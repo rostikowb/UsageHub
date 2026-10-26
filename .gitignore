@@ -35,3 +35,16 @@ test_bin/
 # Local dev builds and scratch
 /builds/
 /scratch/
+
+# Local account state and secrets: never publish with the source fork
+.env
+.env.*
+!.env.example
+/.credentials.json
+/credentials*.json
+/settings.json
+/usage-cache.json
+/profiles/
+/backups/
+/skills-library/
+*.dmp

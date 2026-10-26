@@ -30,6 +30,10 @@ pub(super) fn show_context_menu_document(
             origin.as_ref(),
             &mut actions,
         );
+        // Dynamic widget slots: one entry per pinned account plus management.
+        // Slots exist independently of polling, so a third account appears
+        // here (and on the bar) without any manual menu JSON.
+        append_account_section(menu, language, &data_context, &mut actions);
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
         let _ = SetForegroundWindow(hwnd);
@@ -210,15 +214,22 @@ pub(super) fn context_menu_action_flags(
             .unwrap_or(false),
         _ => false,
     };
+    let account_busy = matches!(
+        action,
+        ContextMenuAction::OpenAccount { provider, id }
+        | ContextMenuAction::FocusAccount { provider, id }
+        if crate::manager::widget::account_busy(*provider, id)
+    );
     let disabled = matches!(
         action,
         ContextMenuAction::CheckForUpdates
             if matches!(state.update_status, UpdateStatus::Checking | UpdateStatus::Applying)
-    ) || matches!(
-        action,
-        ContextMenuAction::LayerActions { .. } | ContextMenuAction::ToggleLayerRender { .. }
-    ) && origin.is_none()
-        && state.active_theme.is_none();
+    ) || account_busy
+        || matches!(
+            action,
+            ContextMenuAction::LayerActions { .. } | ContextMenuAction::ToggleLayerRender { .. }
+        ) && origin.is_none()
+            && state.active_theme.is_none();
     match (checked, disabled) {
         (true, true) => MF_CHECKED | MF_GRAYED,
         (true, false) => MF_CHECKED,
@@ -257,7 +268,7 @@ pub(super) fn execute_context_menu_action(
     origin: Option<(usize, String)>,
 ) {
     let static_command = match &action {
-        ContextMenuAction::OpenDashboard => Some(IDM_DASHBOARD),
+        ContextMenuAction::OpenDashboard | ContextMenuAction::ManageAccounts => Some(IDM_DASHBOARD),
         ContextMenuAction::Refresh => Some(1),
         ContextMenuAction::SetUpdateFrequency { seconds } => match *seconds {
             POLL_1_MIN_SECONDS => Some(IDM_FREQ_1MIN),
@@ -286,7 +297,9 @@ pub(super) fn execute_context_menu_action(
         | ContextMenuAction::LegacyResetPosition
         | ContextMenuAction::ToggleLayerRender { .. }
         | ContextMenuAction::LayerActions { .. }
-        | ContextMenuAction::OpenUrl { .. } => None,
+        | ContextMenuAction::OpenUrl { .. }
+        | ContextMenuAction::OpenAccount { .. }
+        | ContextMenuAction::FocusAccount { .. } => None,
     };
     if let Some(command) = static_command {
         unsafe {
@@ -327,7 +340,139 @@ pub(super) fn execute_context_menu_action(
         ContextMenuAction::OpenUrl { url } => {
             open_web_url(hwnd, &url, "context menu URL could not be opened")
         }
+        ContextMenuAction::OpenAccount { provider, id } => {
+            open_account_slot(hwnd, provider.descriptor().key.to_string(), id, false);
+        }
+        ContextMenuAction::FocusAccount { provider, id } => {
+            open_account_slot(hwnd, provider.descriptor().key.to_string(), id, true);
+        }
         _ => {}
+    }
+}
+
+/// Overflow account chooser: the native popup behind the `+N` bar chip and
+/// the account rows that exceed the width budget. Per-account open entries
+/// plus dashboard management; busy slots stay visible but grayed.
+pub(super) fn show_account_overflow_menu(hwnd: HWND) {
+    let language = lock_state()
+        .as_ref()
+        .map(|state| state.language)
+        .unwrap_or_else(localization::detect_system_language);
+    let data_context = context_menu_data_context(None);
+    let cards = {
+        let state = lock_state();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let cards = crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref());
+        let budget = account_bar_budget(state);
+        let layout = theme_engine::account_layout::layout_accounts(&cards, budget);
+        if layout.overflow.is_empty() {
+            layout.visible
+        } else {
+            layout.overflow
+        }
+    };
+    if cards.is_empty() {
+        return;
+    }
+    let mut actions = Vec::new();
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        append_account_items(menu, &cards, language, &data_context, &mut actions);
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let _ = SetForegroundWindow(hwnd);
+        let selected = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD,
+            point.x,
+            point.y,
+            None,
+            hwnd,
+            None,
+        )
+        .0 as usize;
+        let _ = DestroyMenu(menu);
+        if selected >= 1_000 {
+            if let Some(action) = actions.get(selected - 1_000).cloned() {
+                execute_context_menu_action(hwnd, action, None);
+            }
+        }
+    }
+}
+
+/// Dynamic widget-slot section appended to every native menu open: one entry
+/// per pinned account plus dashboard management. Driven by the settings
+/// registry, so new accounts appear without manual menu JSON.
+fn append_account_section(
+    menu: HMENU,
+    language: LanguageId,
+    context: &DataContext,
+    actions: &mut Vec<ContextMenuAction>,
+) {
+    let cards = lock_state()
+        .as_ref()
+        .map(|state| crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref()));
+    let Some(cards) = cards else {
+        return;
+    };
+    if cards.is_empty() {
+        return;
+    }
+    unsafe {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let Ok(submenu) = CreatePopupMenu() else {
+            return;
+        };
+        append_account_items(submenu, &cards, language, context, actions);
+        let label = native_interop::wide_str(&language.text("Accounts"));
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            submenu.0 as usize,
+            PCWSTR::from_raw(label.as_ptr()),
+        );
+    }
+}
+
+fn append_account_items(
+    menu: HMENU,
+    cards: &[theme_engine::account_layout::AccountCard],
+    _language: LanguageId,
+    _context: &DataContext,
+    actions: &mut Vec<ContextMenuAction>,
+) {
+    unsafe {
+        for card in cards {
+            let action = ContextMenuAction::OpenAccount {
+                provider: card.provider,
+                id: card.id.clone(),
+            };
+            let suffix = if card.has_error { " !" } else { "" };
+            let label = native_interop::wide_str(&format!(
+                "{} ({}){suffix}",
+                card.display_label(),
+                card.provider.descriptor().key
+            ));
+            let flags = context_menu_action_flags(&action, None);
+            let id = 1_000 + actions.len();
+            let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr()));
+            actions.push(action);
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let manage = ContextMenuAction::ManageAccounts;
+        let label = native_interop::wide_str(&crate::context_menu::rendered_label(
+            _language,
+            "Manage accounts",
+            _context,
+        ));
+        let flags = context_menu_action_flags(&manage, None);
+        let id = 1_000 + actions.len();
+        let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr()));
+        actions.push(manage);
     }
 }
 

@@ -248,7 +248,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claude-code-usage-monitor-winsqlite-{}-{unique}.db",
+            "usagehub-winsqlite-{}-{unique}.db",
             std::process::id()
         ));
         create_database(&path);

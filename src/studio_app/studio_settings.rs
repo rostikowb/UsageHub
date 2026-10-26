@@ -13,6 +13,9 @@ impl StudioApp {
             ui.add_space(8.0);
         }
         settings_scroll_area(ui, |ui| {
+            // Account manager first: the dashboard opens directly on account
+            // navigation. All mutations go through the --manage CLI surface.
+            self.manage_section(ui);
             section(ui, language.text("General"), |ui| {
                 setting_row(
                     ui,
@@ -236,31 +239,44 @@ fn account_settings(
         });
         let mut remove = None;
         for (index, profile) in accounts.profiles.iter_mut().enumerate() {
+            let managed = profile.ownership == crate::accounts::AccountOwnership::Managed;
             ui.push_id(profile.id.clone(), |ui| {
                 ui.separator();
                 ui.horizontal(|ui| {
                     changed |= ui.checkbox(&mut profile.enabled, language.text("Monitor")).changed();
-                    let name = ui.add(crate::ui::components::text_field::singleline(&mut profile.name)
-                        .desired_width(220.0).hint_text(language.text("Account name")));
-                    changed |= name.lost_focus();
-                    if ui.button(language.text("Remove")).clicked() { remove = Some(index); }
-                });
-                ui.label(language.text("Config directory"));
-                let directory = ui.add(crate::ui::components::text_field::singleline(&mut profile.config_dir)
-                    .hint_text(if provider == ProviderId::Claude { "~/.claude-work" } else { "~/.codex-work" }));
-                changed |= directory.lost_focus();
-                ui.collapsing(language.text("Custom credentials file"), |ui| {
-                    let file = ui.add(crate::ui::components::text_field::singleline(&mut profile.credentials_path)
-                        .hint_text(language.text("Optional; overrides the config directory")));
-                    changed |= file.lost_focus();
-                    if ui.button(language.text("Browse...")).clicked() {
-                        if let Some(path) = choose_file(owner, language.text("Select credentials file"), "JSON files\0*.json\0All files\0*.*\0\0") {
-                            profile.credentials_path = path.to_string_lossy().into_owned();
-                            changed = true;
-                        }
+                    if managed {
+                        ui.label(egui::RichText::new(&profile.name).strong());
+                        ui.weak(language.text("Managed accounts are edited through the account manager above."));
+                    } else {
+                        let name = ui.add(crate::ui::components::text_field::singleline(&mut profile.name)
+                            .desired_width(220.0).hint_text(language.text("Account name")));
+                        changed |= name.lost_focus();
+                        // Claude removals always go through the account manager's
+                        // backup-verified cleanup preview; other providers keep
+                        // their direct settings controls.
+                        if !managed && provider != ProviderId::Claude && ui.button(language.text("Remove")).clicked() { remove = Some(index); }
                     }
-                    ui.weak(format!("{}: accounts.{}.{}", language.text("Theme binding"), provider.descriptor().key, profile.id));
                 });
+                if managed {
+                    ui.weak(format!("{}: accounts.{}.{}", language.text("Theme binding"), provider.descriptor().key, profile.id));
+                } else {
+                    ui.label(language.text("Config directory"));
+                    let directory = ui.add(crate::ui::components::text_field::singleline(&mut profile.config_dir)
+                        .hint_text(if provider == ProviderId::Claude { "~/.claude-work" } else { "~/.codex-work" }));
+                    changed |= directory.lost_focus();
+                    ui.collapsing(language.text("Custom credentials file"), |ui| {
+                        let file = ui.add(crate::ui::components::text_field::singleline(&mut profile.credentials_path)
+                            .hint_text(language.text("Optional; overrides the config directory")));
+                        changed |= file.lost_focus();
+                        if ui.button(language.text("Browse...")).clicked() {
+                            if let Some(path) = choose_file(owner, language.text("Select credentials file"), "JSON files\0*.json\0All files\0*.*\0\0") {
+                                profile.credentials_path = path.to_string_lossy().into_owned();
+                                changed = true;
+                            }
+                        }
+                        ui.weak(format!("{}: accounts.{}.{}", language.text("Theme binding"), provider.descriptor().key, profile.id));
+                    });
+                }
                 match profile.credential_path(provider) {
                     Err(error) => { ui.colored_label(egui::Color32::from_rgb(196, 64, 64), error); }
                     Ok(None) => { ui.weak(if provider == ProviderId::Claude {

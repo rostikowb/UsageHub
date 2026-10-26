@@ -479,6 +479,19 @@ pub enum MouseAction {
     ShowContextMenu {
         menu: Option<String>,
     },
+    /// Open the account window for one widget slot (focus when running).
+    OpenAccount {
+        provider: String,
+        id: String,
+    },
+    /// Focus the account window for one widget slot (no launch).
+    FocusAccount {
+        provider: String,
+        id: String,
+    },
+    /// Open the native overflow account chooser for cards beyond the width
+    /// budget.
+    ShowAccountOverflow,
     Set {
         target: MouseActionTarget,
         property: MouseActionProperty,
@@ -517,13 +530,17 @@ pub enum MouseActionEffect {
     ToggleDashboard,
     OpenUrl(String),
     ShowContextMenu(Option<String>),
+    OpenAccount { provider: String, id: String },
+    FocusAccount { provider: String, id: String },
+    ShowAccountOverflow,
 }
 
 /// Parse the deliberately small, line-or-semicolon separated action language.
 /// Supported forms include `show_dashboard()`, `toggle_dashboard()`,
 /// `open_url("https://example.com")`, `show_context_menu()`,
-/// `show_context_menu("menu-id")`, `set(self.render, false)`,
-/// `increase("layer-id", height, 10)`, `decrease(self.width, 5)`,
+/// `show_context_menu("menu-id")`, `open_account("claude", "account_1")`,
+/// `focus_account("codex", "default")`, `show_account_overflow()`,
+/// `set(self.render, false)`, `increase("layer-id", height, 10)`,
 /// `toggle(self.render)`, and `reset("layer-id", height)`.
 pub fn parse_mouse_actions(source: &str) -> Result<Vec<MouseAction>, String> {
     let statements = split_action_statements(source)?;
@@ -563,6 +580,26 @@ pub fn parse_mouse_actions(source: &str) -> Result<Vec<MouseAction>, String> {
             }
             "show_context_menu" => {
                 return Err("show_context_menu expects zero or one quoted menu id or name".into())
+            }
+            "open_account" | "focus_account" if args.len() == 2 => {
+                let provider = parse_quoted_action_string(&args[0], "provider key")?;
+                let id = parse_quoted_action_string(&args[1], "account id")?;
+                if name == "open_account" {
+                    actions.push(MouseAction::OpenAccount { provider, id });
+                } else {
+                    actions.push(MouseAction::FocusAccount { provider, id });
+                }
+            }
+            "open_account" | "focus_account" => {
+                return Err(
+                    "open_account/focus_account expect a quoted provider key and account id".into(),
+                )
+            }
+            "show_account_overflow" if args.is_empty() => {
+                actions.push(MouseAction::ShowAccountOverflow);
+            }
+            "show_account_overflow" => {
+                return Err("show_account_overflow() does not take arguments".into())
             }
             "set" | "increase" | "decrease" => {
                 let (target, property, value) = match args.as_slice() {
@@ -1560,6 +1597,10 @@ impl DataContext {
             runtime.crossfade_opacity.clamp(0.0, 1.0),
         );
         if let Some(data) = data {
+            // Dynamic slot count: themes gate overflow UI on this instead of a
+            // static count binding. Per-slot readings stay under
+            // `accounts.<provider>.<id>.*`; the count never selects data.
+            context.insert("accounts.count", data.accounts.len() as f64);
             for account in &data.accounts {
                 let key = format!(
                     "accounts.{}.{}",
@@ -1627,6 +1668,7 @@ impl DataContext {
                 runtime.countdown,
             );
         } else {
+            context.insert("accounts.count", 0.0);
             for descriptor in PROVIDER_DESCRIPTORS {
                 context.insert_provider(
                     descriptor.key,
@@ -1917,14 +1959,30 @@ impl DataContext {
     // bindings. Supply typed defaults during validation, startup and removal;
     // unknown fields must still report typos instead of silently becoming zero.
     fn account_default_key(name: &str) -> Option<String> {
-        let (provider, rest) = name.strip_prefix("accounts.")?.split_once('.')?;
-        let (id, field) = rest.split_once('.')?;
-        (matches!(provider, "claude" | "codex")
-            && !id.is_empty()
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
-        .then(|| format!("account.{field}"))
+        if let Some(rest) = name.strip_prefix("accounts.") {
+            let (provider, rest) = rest.split_once('.')?;
+            let (id, field) = rest.split_once('.')?;
+            return (matches!(provider, "claude" | "codex")
+                && !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+            .then(|| format!("account.{field}"));
+        }
+        // Singular `account.` placeholder used by opt-in account-row
+        // templates (rewritten to `accounts.<provider>.<id>.` per card at
+        // render). Resolve against the same typed defaults so templates
+        // validate; anything not in the schema still reports a typo.
+        if let Some(field) = name.strip_prefix("account.") {
+            let defaults = Self::account_defaults();
+            let key = format!("account.{field}");
+            if defaults.values.contains_key(key.as_str())
+                || defaults.strings.contains_key(key.as_str())
+            {
+                return Some(key);
+            }
+        }
+        None
     }
 
     fn account_defaults() -> &'static Self {
@@ -2064,7 +2122,10 @@ pub fn validate_mouse_action_script(
             MouseAction::ShowDashboard
             | MouseAction::ToggleDashboard
             | MouseAction::OpenUrl { .. }
-            | MouseAction::ShowContextMenu { .. } => continue,
+            | MouseAction::ShowContextMenu { .. }
+            | MouseAction::OpenAccount { .. }
+            | MouseAction::FocusAccount { .. }
+            | MouseAction::ShowAccountOverflow => continue,
             MouseAction::Set {
                 target,
                 property,
@@ -2272,6 +2333,15 @@ pub fn execute_mouse_actions(
             MouseAction::OpenUrl { url } => effects.push(MouseActionEffect::OpenUrl(url)),
             MouseAction::ShowContextMenu { menu } => {
                 effects.push(MouseActionEffect::ShowContextMenu(menu))
+            }
+            MouseAction::OpenAccount { provider, id } => {
+                effects.push(MouseActionEffect::OpenAccount { provider, id })
+            }
+            MouseAction::FocusAccount { provider, id } => {
+                effects.push(MouseActionEffect::FocusAccount { provider, id })
+            }
+            MouseAction::ShowAccountOverflow => {
+                effects.push(MouseActionEffect::ShowAccountOverflow)
             }
             MouseAction::Set {
                 target,
@@ -2899,6 +2969,7 @@ impl Paint {
     }
 }
 
+pub mod account_layout;
 mod theme_storage;
 pub use theme_storage::*;
 

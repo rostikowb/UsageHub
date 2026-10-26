@@ -70,7 +70,7 @@ impl DiagnoseState {
 static DIAGNOSE_STATE: DiagnoseState = DiagnoseState::new();
 
 pub fn log_path() -> PathBuf {
-    std::env::temp_dir().join("claude-code-usage-monitor.log")
+    std::env::temp_dir().join("usagehub.log")
 }
 
 /// Record panics even when diagnostic recording is disabled.
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn log_tail_tracks_appends_and_truncation_without_partial_utf8_lines() {
         let path = std::env::temp_dir().join(format!(
-            "ccum-log-tail-{}-{}.log",
+            "usagehub-log-tail-{}-{}.log",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

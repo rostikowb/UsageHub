@@ -61,6 +61,21 @@ pub(super) fn read_generic(target: &str) -> Option<String> {
     secret
 }
 
+/// Last-write FILETIME of one exact credential target, without exposing its
+/// secret. Missing or unreadable targets report `None` so signatures can
+/// record them as watchable `missing` candidates.
+pub(super) fn last_written(target: &str) -> Option<u64> {
+    let target_wide = wide(target);
+    let mut credential: *mut CredentialW = std::ptr::null_mut();
+    let ok = unsafe { CredReadW(target_wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+    if ok == 0 || credential.is_null() {
+        return None;
+    }
+    let stamp = unsafe { (*credential).last_written };
+    unsafe { CredFree(credential as *mut c_void) };
+    Some(stamp)
+}
+
 /// Every generic credential whose target starts with `prefix`. An empty
 /// result covers both "none stored" and "the vault could not be read".
 pub(super) fn enumerate_generic(prefix: &str) -> Vec<StoredCredential> {

@@ -31,20 +31,14 @@ pub fn source_key(path: &Path) -> String {
 }
 
 pub fn default_credential_path(provider: ProviderId) -> Option<PathBuf> {
-    let directory = environment_directory(provider).or_else(|| {
-        crate::known_folders::home_dir().map(|home| {
-            home.join(if provider == ProviderId::Claude {
-                ".claude"
-            } else {
-                ".codex"
-            })
-        })
-    })?;
-    Some(directory.join(if provider == ProviderId::Claude {
-        ".credentials.json"
-    } else {
-        "auth.json"
-    }))
+    let (folder, file) = match provider {
+        ProviderId::Claude => (".claude", ".credentials.json"),
+        ProviderId::Codex => (".codex", "auth.json"),
+        _ => return None,
+    };
+    let directory = environment_directory(provider)
+        .or_else(|| crate::known_folders::home_dir().map(|home| home.join(folder)))?;
+    Some(directory.join(file))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +49,33 @@ pub struct AccountProfile {
     pub config_dir: String,
     pub credentials_path: String,
     pub enabled: bool,
+    /// Explicit Desktop user-data-dir (config.json + Local State source).
+    /// Empty means "not configured"; provider-default discovery stays in the poller.
+    pub desktop_dir: String,
+    /// Managed (created/adopted by UsageHub) vs external (read-only by default).
+    pub ownership: AccountOwnership,
+    /// Display-only presentation. Never affects identity, paths, or polling.
+    pub pinned: bool,
+    pub sort_order: i32,
+    pub color: String,
+    pub label: String,
+    /// Confirmed Windows Credential Manager targets owned by this account.
+    /// Only listed targets may be backed up or deleted; unknown targets are
+    /// reported, never guessed.
+    pub credential_targets: Vec<String>,
+}
+
+/// Lifetime ownership of an account profile.
+///
+/// IDs are immutable once allocated (`used_ids` is never reused); renames only
+/// change display fields. New profiles and adopted legacy paths (e.g. Second)
+/// are `Managed`; the external Default stays `External` (read-only by default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountOwnership {
+    Managed,
+    #[default]
+    External,
 }
 
 impl Default for AccountProfile {
@@ -65,6 +86,13 @@ impl Default for AccountProfile {
             config_dir: String::new(),
             credentials_path: String::new(),
             enabled: true,
+            desktop_dir: String::new(),
+            ownership: AccountOwnership::External,
+            pinned: false,
+            sort_order: 0,
+            color: String::new(),
+            label: String::new(),
+            credential_targets: Vec::new(),
         }
     }
 }
@@ -94,6 +122,36 @@ impl ProviderAccounts {
             .iter()
             .find(|profile| profile.enabled && profile.id == self.selected)
             .or_else(|| self.profiles.iter().find(|profile| profile.enabled))
+    }
+
+    pub fn find(&self, id: &str) -> Option<&AccountProfile> {
+        self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut AccountProfile> {
+        self.profiles.iter_mut().find(|profile| profile.id == id)
+    }
+
+    /// Display order for account rows: pinned first, then `sort_order`,
+    /// then name. Identity (`id`) is never reordered or rewritten.
+    pub fn ordered(&self) -> Vec<&AccountProfile> {
+        let mut profiles: Vec<&AccountProfile> = self.profiles.iter().collect();
+        profiles.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| a.sort_order.cmp(&b.sort_order))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        profiles
+    }
+
+    /// Display-only rename. The stable `id` is preserved, so theme bindings,
+    /// backup directories, and shortcuts keep targeting the same account.
+    pub fn rename(&mut self, id: &str, new_name: &str) -> Result<(), String> {
+        let Some(profile) = self.find_mut(id) else {
+            return Err(format!("Unknown account '{id}'"));
+        };
+        profile.rename_display(new_name)
     }
 
     pub fn add(&mut self) {
@@ -218,8 +276,26 @@ impl AccountProfile {
         self.id == other.id
             && self.config_dir == other.config_dir
             && self.credentials_path == other.credentials_path
+            && self.desktop_dir == other.desktop_dir
     }
 
+    /// Explicit source kind selected by this profile. The runtime/poller MUST
+    /// distinguish `DesktopDir` directly: it reads config.json + Local State in
+    /// that directory and never falls back to CLI credential discovery for it.
+    pub fn source_kind(&self, provider: ProviderId) -> SourceKind {
+        if !self.desktop_dir.trim().is_empty() && provider == ProviderId::Claude {
+            return SourceKind::DesktopDir;
+        }
+        if !self.credentials_path.trim().is_empty() || !self.config_dir.trim().is_empty() {
+            return SourceKind::CredentialFile;
+        }
+        SourceKind::ProviderDefault
+    }
+
+    /// Legacy credential-file resolution for CLI/Codex callers. Preserved
+    /// unchanged: explicit file wins, then config_dir file, then provider
+    /// defaults (`None` for the default profile) or an error when the profile
+    /// cannot supply a source.
     pub fn credential_path(&self, provider: ProviderId) -> Result<Option<PathBuf>, String> {
         if !self.credentials_path.trim().is_empty() {
             return expand_path(Path::new(self.credentials_path.trim()))
@@ -229,7 +305,7 @@ impl AccountProfile {
         let directory = if !self.config_dir.trim().is_empty() {
             expand_path(Path::new(self.config_dir.trim()))
                 .ok_or("Use an absolute config directory or ~/path")?
-        } else if self.id == "default" {
+        } else if self.id.eq_ignore_ascii_case("default") {
             return Ok(None);
         } else {
             return Err(
@@ -242,6 +318,54 @@ impl AccountProfile {
             _ => return Err("This provider does not support account profiles".into()),
         })))
     }
+
+    /// Resolved explicit Desktop user-data-dir, if configured.
+    pub fn desktop_dir_resolved(&self) -> Result<Option<PathBuf>, String> {
+        if self.desktop_dir.trim().is_empty() {
+            return Ok(None);
+        }
+        expand_path(Path::new(self.desktop_dir.trim()))
+            .map(Some)
+            .ok_or_else(|| "Use an absolute desktop data directory or ~/path".into())
+    }
+
+    /// Resolved explicit CLI config directory, if configured.
+    pub fn config_dir_resolved(&self) -> Result<Option<PathBuf>, String> {
+        if self.config_dir.trim().is_empty() {
+            return Ok(None);
+        }
+        expand_path(Path::new(self.config_dir.trim()))
+            .map(Some)
+            .ok_or_else(|| "Use an absolute config directory or ~/path".into())
+    }
+
+    /// Display-only rename. The stable `id` is never touched, so theme
+    /// bindings and backup directories keep targeting the same account.
+    pub fn rename_display(&mut self, new_name: &str) -> Result<(), String> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err("Account name must not be empty".into());
+        }
+        self.name = trimmed.to_string();
+        Ok(())
+    }
+
+    pub fn is_managed(&self) -> bool {
+        self.ownership == AccountOwnership::Managed
+    }
+}
+
+/// Explicit credential-source selection for a profile/provider pair.
+///
+/// Authoritative limits AND resets are produced only by the original usageBar
+/// server poller for the resolved source. No switcher estimates, local-history
+/// inference, weekly corrections, or manual reset overrides are permitted in
+/// any authoritative usage path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    CredentialFile,
+    DesktopDir,
+    ProviderDefault,
 }
 
 #[cfg(test)]
@@ -326,6 +450,20 @@ mod tests {
                 .unwrap(),
             None
         );
+        // Legacy/hand-edited `"Default"` still resolves as provider-default.
+        let upper_default = AccountProfile {
+            id: "Default".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            upper_default.credential_path(ProviderId::Claude).unwrap(),
+            None
+        );
+        // Only Claude/Codex have provider-default credential files.
+        assert_eq!(default_credential_path(ProviderId::Antigravity), None);
+        assert_eq!(default_credential_path(ProviderId::OpenCode), None);
+        assert!(default_credential_path(ProviderId::Claude).is_some());
+        assert!(default_credential_path(ProviderId::Codex).is_some());
     }
 
     #[test]

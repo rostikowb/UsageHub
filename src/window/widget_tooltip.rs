@@ -107,6 +107,32 @@ fn content(owner: HWND) -> Option<(String, bool, HWND)> {
     } else {
         String::new()
     };
+    // Pinned slots are never silently ineffective: with more than one pinned
+    // account, custom (non-account-aware) themes keep their authored look on
+    // the bar while the hover popup still enumerates every slot with its
+    // live state. The native menu and overflow chooser expose the same set.
+    let language = state.language;
+    let cards = crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref());
+    let mut text = text;
+    if cards.len() > 1 {
+        for card in &cards {
+            let status = if card.busy {
+                format!(" — {}", language.text("updating"))
+            } else if card.has_error {
+                format!(" — {}", language.text("error"))
+            } else {
+                String::new()
+            };
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!(
+                "{} ({}){status}",
+                card.display_label(),
+                card.provider.descriptor().key
+            ));
+        }
+    }
     Some((
         if text.is_empty() {
             state.language.strings().window_title.to_string()

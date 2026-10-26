@@ -641,36 +641,51 @@ mod tests {
     fn production_agent_preserves_header_before_status_conversion() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "client never connected");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept failed: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
+            // Blocking accept: the client below connects immediately, so no
+            // polling sleep is needed.
+            let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            // Consume the full request framing (headers plus any body) so the
+            // socket never closes with unread request bytes (RST on Windows).
             let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert!(request.len() < 64 * 1024, "request headers too large");
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending body");
+                request.extend_from_slice(&buffer[..count]);
             }
             stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+            stream.flush().unwrap();
+            // Keep both socket and listener alive until the client explicitly
+            // consumes the response. FIN plus a read timeout still raced with
+            // the Windows loopback stack under the full parallel suite.
+            let _ = consumed_rx.recv_timeout(Duration::from_secs(10));
         });
         let agent = super::super::build_agent().unwrap();
         let fetch = || {
@@ -682,13 +697,15 @@ mod tests {
                 .build()
                 .call()
         };
-        let response = fetch().unwrap();
-        server.join().unwrap();
+        let mut response = fetch().unwrap();
         assert_eq!(response.headers()["Retry-After"], "120");
-        assert!(matches!(
-            super::super::check_http_status(response),
-            Err(ureq::Error::StatusCode(429))
-        ));
+        // Drain the body before joining the server so the fixture's graceful
+        // close observes the client consume the response.
+        response.body_mut().read_to_string().unwrap();
+        consumed_tx.send(()).unwrap();
+        let status = super::super::check_http_status(response);
+        server.join().unwrap();
+        assert!(matches!(status, Err(ureq::Error::StatusCode(429))));
         // The listener is closed: an actual retry would fail to connect.
         assert!(matches!(fetch(), Err(ureq::Error::StatusCode(429))));
     }

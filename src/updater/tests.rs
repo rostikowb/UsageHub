@@ -107,9 +107,7 @@ fn is_winget_install_path_accepts_configured_roots_and_descendants() {
     assert!(!roots.is_empty());
     for root in roots {
         assert!(is_winget_install_path(&root), "root: {}", root.display());
-        let executable = root
-            .join("CodeZeno.ClaudeCodeUsageMonitor_source")
-            .join("app.exe");
+        let executable = root.join("UsageHub.UsageHub_source").join("app.exe");
         let path = executable.to_string_lossy();
         for variant in [
             path.to_string(),
@@ -163,7 +161,7 @@ fn winget_upgrade_command_waits_upgrades_and_restarts_only_on_success() {
             "$target = 'C:\\Usage Monitor\\app.exe'; ",
             "$workingDir = 'C:\\Usage Monitor'; ",
             "try { Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop } catch { }; ",
-            "winget upgrade --id CodeZeno.ClaudeCodeUsageMonitor --exact --source winget; ",
+            "winget upgrade --id UsageHub.UsageHub --exact --source winget; ",
             "$exitCode = $LASTEXITCODE; ",
             "if ($exitCode -eq 0) { ",
             "Start-Sleep -Seconds 2; ",
@@ -211,13 +209,13 @@ fn winget_upgrade_command_quotes_each_path_as_a_powershell_literal() {
 fn winget_show_args_list_versions_non_interactively() {
     assert_eq!(
         WINGET_SHOW_VERSIONS_ARGS.join(" "),
-        "show --id CodeZeno.ClaudeCodeUsageMonitor --exact --versions --source winget --accept-source-agreements --disable-interactivity"
+        "show --id UsageHub.UsageHub --exact --versions --source winget --accept-source-agreements --disable-interactivity"
     );
 }
 
 #[test]
 fn winget_versions_outcome_parses_versions_under_localized_headers() {
-    let stdout = "Trouvé Claude Code Usage Monitor [CodeZeno.ClaudeCodeUsageMonitor]\r\n\
+    let stdout = "Trouvé UsageHub [UsageHub.UsageHub]\r\n\
         Version\r\n-------\r\n2.15.14\r\n2.15.0\r\n  2.14.55  \r\n1.3\r\n";
     assert_eq!(
         winget_versions_outcome(Some(0), stdout),
@@ -357,4 +355,28 @@ fn source_errors_never_fall_back_to_the_other_channel() {
 fn winget_lists_published_versions_from_the_live_source() {
     let versions = winget_listed_versions().unwrap();
     assert!(versions.contains(&v("2.15.0")), "{versions:?}");
+}
+
+#[test]
+fn fork_update_channel_never_contacts_upstream() {
+    for channel in [InstallChannel::Portable, InstallChannel::Winget] {
+        let error = check_for_updates(channel).unwrap_err();
+        assert!(
+            error.contains("disabled"),
+            "channel {channel:?} must refuse instead of querying: {error}"
+        );
+    }
+}
+
+#[test]
+fn fork_update_apply_is_refused_before_touching_binaries() {
+    let release = ReleaseDescriptor {
+        latest_version: "99.0.0".into(),
+        asset_url: "https://example.invalid/usagehub.exe".into(),
+        integrity: AssetIntegrity::new(3, Some(ABC_DIGEST)).unwrap(),
+    };
+    for refused in [begin_self_update(&release), begin_winget_update()] {
+        let error = refused.unwrap_err();
+        assert!(error.contains("disabled"), "{error}");
+    }
 }

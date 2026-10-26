@@ -1,5 +1,10 @@
 [toolchain]
 # Keep in sync with .github/workflows/release.yml and Cargo.toml's rust-version.
-channel = "1.95.0"
+# Host IS x86_64-pc-windows-gnullvm (published on static.rust-lang.org, installed
+# in D:/Tools/usagehub-toolchain; see docs/build-windows.md), so host build
+# scripts/proc-macros link with the same LLVM-native flags as the target and never
+# ask for -lgcc_eh/-lgcc. The previous plain windows-gnu host did require those
+# libs, which llvm-mingw does not ship (lld "unable to find library -lgcc_eh").
+channel = "1.95.0-x86_64-pc-windows-gnullvm"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

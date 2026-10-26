@@ -54,6 +54,18 @@ pub enum ContextMenuItemKind {
 pub enum ContextMenuAction {
     OpenDashboard,
     Refresh,
+    /// Open (launch when needed, then focus) one dynamic widget account slot.
+    OpenAccount {
+        provider: ContextMenuProvider,
+        id: String,
+    },
+    /// Focus the running window of one dynamic widget account slot.
+    FocusAccount {
+        provider: ContextMenuProvider,
+        id: String,
+    },
+    /// Open the dashboard account management surface.
+    ManageAccounts,
     SetUpdateFrequency {
         #[serde(
             alias = "milliseconds",
@@ -258,6 +270,12 @@ fn validate_items(
                     ContextMenuAction::SetLanguage { language } if language.trim().is_empty() => {
                         errors.push(format!("{}.language cannot be empty", item.id));
                     }
+                    ContextMenuAction::OpenAccount { id, .. }
+                    | ContextMenuAction::FocusAccount { id, .. }
+                        if id.trim().is_empty() =>
+                    {
+                        errors.push(format!("{}.id cannot be empty", item.id));
+                    }
                     ContextMenuAction::ToggleLayerRender { target } if target.trim().is_empty() => {
                         errors.push(format!("{}.target cannot be empty", item.id));
                     }
@@ -303,6 +321,7 @@ pub fn rendered_label(
 ) -> String {
     let translated = match label {
         "Settings" => language.text("Settings"),
+        "Manage accounts" => language.text("Manage accounts"),
         "Update frequency" => language.text("Update frequency"),
         "Start with Windows" => language.text("Start with Windows"),
         "Language" => language.text("Language"),

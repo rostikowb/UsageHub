@@ -97,6 +97,14 @@ pub(super) unsafe extern "system" fn wnd_proc(
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
+                TIMER_BACKUP_PURGE => {
+                    // Expiry only; the worker thread owns the whole purge.
+                    crate::manager::widget::schedule_backup_purge();
+                }
+                TIMER_TASKBAR_IDENTITIES => {
+                    // Shortcut/COM stamping on a worker; coalesced in-flight.
+                    crate::manager::widget::schedule_taskbar_identity_refresh("periodic");
+                }
                 TIMER_WINDOW_STATE => {
                     sync_theme_window_visibility();
                 }
@@ -149,6 +157,16 @@ pub(super) unsafe extern "system" fn wnd_proc(
         WM_APP_SETTINGS_UPDATED => {
             reload_external_settings(hwnd);
             LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            // Resume from sleep: purge expired deletion-undo snapshots and
+            // restamp taskbar identities, both on worker threads.
+            if wparam.0 as u32 == PBT_APMRESUMESUSPEND {
+                crate::manager::widget::schedule_backup_purge();
+                crate::manager::widget::schedule_taskbar_identity_refresh("resume");
+                render_layered();
+            }
+            LRESULT(1)
         }
         WM_APP_REFRESH_NOW => {
             diagnose::log("Refresh now received by monitor");

@@ -31,7 +31,7 @@ impl StudioApp {
         let selected_asset = selected
             .as_ref()
             .and_then(|path| assets.iter().find(|asset| &asset.relative_path == path))
-            .cloned();
+            .map(|asset| asset.clone());
         let mut add_image = false;
         let mut delete_asset = false;
         ui.horizontal(|ui| {

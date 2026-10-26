@@ -1,4 +1,3 @@
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -11,7 +10,6 @@ use crate::diagnose;
 use crate::models::{CodexCreditsState, CreditsSection, UsageData, UsageSection};
 
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Deserialize)]
 struct CodexAuthFile {
@@ -418,43 +416,48 @@ fn cli_refresh_codex_token(directory: &Path) {
         command.args(args);
         command
     };
-    command
-        .env("CODEX_HOME", directory)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
-        }
-    };
-    wait_for_refresh(&mut child);
+    command.env("CODEX_HOME", directory);
+    // Shared bounded runner owns stdio pipes, the hidden console, the original
+    // 30s refresh budget and the kill-on-timeout job tree. No CLI args in logs.
+    if let Err(error) = crate::manager::process::run_bounded(
+        &mut command,
+        Duration::from_secs(30),
+        64 * 1024,
+        "codex token refresh",
+    ) {
+        diagnose::log(format!("Windows Codex token refresh failed: {error}"));
+    }
 }
 
 fn resolve_windows_codex_path() -> String {
+    // Bounded discovery: 2s and 8MiB per probe, eight probes at most, so the
+    // whole scan stays within ~16s even when every probe hangs.
+    const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+    const DISCOVERY_CAPTURE_CAP: usize = 8 * 1024 * 1024;
     for name in ["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        let mut probe = Command::new(name);
+        probe.arg("--version");
+        if crate::manager::process::run_bounded(
+            &mut probe,
+            DISCOVERY_TIMEOUT,
+            DISCOVERY_CAPTURE_CAP,
+            "codex discovery",
+        )
+        .is_ok()
         {
             return name.to_string();
         }
     }
 
     for name in ["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
+        let mut locate = Command::new("where.exe");
+        locate.arg(name);
+        if let Ok(output) = crate::manager::process::run_bounded(
+            &mut locate,
+            DISCOVERY_TIMEOUT,
+            DISCOVERY_CAPTURE_CAP,
+            "codex discovery",
+        ) {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(path) = stdout
@@ -469,21 +472,6 @@ fn resolve_windows_codex_path() -> String {
         }
     }
     "codex.cmd".to_string()
-}
-
-fn wait_for_refresh(child: &mut std::process::Child) {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() > Duration::from_secs(30) => {
-                let _ = child.kill();
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(500)),
-            Err(_) => break,
-        }
-    }
 }
 
 #[cfg(test)]

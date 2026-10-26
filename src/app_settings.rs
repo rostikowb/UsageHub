@@ -311,10 +311,16 @@ pub struct UsageCache {
 
 #[cfg(not(test))]
 pub fn app_data_directory() -> PathBuf {
-    let root = std::env::var_os("APPDATA")
+    // Single root definition: the fork config dir owns settings, themes,
+    // context menus, skills and credits. Fall back to the legacy %APPDATA%
+    // layout only when the known-folder lookup fails.
+    if let Some(dir) = crate::manager::paths::fork_config_dir() {
+        return dir;
+    }
+    std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    root.join("ClaudeCodeUsageMonitor")
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("UsageHub")
 }
 
 /// Test threads get independent settings, themes, menus, and caches. Do not
@@ -341,7 +347,7 @@ impl TestAppData {
             .as_nanos();
         loop {
             let path = std::env::temp_dir().join(format!(
-                "ccum-test-{}-{stamp}-{}",
+                "usagehub-test-{}-{stamp}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -379,9 +385,120 @@ pub fn load_settings() -> SettingsFile {
 }
 
 pub fn save_settings(settings: &SettingsFile) -> Result<(), String> {
+    // Every ordinary settings save serializes on the shared settings mutex
+    // so a manager read-modify-write cannot interleave with a UI snapshot
+    // save. Never acquire this inside [`crate::manager::state::mutate_settings`];
+    // that transaction already holds the guard and must use
+    // `save_settings_unlocked` (the named mutex is not re-entrant here).
+    let _guard = crate::manager::state::SettingsOperationGuard::acquire(
+        crate::manager::state::SETTINGS_MUTEX_TIMEOUT_MS,
+    )?;
+    let mut merged = settings.clone();
+    merged.normalize();
+    // A long-lived UI snapshot may predate a manager registry change. Rebase
+    // the caller session's accounts onto the freshly persisted registry so a
+    // dashboard/window save cannot drop manager-owned managed profiles or
+    // retired IDs. The caller's external profiles stay authoritative.
+    if let Some(fresh) = std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|content| decode_settings(&content))
+    {
+        merge_account_registry(&mut merged, &fresh);
+        merged.normalize();
+    }
+    save_settings_unlocked(&merged)
+}
+
+/// Authoritative settings write for the [`crate::manager::state`] transaction
+/// owner. Caller must hold `SettingsOperationGuard`; no merge is applied so
+/// explicit registry mutations persist exactly as produced.
+pub(crate) fn save_settings_unlocked(settings: &SettingsFile) -> Result<(), String> {
     let mut normalized = settings.clone();
     normalized.normalize();
-    write_json_atomic(&settings_path(), &settings_json(&normalized))
+    // Registry commit first: its result stays accurate even when the cache
+    // purge below fails.
+    write_json_atomic(&settings_path(), &settings_json(&normalized))?;
+    // The caller already holds `SettingsOperationGuard`: reconcile the disk
+    // cache inline via the unlocked writer (never the guarded
+    // `save_usage_cache` — the named mutex is not re-entrant here).
+    if let Err(error) = reconcile_usage_cache_locked(&normalized) {
+        return Err(format!("settings saved; usage cache purge failed: {error}"));
+    }
+    Ok(())
+}
+
+/// Drop deleted/disabled/re-sourced accounts from the disk cache after an
+/// authoritative registry write. Skips the write entirely when the cached
+/// registry already matches, so unrelated setting flips never churn the
+/// cache. Retired ids are opaque settings metadata and are never touched;
+/// providers without an account registry pass through `select_accounts`
+/// unchanged, and the encrypted 7-day deletion-undo snapshots owned by
+/// `manager::backup` are out of scope here.
+fn reconcile_usage_cache_locked(settings: &SettingsFile) -> Result<(), String> {
+    let Some(raw): Option<UsageCache> = read_json(&usage_cache_path()) else {
+        return Ok(());
+    };
+    let mut filtered = raw.data.clone();
+    filtered.select_accounts(&settings.accounts);
+    if filtered == raw.data {
+        return Ok(());
+    }
+    write_usage_cache_locked(&filtered, raw.poll_ok)
+}
+
+/// Rebase `incoming` (a possibly stale UI snapshot) onto `fresh` (just loaded
+/// under the settings mutex). Managed profiles and retired IDs are owned by
+/// the manager transaction path, so the fresh disk copy wins for them; the
+/// caller's external profiles (edits, additions, removals, selection) win for
+/// everything else.
+fn merge_account_registry(incoming: &mut SettingsFile, fresh: &SettingsFile) {
+    merge_provider_accounts(&mut incoming.accounts.claude, &fresh.accounts.claude);
+    merge_provider_accounts(&mut incoming.accounts.codex, &fresh.accounts.codex);
+}
+
+fn merge_provider_accounts(
+    incoming: &mut crate::accounts::ProviderAccounts,
+    fresh: &crate::accounts::ProviderAccounts,
+) {
+    use crate::accounts::AccountOwnership;
+    use std::collections::HashSet;
+    let mut merged: Vec<crate::accounts::AccountProfile> = Vec::new();
+    let mut ids: HashSet<String> = HashSet::new();
+    // Manager-owned registry is authoritative on disk: every managed profile
+    // on disk survives verbatim. All managed mutations (including display
+    // fields) go through manager transactions, so the stale caller's copy of
+    // a managed id is never used.
+    for profile in fresh
+        .profiles
+        .iter()
+        .filter(|profile| profile.ownership == AccountOwnership::Managed)
+    {
+        ids.insert(profile.id.clone());
+        merged.push(profile.clone());
+    }
+    // External profiles belong to the caller session: its additions, edits
+    // and removals apply as-is. Fresh-only externals stay dropped (the
+    // session removed them or never saw a concurrent addition); managed ids
+    // already merged always win over a colliding external copy.
+    for profile in incoming
+        .profiles
+        .iter()
+        .filter(|profile| profile.ownership != AccountOwnership::Managed)
+    {
+        if ids.insert(profile.id.clone()) {
+            merged.push(profile.clone());
+        }
+    }
+    incoming.profiles = merged;
+    // Retired IDs are never reused: union both sides.
+    incoming.used_ids.extend(fresh.used_ids.iter().cloned());
+    // Keep the caller's selection when it still resolves; otherwise adopt the
+    // fresh selection when it resolves and let `normalize` repair the rest.
+    if !incoming.profiles.iter().any(|p| p.id == incoming.selected)
+        && fresh.profiles.iter().any(|p| p.id == fresh.selected)
+    {
+        incoming.selected = fresh.selected.clone();
+    }
 }
 
 fn decode_settings(content: &str) -> Option<SettingsFile> {
@@ -428,11 +545,35 @@ pub fn save_codex_credits(state: &CodexCreditsState) -> Result<(), String> {
 
 pub fn load_usage_cache() -> Option<UsageCache> {
     let mut cache: UsageCache = read_json(&usage_cache_path())?;
+    // A deleted/disabled/re-sourced account must never reappear from disk:
+    // rebind to the fresh registry first, then drop changed credentials.
+    // `load_settings` only reads the file, so no settings guard is needed.
+    let settings = load_settings();
+    cache.data.select_accounts(&settings.accounts);
     cache.data.invalidate_changed_credentials();
     Some(cache)
 }
 
+/// Poller snapshot publish, ordered against registry commits. Holds the
+/// settings guard while rebasing onto fresh settings so a late pre-delete
+/// snapshot cannot resurrect a removed profile on disk. Every writer call
+/// site is a poller path that never holds the guard; the authoritative
+/// registry path (`save_settings_unlocked`) already holds it and must use
+/// `write_usage_cache_locked` directly.
+/// Lock ordering: this guard always ranks outer to the write-serial mutex
+/// held inside `write_json_atomic`; never acquire this guard while holding
+/// that lock.
 pub fn save_usage_cache(data: &AppUsageData, poll_ok: bool) -> Result<(), String> {
+    let _guard = crate::manager::state::SettingsOperationGuard::acquire(
+        crate::manager::state::SETTINGS_MUTEX_TIMEOUT_MS,
+    )?;
+    let settings = load_settings();
+    let mut filtered = data.clone();
+    filtered.select_accounts(&settings.accounts);
+    write_usage_cache_locked(&filtered, poll_ok)
+}
+
+fn write_usage_cache_locked(data: &AppUsageData, poll_ok: bool) -> Result<(), String> {
     write_json_atomic(
         &usage_cache_path(),
         &UsageCache {
@@ -449,19 +590,57 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Process-local serialization for the temp/write/replace critical section.
+    // Unique temp names alone do not prevent simultaneous MoveFileExW replaces
+    // of the same destination from racing on Windows, so hold this across the
+    // whole section. Lock ordering: the cross-process settings guard (held by
+    // `save_settings`/`mutate_settings`) always ranks outer to this lock;
+    // never acquire that guard while holding this lock.
+    static WRITE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let parent = path.parent().ok_or("Invalid settings path")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state.json");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     let json = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    let _serial = WRITE_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Unique temp per call (pid + process-wide sequence): concurrent same-process
+    // writers (settings, usage-cache, codex-credits) never truncate each other's
+    // temp file. `create_new` retries on the residual sequence-wraparound hit.
+    let mut attempts = 0;
+    let (temporary, mut file) = loop {
+        let sequence = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let write_result = (|| {
         file.write_all(&json).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
+        Ok::<_, String>(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
     }
     let source = wide_path(&temporary);
     let destination = wide_path(path);
@@ -472,9 +651,9 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
-    if moved.is_err() {
+    if let Err(error) = moved {
         let _ = std::fs::remove_file(&temporary);
-        return Err("Unable to replace the settings file".into());
+        return Err(error.to_string());
     }
     Ok(())
 }
@@ -522,7 +701,7 @@ mod tests {
         let root = app_data_directory();
         assert!(root.starts_with(std::env::temp_dir()));
         if let Some(real) = std::env::var_os("APPDATA") {
-            assert!(!root.starts_with(PathBuf::from(real).join("ClaudeCodeUsageMonitor")));
+            assert!(!root.starts_with(PathBuf::from(real).join("UsageHub")));
         }
         for path in [
             settings_path(),
@@ -807,5 +986,541 @@ mod tests {
             assert!(!reloaded.antigravity_gemini_enabled());
             assert!(!reloaded.antigravity_external_enabled());
         }
+    }
+
+    #[test]
+    fn stale_ordinary_save_keeps_managed_registry_and_external_edits() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        // A long-lived UI snapshot taken before the manager transaction.
+        let mut stale = SettingsFile::default();
+        // Manager transaction adds a managed account after the snapshot.
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.codex.profiles.push(AccountProfile {
+                id: "account_1".into(),
+                name: "Managed One".into(),
+                enabled: true,
+                ownership: AccountOwnership::Managed,
+                ..Default::default()
+            });
+            settings.accounts.codex.used_ids.insert("account_1".into());
+            settings.accounts.codex.selected = "account_1".into();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        // The stale session edits its own external profile and a UI flag.
+        stale.accounts.codex.profiles[0].config_dir = "C:\\Users\\Test\\.codex-ui".into();
+        stale.usage_countdown = true;
+        save_settings(&stale).unwrap();
+        let saved = load_settings();
+        // Manager-owned registry survives the stale save.
+        let managed = saved
+            .accounts
+            .codex
+            .find("account_1")
+            .expect("managed account must survive a stale ordinary save");
+        assert_eq!(managed.ownership, AccountOwnership::Managed);
+        assert_eq!(managed.name, "Managed One");
+        assert!(saved.accounts.codex.used_ids.contains("account_1"));
+        // The caller's own external edits survive too.
+        assert_eq!(
+            saved.accounts.codex.find("default").unwrap().config_dir,
+            "C:\\Users\\Test\\.codex-ui"
+        );
+        assert!(saved.usage_countdown);
+    }
+
+    #[test]
+    fn stale_display_save_never_rewinds_manager_managed_edits() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        // Seed a managed account, then snapshot it as a stale UI session.
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles.push(AccountProfile {
+                id: "account_1".into(),
+                name: "Managed One".into(),
+                enabled: true,
+                ownership: AccountOwnership::Managed,
+                ..Default::default()
+            });
+            settings.accounts.claude.used_ids.insert("account_1".into());
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let mut stale = load_settings();
+        // Manager transaction renames, pins and re-points the same id.
+        crate::manager::state::mutate_settings(|settings| {
+            let profile = settings
+                .accounts
+                .claude
+                .find_mut("account_1")
+                .expect("managed account must exist");
+            profile.name = "Managed Renamed".into();
+            profile.pinned = true;
+            profile.sort_order = 7;
+            profile.config_dir = "C:\\Managed\\New".into();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        // The stale session only flips a display flag; its outdated managed
+        // copy must not clobber the manager's latest values.
+        stale.accounts.claude.find("account_1").unwrap();
+        stale.usage_countdown = true;
+        save_settings(&stale).unwrap();
+        let saved = load_settings();
+        let managed = saved
+            .accounts
+            .claude
+            .find("account_1")
+            .expect("managed account must survive a stale ordinary save");
+        assert_eq!(managed.name, "Managed Renamed");
+        assert!(managed.pinned);
+        assert_eq!(managed.sort_order, 7);
+        assert_eq!(managed.config_dir, "C:\\Managed\\New");
+        assert!(saved.usage_countdown);
+    }
+
+    #[test]
+    fn stale_ordinary_save_keeps_retired_ids_and_manager_selection() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        // Retire a managed id through the authoritative transaction path:
+        // the profile is gone but the id stays reserved.
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles.push(AccountProfile {
+                id: "account_1".into(),
+                ownership: AccountOwnership::Managed,
+                ..Default::default()
+            });
+            settings.accounts.claude.used_ids.insert("account_1".into());
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let mut stale = load_settings();
+        crate::manager::state::mutate_settings(|settings| {
+            settings
+                .accounts
+                .claude
+                .profiles
+                .retain(|profile| profile.id != "account_1");
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        // The stale snapshot still lists the retired profile; the ordinary
+        // save must not resurrect it, but must keep the retired id reserved
+        // and adopt the manager's selection.
+        assert!(stale.accounts.claude.find("account_1").is_some());
+        stale.usage_countdown = true;
+        save_settings(&stale).unwrap();
+        let saved = load_settings();
+        assert!(saved.accounts.claude.find("account_1").is_none());
+        assert!(saved.accounts.claude.used_ids.contains("account_1"));
+        assert_eq!(saved.accounts.claude.selected, "default");
+        assert!(saved.usage_countdown);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_share_no_temp_file() {
+        let target = app_data_directory().join("concurrent-probe.json");
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    for round in 0..25 {
+                        write_json_atomic(
+                            &target,
+                            &serde_json::json!({ "worker": index, "round": round }),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let content = std::fs::read_to_string(&target).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value.get("worker").is_some());
+        let leftovers: Vec<_> = std::fs::read_dir(app_data_directory())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+    }
+
+    fn test_source_dir(marker: &str, file_name: &str) -> (std::path::PathBuf, String) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Real temp credential file under the system temp root (never a
+        // production root): deterministic signatures for hermetic asserts.
+        let dir = std::env::temp_dir().join(format!(
+            "usagehub-cache-purge-{}-{}-{}-{marker}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(dir.starts_with(std::env::temp_dir()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_name), "{\"token\":\"fixture\"}").unwrap();
+        let config_dir = dir.to_string_lossy().into_owned();
+        (dir, config_dir)
+    }
+
+    fn test_cache_account(
+        provider: ProviderId,
+        profile: crate::accounts::AccountProfile,
+        percentage: f64,
+    ) -> crate::models::AccountUsage {
+        use crate::models::{AccountUsage, UsageData, UsageSection};
+        // Mirror poller output: provenance points at the real explicit
+        // source so `invalidate_changed_credentials` keeps the reading.
+        let source_path = crate::poller::explicit_source_path(provider, &profile);
+        let source_signature = crate::poller::profile_source_signature(provider, &profile);
+        AccountUsage {
+            provider,
+            profile,
+            source_signature,
+            source_path,
+            usage: Some(UsageData {
+                session: UsageSection {
+                    available: true,
+                    percentage,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            error: None,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn registry_removal_purges_deleted_account_from_disk_cache() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        use crate::models::{UsageData, UsageSection};
+        let (personal_dir, personal_config) = test_source_dir("personal", ".credentials.json");
+        let (work_dir, work_config) = test_source_dir("work", ".credentials.json");
+        let (codex_dir, codex_config) = test_source_dir("codex", "auth.json");
+        // Directory names end with `-{marker}` (no trailing dash): match the
+        // exact file names so these asserts track `test_source_dir` format.
+        let personal_tag = personal_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let work_tag = work_dir.file_name().unwrap().to_string_lossy().into_owned();
+        let codex_tag = codex_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Authoritative registry path: holds the Windows named settings
+        // lock, mirroring production deletion.
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles = vec![
+                AccountProfile {
+                    id: "personal".into(),
+                    name: "Personal".into(),
+                    config_dir: personal_config.clone(),
+                    enabled: true,
+                    ownership: AccountOwnership::Managed,
+                    ..Default::default()
+                },
+                AccountProfile {
+                    id: "work".into(),
+                    name: "Work".into(),
+                    config_dir: work_config.clone(),
+                    enabled: true,
+                    ownership: AccountOwnership::Managed,
+                    ..Default::default()
+                },
+            ];
+            settings.accounts.claude.selected = "personal".into();
+            settings.accounts.claude.used_ids.extend([
+                "personal".to_string(),
+                "work".to_string(),
+                "account_9".to_string(),
+            ]);
+            settings.accounts.codex.profiles[0].config_dir = codex_config.clone();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let settings = load_settings();
+        let personal = settings.accounts.claude.find("personal").unwrap().clone();
+        let work = settings.accounts.claude.find("work").unwrap().clone();
+        let codex = settings.accounts.codex.find("default").unwrap().clone();
+        let mut data = AppUsageData::from_iter([(
+            ProviderId::Cursor,
+            UsageData {
+                session: UsageSection {
+                    available: true,
+                    percentage: 12.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )]);
+        data.accounts = vec![
+            test_cache_account(ProviderId::Claude, personal, 25.0),
+            test_cache_account(ProviderId::Claude, work, 60.0),
+            test_cache_account(ProviderId::Codex, codex, 10.0),
+        ];
+        save_usage_cache(&data, true).unwrap();
+        let seeded = std::fs::read_to_string(usage_cache_path()).unwrap();
+        assert!(seeded.contains(&personal_tag), "{seeded}");
+        assert!(seeded.contains(&work_tag), "{seeded}");
+        // Delete the work account through the authoritative path.
+        crate::manager::state::mutate_settings(|settings| {
+            settings
+                .accounts
+                .claude
+                .profiles
+                .retain(|profile| profile.id != "work");
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let raw = std::fs::read_to_string(usage_cache_path()).unwrap();
+        assert!(
+            !raw.contains(&work_tag),
+            "deleted work source leaked on disk: {raw}"
+        );
+        assert!(
+            !raw.contains("\"work\""),
+            "deleted work id leaked on disk: {raw}"
+        );
+        assert!(raw.contains(&personal_tag), "sibling account lost: {raw}");
+        assert!(
+            raw.contains(&codex_tag),
+            "unrelated provider account lost: {raw}"
+        );
+        // Opaque retired ids stay reserved; the registry still resolves.
+        let settings = load_settings();
+        assert!(settings.accounts.claude.find("work").is_none());
+        assert!(settings.accounts.claude.used_ids.contains("work"));
+        assert!(settings.accounts.claude.used_ids.contains("account_9"));
+        // Filtered load agrees with disk: no resurrection, siblings kept.
+        let cache = load_usage_cache().unwrap();
+        assert!(cache
+            .data
+            .accounts
+            .iter()
+            .all(|account| account.profile.id != "work"));
+        assert_eq!(
+            cache
+                .data
+                .get(ProviderId::Claude)
+                .unwrap()
+                .session
+                .percentage,
+            25.0
+        );
+        assert_eq!(
+            cache
+                .data
+                .get(ProviderId::Codex)
+                .unwrap()
+                .session
+                .percentage,
+            10.0
+        );
+        assert_eq!(
+            cache
+                .data
+                .get(ProviderId::Cursor)
+                .unwrap()
+                .session
+                .percentage,
+            12.0
+        );
+        std::fs::remove_dir_all(&personal_dir).unwrap();
+        std::fs::remove_dir_all(&work_dir).unwrap();
+        std::fs::remove_dir_all(&codex_dir).unwrap();
+    }
+
+    #[test]
+    fn late_pre_delete_snapshot_cannot_resurrect_removed_profile() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        let (personal_dir, personal_config) = test_source_dir("personal", ".credentials.json");
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles = vec![AccountProfile {
+                id: "personal".into(),
+                name: "Personal".into(),
+                config_dir: personal_config.clone(),
+                enabled: true,
+                ownership: AccountOwnership::Managed,
+                ..Default::default()
+            }];
+            settings.accounts.claude.selected = "personal".into();
+            settings
+                .accounts
+                .claude
+                .used_ids
+                .extend(["personal".to_string(), "work".to_string()]);
+            settings.accounts.codex.profiles[0].config_dir.clear();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let settings = load_settings();
+        let personal = settings.accounts.claude.find("personal").unwrap().clone();
+        // A poller snapshot taken before the delete still lists the work
+        // account; publishing it after the delete must not bring it back.
+        let mut stale = AppUsageData::default();
+        stale.accounts = vec![
+            test_cache_account(ProviderId::Claude, personal, 25.0),
+            test_cache_account(
+                ProviderId::Claude,
+                AccountProfile {
+                    id: "work".into(),
+                    name: "Work".into(),
+                    config_dir: "C:\\removed\\work".into(),
+                    enabled: true,
+                    ownership: AccountOwnership::Managed,
+                    ..Default::default()
+                },
+                60.0,
+            ),
+        ];
+        save_usage_cache(&stale, true).unwrap();
+        let raw = std::fs::read_to_string(usage_cache_path()).unwrap();
+        assert!(
+            !raw.contains("removed"),
+            "stale snapshot resurrected deleted source: {raw}"
+        );
+        assert!(
+            !raw.contains("\"work\""),
+            "stale snapshot resurrected deleted id: {raw}"
+        );
+        let cache = load_usage_cache().unwrap();
+        assert_eq!(cache.data.accounts.len(), 1);
+        assert_eq!(cache.data.accounts[0].profile.id, "personal");
+        std::fs::remove_dir_all(&personal_dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_setting_change_leaves_disk_cache_untouched() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        let (personal_dir, personal_config) = test_source_dir("personal", ".credentials.json");
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles = vec![AccountProfile {
+                id: "personal".into(),
+                name: "Personal".into(),
+                config_dir: personal_config.clone(),
+                enabled: true,
+                ownership: AccountOwnership::Managed,
+                ..Default::default()
+            }];
+            settings.accounts.claude.selected = "personal".into();
+            settings.accounts.codex.profiles[0].config_dir.clear();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let settings = load_settings();
+        let personal = settings.accounts.claude.find("personal").unwrap().clone();
+        let mut data = AppUsageData::default();
+        data.accounts = vec![test_cache_account(ProviderId::Claude, personal, 25.0)];
+        save_usage_cache(&data, true).unwrap();
+        let before = std::fs::read(usage_cache_path()).unwrap();
+        crate::manager::state::mutate_settings(|settings| {
+            settings.usage_countdown = !settings.usage_countdown;
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let after = std::fs::read(usage_cache_path()).unwrap();
+        assert_eq!(
+            before, after,
+            "unrelated setting flip churned the disk cache"
+        );
+        std::fs::remove_dir_all(&personal_dir).unwrap();
+    }
+
+    #[test]
+    fn cache_purge_failure_keeps_registry_truthful() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        let (personal_dir, personal_config) = test_source_dir("personal", ".credentials.json");
+        let (work_dir, work_config) = test_source_dir("work", ".credentials.json");
+        let work_tag = work_dir.file_name().unwrap().to_string_lossy().into_owned();
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles = vec![
+                AccountProfile {
+                    id: "personal".into(),
+                    name: "Personal".into(),
+                    config_dir: personal_config.clone(),
+                    enabled: true,
+                    ownership: AccountOwnership::Managed,
+                    ..Default::default()
+                },
+                AccountProfile {
+                    id: "work".into(),
+                    name: "Work".into(),
+                    config_dir: work_config.clone(),
+                    enabled: true,
+                    ownership: AccountOwnership::Managed,
+                    ..Default::default()
+                },
+            ];
+            settings.accounts.claude.selected = "personal".into();
+            settings.accounts.codex.profiles[0].config_dir.clear();
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let settings = load_settings();
+        let mut data = AppUsageData::default();
+        data.accounts = vec![
+            test_cache_account(
+                ProviderId::Claude,
+                settings.accounts.claude.find("personal").unwrap().clone(),
+                25.0,
+            ),
+            test_cache_account(
+                ProviderId::Claude,
+                settings.accounts.claude.find("work").unwrap().clone(),
+                60.0,
+            ),
+        ];
+        save_usage_cache(&data, true).unwrap();
+        // Read-only cache file: the registry commit succeeds but the purge
+        // replace fails. The guard below restores writability on any exit.
+        struct WritableOnDrop(std::path::PathBuf);
+        impl Drop for WritableOnDrop {
+            fn drop(&mut self) {
+                if let Ok(metadata) = std::fs::metadata(&self.0) {
+                    let mut permissions = metadata.permissions();
+                    if permissions.readonly() {
+                        permissions.set_readonly(false);
+                        let _ = std::fs::set_permissions(&self.0, permissions);
+                    }
+                }
+            }
+        }
+        let cache_path = usage_cache_path();
+        let mut permissions = std::fs::metadata(&cache_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&cache_path, permissions).unwrap();
+        let _writable = WritableOnDrop(cache_path.clone());
+        let result = crate::manager::state::mutate_settings(|settings| {
+            settings
+                .accounts
+                .claude
+                .profiles
+                .retain(|profile| profile.id != "work");
+            Ok::<_, String>(())
+        });
+        let error = result.expect_err("read-only cache must surface a partial error");
+        assert!(error.contains("usage cache"), "unexpected error: {error}");
+        // Registry commit stayed accurate despite the purge failure.
+        assert!(load_settings().accounts.claude.find("work").is_none());
+        drop(_writable);
+        // Recovery purges the deleted account and reports success.
+        save_settings(&load_settings()).unwrap();
+        let raw = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(
+            !raw.contains(&work_tag),
+            "deleted work source leaked on disk: {raw}"
+        );
+        std::fs::remove_dir_all(&personal_dir).unwrap();
+        std::fs::remove_dir_all(&work_dir).unwrap();
     }
 }

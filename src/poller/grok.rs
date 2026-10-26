@@ -1,5 +1,3 @@
-use std::io::Read;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -21,7 +19,6 @@ const GROK_CLIENT_MODE: &str = "cli";
 const DEFAULT_GROK_CLIENT_VERSION: &str = "1.0.0";
 const GROK_HOME_ENV: &str = "GROK_HOME";
 const GROK_CLIENT_VERSION_ENV: &str = "GROK_CLIENT_VERSION";
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// One entry of `auth.json`, keyed by `"{issuer}::{client_id}"` or the
 /// legacy `"https://accounts.x.ai/sign-in"` scope.
@@ -406,27 +403,23 @@ fn cli_grok_version() -> Option<String> {
 }
 
 fn read_cli_version(path: &str, timeout: Duration) -> Option<String> {
-    let start = std::time::Instant::now();
-    let mut child = grok_command(path, &["version"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    // Drain while the process runs so a full pipe cannot block its exit.
-    // Bound both the captured output and the wait, including inherited pipes.
-    std::thread::spawn(move || {
-        let mut output = String::new();
-        let result = stdout.take(64 * 1024).read_to_string(&mut output);
-        let _ = sender.send(result.ok().map(|_| output));
-    });
-    if !wait_for_command(&mut child, timeout) {
+    // Shared bounded runner owns the deadline, the concurrent pipe drain and
+    // the kill-on-timeout job tree. Original 64KiB stdout cap: a capped
+    // (possibly truncated) buffer is never version-parsed.
+    const VERSION_CAPTURE_CAP: usize = 64 * 1024;
+    let mut command = grok_command(path, &["version"]);
+    let output = crate::manager::process::run_bounded(
+        &mut command,
+        timeout,
+        VERSION_CAPTURE_CAP,
+        "grok version",
+    )
+    .ok()?;
+    if !output.status.success() || output.stdout.len() >= VERSION_CAPTURE_CAP {
         return None;
     }
-    let output = receiver
-        .recv_timeout(timeout.saturating_sub(start.elapsed()))
-        .ok()??;
-    first_version(&output)
+    let text = String::from_utf8(output.stdout).ok()?;
+    first_version(&text)
 }
 
 /// Pick the first `major.minor.patch` token out of arbitrary CLI output.
@@ -453,14 +446,17 @@ fn cli_refresh_grok_token() {
         "attempting Windows Grok token refresh via {grok_path}"
     ));
 
-    let mut child = match grok_command(&grok_path, &["models"]).spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Grok token refresh", error);
-            return;
-        }
-    };
-    wait_for_command(&mut child, Duration::from_secs(30));
+    let mut command = grok_command(&grok_path, &["models"]);
+    // Shared bounded runner owns stdio pipes, the hidden console, the original
+    // 30s refresh budget and the kill-on-timeout job tree. No CLI args in logs.
+    if let Err(error) = crate::manager::process::run_bounded(
+        &mut command,
+        Duration::from_secs(30),
+        64 * 1024,
+        "grok token refresh",
+    ) {
+        diagnose::log(format!("Windows Grok token refresh failed: {error}"));
+    }
 }
 
 fn grok_command(grok_path: &str, args: &[&str]) -> Command {
@@ -485,12 +481,7 @@ fn grok_command(grok_path: &str, args: &[&str]) -> Command {
         command.args(args);
         command
     };
-    command
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
+    // run_bounded owns stdin null, stdout/stderr pipes and the hidden console.
     command
 }
 
@@ -499,12 +490,17 @@ fn resolve_windows_grok_path() -> String {
     cached_cli_detection(&PATH, || {
         // The official installer drops a real executable in ~/.grok/bin;
         // prefer it over an npm shim that would cost an extra cmd.exe hop.
+        // Bounded discovery: 2s and 8MiB per probe, four probes at most, so the
+        // whole scan stays well within 16s even when every probe hangs.
         for name in ["grok.exe", "grok.cmd", "grok.ps1", "grok"] {
-            if let Ok(output) = Command::new("where.exe")
-                .arg(name)
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-            {
+            let mut locate = Command::new("where.exe");
+            locate.arg(name);
+            if let Ok(output) = crate::manager::process::run_bounded(
+                &mut locate,
+                Duration::from_secs(2),
+                8 * 1024 * 1024,
+                "grok discovery",
+            ) {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Some(path) = stdout
@@ -521,26 +517,6 @@ fn resolve_windows_grok_path() -> String {
         None
     })
     .unwrap_or_else(|| "grok.cmd".to_string())
-}
-
-fn wait_for_command(child: &mut std::process::Child, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
 }
 
 fn non_empty_environment(name: &str) -> Option<String> {

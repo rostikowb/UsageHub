@@ -2426,7 +2426,7 @@ fn minecraft_context_menu_migration_is_targeted_and_one_time() {
 #[test]
 fn bundled_minecraft_install_preserves_user_edits() {
     let root = std::env::temp_dir().join(format!(
-        "claude-code-usage-monitor-minecraft-test-{}-{}",
+        "usagehub-minecraft-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -148,7 +148,7 @@ unsafe fn dispatch_to_surface(msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESU
 
 pub(super) unsafe fn create_primary_surface() -> HWND {
     let instance = GetModuleHandleW(PCWSTR::null()).unwrap();
-    let class = native_interop::wide_str("ClaudeCodeUsageSurface");
+    let class = native_interop::wide_str("UsageHubSurface");
     RegisterClassW(&WNDCLASSW {
         style: CS_DBLCLKS,
         lpfnWndProc: Some(wnd_proc),
@@ -209,7 +209,7 @@ pub(super) fn surface_alive(hwnd: HWND) -> bool {
         && native_interop::window_class_name(hwnd).is_some_and(|name| {
             matches!(
                 name.as_str(),
-                "ClaudeCodeUsageSurface" | "CCUMThemeMirror" | "CCUMDesktopSurface"
+                "UsageHubSurface" | "UHThemeMirror" | "UHDesktopSurface"
             )
         })
 }

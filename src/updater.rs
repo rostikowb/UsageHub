@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,8 +16,10 @@ const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-// Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
+// Fork identifier reserved for a future UsageHub listing. It intentionally
+// differs from the upstream package so a WinGet-based install can never be
+// upgraded to an upstream build.
+const WINGET_PACKAGE_ID: &str = "UsageHub.UsageHub";
 // `winget show` exit code when the package is not in the source.
 const WINGET_NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
 const WINGET_SHOW_TIMEOUT: Duration = Duration::from_secs(60);
@@ -122,7 +124,25 @@ pub fn current_install_channel() -> InstallChannel {
     }
 }
 
+/// Fork update policy: UsageHub publishes no release channel yet, so every
+/// update check and install is refused before touching the network. An
+/// upstream release must never replace this side-by-side fork install. To
+/// enable the fork's own channel later: point `repository` in Cargo.toml at
+/// the fork, publish a `usagehub.exe` asset per release, set
+/// `WINGET_PACKAGE_ID` to the fork listing, then make
+/// `own_update_channel_configured` return true.
+fn own_update_channel_configured() -> bool {
+    false
+}
+
+fn update_channel_disabled() -> String {
+    "Automatic updates are disabled in this UsageHub build. Install new UsageHub releases manually; it never updates itself from the upstream project.".into()
+}
+
 pub fn check_for_updates(channel: InstallChannel) -> Result<UpdateCheckResult, String> {
+    if !own_update_channel_configured() {
+        return Err(update_channel_disabled());
+    }
     check_channel_updates(channel, fetch_latest_release, winget_listed_versions)
 }
 
@@ -161,6 +181,9 @@ fn winget_update_result(current: &Version, listed: &[Version]) -> UpdateCheckRes
 }
 
 pub fn begin_winget_update() -> Result<(), String> {
+    if !own_update_channel_configured() {
+        return Err(update_channel_disabled());
+    }
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     let current_dir = current_exe
@@ -184,6 +207,9 @@ pub fn begin_winget_update() -> Result<(), String> {
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
+    if !own_update_channel_configured() {
+        return Err(update_channel_disabled());
+    }
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     ensure_target_location_writable(&current_exe)?;
@@ -373,64 +399,42 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
 
 fn updates_dir() -> Result<PathBuf, String> {
     crate::known_folders::local_app_data_dir()
-        .map(|dir| dir.join("ClaudeCodeUsageMonitor").join("updates"))
-        .or_else(|| {
-            Some(
-                std::env::temp_dir()
-                    .join("ClaudeCodeUsageMonitor")
-                    .join("updates"),
-            )
-        })
+        .map(|dir| dir.join("UsageHub").join("updates"))
+        .or_else(|| Some(std::env::temp_dir().join("UsageHub").join("updates")))
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
 fn winget_listed_versions() -> Result<Vec<Version>, String> {
-    let mut child = Command::new("winget.exe")
-        .args(WINGET_SHOW_VERSIONS_ARGS)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Unable to run WinGet: {e}"))?;
-
-    // Drain stdout on another thread so a full pipe cannot stall WinGet.
-    let stdout = child.stdout.take().expect("WinGet stdout is piped");
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = stdout.take(1024 * 1024).read_to_end(&mut output);
-        let _ = sender.send(result.map(|_| output));
-    });
-
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < WINGET_SHOW_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Timed out waiting for WinGet to list available versions.".into());
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Unable to wait for WinGet: {error}"));
-            }
+    const WINGET_SHOW_CAPTURE_CAP: usize = 1024 * 1024;
+    // Shared bounded runner owns the deadline, the concurrent pipe drain and
+    // the kill-on-timeout job tree; the original 60s budget is unchanged.
+    // Long-lived update handoffs (begin_winget_update/begin_self_update and
+    // relaunch_target) are detached spawns, not console queries, and stay out.
+    let mut command = Command::new("winget.exe");
+    command.args(WINGET_SHOW_VERSIONS_ARGS);
+    let output = crate::manager::process::run_bounded(
+        &mut command,
+        WINGET_SHOW_TIMEOUT,
+        WINGET_SHOW_CAPTURE_CAP,
+        "winget show",
+    )
+    .map_err(|error| match error {
+        crate::manager::process::ConsoleError::TimedOut { .. } => {
+            "Timed out waiting for WinGet to list available versions.".to_string()
         }
-    };
-    // A descendant retaining the pipe must not extend the check indefinitely.
-    let output = receiver
-        .recv_timeout(WINGET_SHOW_TIMEOUT.saturating_sub(started.elapsed()))
-        .map_err(|e| format!("Unable to receive WinGet output: {e}"))?
-        .map_err(|e| format!("Unable to read WinGet output: {e}"))?;
-    if output.len() == 1024 * 1024 {
+        crate::manager::process::ConsoleError::Failed { detail, .. } => {
+            format!("Unable to run WinGet: {detail}")
+        }
+    })?;
+    // The runner truncates at the cap, so a full buffer means the listing was
+    // cut off: never parse a partial version list.
+    if output.stdout.len() >= WINGET_SHOW_CAPTURE_CAP {
         return Err("WinGet version output exceeded the size limit.".into());
     }
-    winget_versions_outcome(status.code(), &String::from_utf8_lossy(&output))
+    winget_versions_outcome(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
 }
 
 fn winget_versions_outcome(exit_code: Option<i32>, stdout: &str) -> Result<Vec<Version>, String> {
@@ -503,7 +507,7 @@ fn ensure_target_location_writable(target: &Path) -> Result<(), String> {
         "Unable to determine the install directory for the current executable.".to_string()
     })?;
 
-    let probe_path = parent.join(".__ccum_update_probe");
+    let probe_path = parent.join(".__usagehub_update_probe");
     match File::create(&probe_path) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe_path);

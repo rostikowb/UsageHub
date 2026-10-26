@@ -1,4 +1,3 @@
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,22 +5,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use super::claude_desktop;
-use super::{
-    build_agent, get_header_f64, get_header_i64, parse_iso8601, unix_to_system_time, HttpResponse,
-    PollError,
-};
+use super::{build_agent, parse_iso8601, PollError};
 use crate::diagnose;
 use crate::models::{CreditsSection, UsageData};
 
-mod cli;
 mod limits;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-// Keep header probes on the low-cost Haiku tier. This API alias follows 4.5
-// snapshots, but still needs updating when the Haiku 4.5 generation retires.
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-haiku-4-5"];
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Deserialize)]
 struct UsageResponse {
@@ -71,6 +61,10 @@ struct Credentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CredentialSource {
     Windows(PathBuf),
+    /// A confirmed Windows Credential Manager target owned by one account
+    /// profile (`AccountProfile::credential_targets`). Only listed targets
+    /// are ever read; nothing is guessed or enumerated by prefix.
+    CredentialManager(String),
     /// The Claude desktop app's own token cache, used when Claude Code has
     /// only ever run inside the desktop app and no CLI login wrote
     /// `~/.claude/.credentials.json`.
@@ -89,117 +83,120 @@ pub(super) fn poll_claude_code() -> Result<UsageData, PollError> {
         }
     };
 
-    let creds = refresh_credentials(creds)?;
+    if is_token_expired(creds.expires_at) {
+        return Err(PollError::TokenExpired);
+    }
 
-    fetch_usage_with_fallback(&creds.access_token)
+    fetch_usage(&creds.access_token)
 }
 
-/// Explicit profiles are pinned to one source, including when refresh fails.
+/// Named credential-file profiles are pinned to their own login material. An
+/// expired login reports `TokenExpired` instead of borrowing another
+/// account's token: there is no fallback to the default CLI path, the global
+/// discovery order, or another profile's desktop directory.
 ///
-/// The one exception is a profile sitting on the default CLI path. That path
-/// is where the desktop app's Claude Code build would have logged in too, and
-/// the desktop app can leave `.credentials.json` present but tokenless once it
-/// takes the login over. Treating "no token there" as the end of the search
-/// hides a perfectly good desktop token, so the default path — and only the
-/// default path — falls through to the desktop app. A custom export stays
-/// pinned, so a multi-account setup can never borrow another account's token.
-pub(super) fn poll_account(path: &Path) -> Result<UsageData, PollError> {
-    let mut credentials =
-        match read_credentials_from_source(&CredentialSource::Windows(path.to_path_buf())) {
-            Some(credentials) => credentials,
-            None => desktop_credentials_for_default_path(path).ok_or(PollError::NoCredentials)?,
-        };
-
-    // Refresh against whichever source actually produced the token.
-    let source = credentials.source.clone();
-    if is_token_expired(credentials.expires_at) {
-        cli_refresh_token(&source);
-        credentials = read_credentials_from_source(&source).ok_or(PollError::TokenExpired)?;
+/// Resolution order: the profile's own credentials file, then — only when
+/// the file holds no usable token — the profile's confirmed
+/// `credential_targets` through the Windows Credential Manager. Desktop
+/// logins are reachable exclusively through `SourceKind::DesktopDir` profiles
+/// (`poll_desktop_dir`), never implicitly from here.
+pub(super) fn poll_credential_file(
+    path: &Path,
+    credential_targets: &[String],
+) -> Result<UsageData, PollError> {
+    if let Some(credentials) =
+        read_credentials_from_source(&CredentialSource::Windows(path.to_path_buf()))
+    {
         if is_token_expired(credentials.expires_at) {
             return Err(PollError::TokenExpired);
         }
+        return fetch_usage(&credentials.access_token);
     }
-    fetch_usage_with_fallback(&credentials.access_token)
-}
-
-/// The desktop app's token, but only for a profile that points at the default
-/// CLI credentials path.
-fn desktop_credentials_for_default_path(path: &Path) -> Option<Credentials> {
-    let credentials = desktop_fallback_paths(path)
-        .iter()
-        .find_map(|path| read_desktop_app_credentials(path))?;
-    diagnose::log("default profile fell back to the Claude desktop app token cache");
-    Some(credentials)
-}
-
-fn desktop_fallback_paths(path: &Path) -> Vec<PathBuf> {
-    let Some(default) =
-        crate::accounts::default_credential_path(crate::providers::ProviderId::Claude)
-    else {
-        return Vec::new();
-    };
-    let explicit = std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|value| !value.is_empty());
-    desktop_fallback_allowed(path, &default, explicit)
-        .then(claude_desktop::config_paths)
-        .unwrap_or_default()
-}
-
-fn desktop_fallback_allowed(path: &Path, default: &Path, explicit_directory: bool) -> bool {
-    // default_credential_path also honors CLAUDE_CONFIG_DIR. That is an
-    // explicit account selection, not permission to use the desktop login.
-    !explicit_directory && crate::accounts::source_key(path) == crate::accounts::source_key(default)
-}
-
-pub(super) fn account_watch_signature(path: &Path) -> String {
-    account_watch_signature_with_desktop(path, &desktop_fallback_paths(path))
-}
-
-fn account_watch_signature_with_desktop(path: &Path, desktops: &[PathBuf]) -> String {
-    let mut signature = crate::accounts::file_signature(path);
-    if desktops.is_empty() {
-        return signature;
+    for target in credential_targets {
+        let Some(credentials) = read_named_credential(target) else {
+            continue;
+        };
+        if is_token_expired(credentials.expires_at) {
+            return Err(PollError::TokenExpired);
+        }
+        return fetch_usage(&credentials.access_token);
     }
-    // Default-path accounts can use either installation. Include even missing
-    // caches so a new Store login resumes polling; custom accounts stay pinned.
-    for desktop in desktops {
-        signature.push('|');
-        signature.push_str(&claude_desktop::watch_signature(desktop));
+    Err(PollError::NoCredentials)
+}
+
+/// Explicit desktop-directory profiles read the original Rust OSCrypt reader
+/// over `config.json` + `Local State` in that directory only, then run the
+/// unchanged usageBar server GET parser. No CLI credential discovery, no
+/// other directory's cache, no token refresh.
+pub(super) fn poll_desktop_dir(dir: &Path) -> Result<UsageData, PollError> {
+    let token = claude_desktop::read_token_for_dir(dir).ok_or_else(|| {
+        diagnose::log(format!(
+            "no usable Claude desktop login in {}",
+            dir.display()
+        ));
+        PollError::NoCredentials
+    })?;
+    if is_token_expired(token.expires_at) {
+        return Err(PollError::TokenExpired);
+    }
+    fetch_usage(&token.access_token)
+}
+
+/// Read one confirmed credential-manager target owned by the calling profile.
+/// Unknown or unreadable targets behave like a missing file: the caller
+/// moves on without borrowing anything else.
+fn read_named_credential(target: &str) -> Option<Credentials> {
+    let secret = super::windows_credentials::read_generic(target)?;
+    parse_credentials(
+        &secret,
+        CredentialSource::CredentialManager(target.to_string()),
+    )
+}
+
+/// Content signature for one named Claude profile: its credentials file plus
+/// the last-write stamps of its confirmed credential-manager targets. Token
+/// rotation changes the signature so only the owning account resumes; other
+/// accounts keep their own signatures and stay paused or live independently.
+pub(super) fn credential_file_signature(path: &Path, credential_targets: &[String]) -> String {
+    let mut signature = format!("file:{}", crate::accounts::file_signature(path));
+    let mut targets: Vec<&str> = credential_targets.iter().map(String::as_str).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    for target in targets {
+        match super::windows_credentials::last_written(target) {
+            Some(stamp) => signature.push_str(&format!("|credman:{target}|{stamp}")),
+            None => signature.push_str(&format!("|credman:{target}|missing")),
+        }
     }
     crate::accounts::fingerprint(&signature)
 }
 
-pub(super) fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
-    if let Some(data) = try_usage_endpoint(token)? {
-        // If reset timers are missing, fill them in from the Messages API
-        if (data.session.available && data.session.resets_at.is_none())
-            || (data.weekly.available && data.weekly.resets_at.is_none())
-        {
-            if let Ok(fallback) = fetch_usage_via_messages(token) {
-                let mut merged = data;
-                merged.session.available |= fallback.session.available;
-                merged.weekly.available |= fallback.weekly.available;
-                if merged.session.resets_at.is_none() {
-                    merged.session.resets_at = fallback.session.resets_at;
-                }
-                if merged.weekly.resets_at.is_none() {
-                    merged.weekly.resets_at = fallback.weekly.resets_at;
-                }
-                return Ok(merged);
-            }
+/// Full content signature for a Claude account profile: desktop-directory
+/// profiles cover `config.json` + `Local State`, credential-file profiles
+/// cover the file + confirmed credential-manager targets, and the legacy
+/// provider-default profile keeps the dynamic global-discovery snapshot so a
+/// fresh login still resumes polling.
+pub(super) fn profile_signature(profile: &crate::accounts::AccountProfile) -> String {
+    if !profile.desktop_dir.trim().is_empty() {
+        return match profile.desktop_dir_resolved() {
+            Ok(Some(dir)) => claude_desktop::signature_for_dir(&dir),
+            _ => crate::accounts::fingerprint("desktop-dir|unresolved"),
+        };
+    }
+    match profile.credential_path(crate::providers::ProviderId::Claude) {
+        Ok(Some(path)) => credential_file_signature(&path, &profile.credential_targets),
+        Ok(None) => {
+            crate::accounts::fingerprint(&format!("{:?}", credential_watch_snapshot(false)))
         }
-        return Ok(data);
+        Err(error) => crate::accounts::fingerprint(&error),
     }
-
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
-    }
-    result
 }
 
-pub(super) fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
+/// Ordinary monitoring reads the dedicated usage endpoint exactly as returned:
+/// no model prompts, no quota probes, no CLI refresh. A missing reset stays
+/// unknown (`None`); only the server's own timestamps are reported. Any
+/// endpoint failure surfaces explicitly with its own status.
+pub(super) fn fetch_usage(token: &str) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
 
     let mut resp = match agent
@@ -210,27 +207,13 @@ pub(super) fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollE
         .and_then(super::check_http_status)
     {
         Ok(resp) => resp,
-        Err(error) => match classify_usage_failure(&error) {
-            UsageEndpointFailure::Auth => {
-                diagnose::log(format!(
-                    "usage endpoint returned an auth error ({error}); re-login required"
-                ));
-                return Err(usage_request_error(&error));
-            }
-            UsageEndpointFailure::Transient => {
-                diagnose::log(format!("usage endpoint temporarily unavailable ({error})"));
-                return Err(usage_request_error(&error));
-            }
-            UsageEndpointFailure::Unsupported => {
-                diagnose::log(format!(
-                    "usage endpoint unavailable for this account ({error}); trying the Messages API"
-                ));
-                return Ok(None);
-            }
-        },
+        Err(error) => {
+            diagnose::log(format!("claude usage endpoint request failed ({error})"));
+            return Err(usage_request_error(&error));
+        }
     };
 
-    parse_usage_body(resp.body_mut()).map(Some)
+    parse_usage_body(resp.body_mut())
 }
 
 fn parse_usage_body(body: &mut ureq::Body) -> Result<UsageData, PollError> {
@@ -294,31 +277,6 @@ fn usage_from_response(response: UsageResponse) -> UsageData {
     data
 }
 
-/// What a failed call to the usage endpoint actually tells us.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UsageEndpointFailure {
-    /// The credentials were rejected.
-    Auth,
-    /// Rate limited, a server-side fault, or the network. Retrying later is
-    /// the right move. Asking the Messages API instead would spend real quota
-    /// on a request whose only purpose is to read headers, and during a rate
-    /// limit it would add to the load that caused it.
-    Transient,
-    /// The endpoint is not usable on this account, which is what the Messages
-    /// API fallback exists for.
-    Unsupported,
-}
-
-fn classify_usage_failure(error: &ureq::Error) -> UsageEndpointFailure {
-    match error {
-        ureq::Error::StatusCode(401 | 403) => UsageEndpointFailure::Auth,
-        ureq::Error::StatusCode(429) => UsageEndpointFailure::Transient,
-        ureq::Error::StatusCode(code) if *code >= 500 => UsageEndpointFailure::Transient,
-        ureq::Error::StatusCode(_) => UsageEndpointFailure::Unsupported,
-        _ => UsageEndpointFailure::Transient,
-    }
-}
-
 fn usage_request_error(error: &ureq::Error) -> PollError {
     match error {
         ureq::Error::StatusCode(status) => PollError::HttpStatus(*status),
@@ -352,126 +310,6 @@ fn claude_credits(spend: &SpendResponse, data: &UsageData) -> Option<CreditsSect
     })
 }
 
-pub(super) fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    fetch_usage_via_messages_at(token, MESSAGES_URL)
-}
-
-fn fetch_usage_via_messages_at(token: &str, url: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-    let mut last_error = PollError::RequestFailed;
-
-    for model in MODEL_FALLBACK_CHAIN {
-        let body = serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}]
-        });
-
-        let response = match agent
-            .post(url)
-            // A 429 still carries the usage and reset headers this probe needs.
-            // Keep polling them without recording or obeying a cooldown.
-            .extension(super::retry_after::BypassCooldown)
-            .header("Authorization", &format!("Bearer {token}"))
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .send_json(&body)
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                last_error = usage_request_error(&error);
-                continue;
-            }
-        };
-
-        let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            diagnose::log(format!(
-                "messages endpoint returned auth error status {status}; re-login required"
-            ));
-            return Err(PollError::HttpStatus(status));
-        }
-
-        let h5 = response
-            .headers()
-            .get("anthropic-ratelimit-unified-5h-utilization");
-        let h7 = response
-            .headers()
-            .get("anthropic-ratelimit-unified-7d-utilization");
-        let hs = response.headers().get("anthropic-ratelimit-unified-status");
-
-        if h5.is_some() || h7.is_some() || hs.is_some() {
-            return Ok(parse_rate_limit_headers(&response));
-        }
-        last_error = if response.status().is_client_error() || response.status().is_server_error() {
-            PollError::HttpStatus(status)
-        } else {
-            PollError::RequestFailed
-        };
-    }
-
-    Err(last_error)
-}
-
-pub(super) fn parse_rate_limit_headers(response: &HttpResponse) -> UsageData {
-    let mut data = UsageData::default();
-
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-    data.session.available = data.session.resets_at.is_some()
-        || response
-            .headers()
-            .contains_key("anthropic-ratelimit-unified-5h-utilization");
-    data.weekly.available = data.weekly.resets_at.is_some()
-        || response
-            .headers()
-            .contains_key("anthropic-ratelimit-unified-7d-utilization");
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-    let claim = response
-        .headers()
-        .get("anthropic-ratelimit-unified-representative-claim")
-        .and_then(|value| value.to_str().ok());
-    data.session.available |= claim == Some("five_hour");
-    data.weekly.available |= claim == Some("seven_day");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
-        let status = response
-            .headers()
-            .get("anthropic-ratelimit-unified-status")
-            .and_then(|value| value.to_str().ok());
-        if status == Some("rejected") {
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
-            }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
-            // Retain the legacy reset binding, but a shared reset alone does
-            // not establish that the five-hour window exists.
-        }
-    }
-
-    data
-}
-
 pub(super) fn credential_watch_snapshot(all_sources: bool) -> Vec<String> {
     let sources = if all_sources {
         all_known_credential_sources()
@@ -488,126 +326,6 @@ pub(super) fn credential_watch_snapshot(all_sources: bool) -> Vec<String> {
     snapshot.sort();
     snapshot.dedup();
     snapshot
-}
-
-fn refresh_credentials(credentials: Credentials) -> Result<Credentials, PollError> {
-    if !is_token_expired(credentials.expires_at) {
-        return Ok(credentials);
-    }
-    let source = credentials.source;
-    cli_refresh_token(&source);
-    // An expired login is still a selected account. Do not replace it with
-    // another account found in Desktop or WSL when its refresh fails.
-    read_credentials_from_source(&source)
-        .filter(|credentials| !is_token_expired(credentials.expires_at))
-        .ok_or(PollError::TokenExpired)
-}
-
-fn cli_refresh_token(source: &CredentialSource) {
-    match source {
-        CredentialSource::Windows(path) => {
-            // The CLI only owns this filename. A custom export is read-only.
-            if path
-                .file_name()
-                .is_some_and(|name| name == ".credentials.json")
-            {
-                if let Some(directory) = path.parent() {
-                    cli_refresh_windows_token(directory);
-                }
-            }
-        }
-        // The desktop app owns this token and refreshes it itself, so there is
-        // nothing to drive from here; re-reading the cache is the whole retry.
-        CredentialSource::DesktopApp(_) => {
-            diagnose::log("Claude desktop app refreshes its own token; re-reading the cache")
-        }
-        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
-    }
-}
-
-fn cli_refresh_windows_token(directory: &Path) {
-    let claude_path = resolve_windows_claude_path();
-    diagnose::log(format!(
-        "checking Windows Claude token refresh support via {claude_path}"
-    ));
-    cli::refresh(
-        cli::windows_command(&claude_path, directory, &["--version"]),
-        cli::windows_command(&claude_path, directory, cli::REFRESH_ARGS),
-    );
-}
-
-fn cli_refresh_wsl_token(distro: &str) {
-    diagnose::log(format!(
-        "checking WSL Claude token refresh support in distro {distro}"
-    ));
-    cli::refresh(
-        cli::wsl_command(distro, &["--version"]),
-        cli::wsl_command(distro, cli::REFRESH_ARGS),
-    );
-}
-
-fn resolve_windows_claude_path() -> String {
-    // Locate the executable first, then capture --version exactly once through
-    // the same command builder and account environment used for refresh.
-    for name in ["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(path) = stdout
-                    .lines()
-                    .next()
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                {
-                    return path.to_string();
-                }
-            }
-        }
-    }
-
-    if let Some(bundled) = bundled_desktop_claude_path(claude_desktop::data_directories()) {
-        return bundled.to_string_lossy().into_owned();
-    }
-
-    "claude.cmd".to_string()
-}
-
-/// The desktop app ships `claude-code\<version>\claude.exe` under its data
-/// directory, including the migrated `%LOCALAPPDATA%\Claude-Data\claude_*`
-/// layout. This may be the only binary when the standalone CLI is absent.
-fn bundled_desktop_claude_path(data_directories: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = data_directories
-        .into_iter()
-        .flat_map(|path| {
-            std::fs::read_dir(path.join("claude-code"))
-                .into_iter()
-                .flatten()
-        })
-        .flatten()
-        .map(|entry| entry.path().join("claude.exe"))
-        .filter(|path| path.is_file())
-        .collect();
-    // Directory order is not version order; the newest install wins.
-    candidates.sort_by(|left, right| {
-        bundled_claude_version(left)
-            .cmp(&bundled_claude_version(right))
-            .then_with(|| left.cmp(right))
-    });
-    candidates.pop()
-}
-
-fn bundled_claude_version(path: &Path) -> Option<Vec<u64>> {
-    path.parent()?
-        .file_name()?
-        .to_str()?
-        .split('.')
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()
 }
 
 fn read_first_credentials() -> Option<Credentials> {
@@ -643,6 +361,7 @@ fn read_desktop_app_credentials(path: &Path) -> Option<Credentials> {
 fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials> {
     match source {
         CredentialSource::Windows(path) => read_windows_credentials(path),
+        CredentialSource::CredentialManager(target) => read_named_credential(target),
         CredentialSource::DesktopApp(path) => read_desktop_app_credentials(path),
         CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
     }
@@ -656,10 +375,7 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
             .arg("--")
             .arg("sh")
             .arg("-lc")
-            .arg("cat ~/.claude/.credentials.json")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
+            .arg("cat ~/.claude/.credentials.json"),
         Duration::from_secs(5),
     )?;
 
@@ -746,8 +462,18 @@ pub(super) fn native_credential_path() -> Option<PathBuf> {
 fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
+        CredentialSource::CredentialManager(target) => {
+            Some(credential_manager_watch_signature(target))
+        }
         CredentialSource::DesktopApp(path) => Some(claude_desktop::watch_signature(path)),
         CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
+    }
+}
+
+fn credential_manager_watch_signature(target: &str) -> String {
+    match super::windows_credentials::last_written(target) {
+        Some(stamp) => format!("credman:{target}|{stamp}"),
+        None => format!("credman:{target}|missing"),
     }
 }
 
@@ -777,10 +503,7 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
             .arg("-lc")
             .arg(
                 "if [ -f ~/.claude/.credentials.json ]; then stat -c 'present|%s|%Y' ~/.claude/.credentials.json; else echo missing; fi",
-            )
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
+            ),
         Duration::from_secs(5),
     )?;
     let state = if output.status.success() {
@@ -793,11 +516,7 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 
 fn list_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
-        Command::new("wsl.exe")
-            .args(["-l", "-q"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null()),
+        Command::new("wsl.exe").args(["-l", "-q"]),
         Duration::from_secs(5),
     ) {
         Some(output) if output.status.success() => output,
@@ -860,110 +579,30 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
-    let mut child = command.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => return None,
+    // Shared bounded runner owns the deadline, the concurrent pipe drain and
+    // the kill-on-timeout job tree. 1MiB cap: credential JSON is tiny, so a
+    // capped (possibly truncated) buffer is never parsed as credentials.
+    const CREDENTIAL_CAPTURE_CAP: usize = 1024 * 1024;
+    match crate::manager::process::run_bounded(
+        command,
+        timeout,
+        CREDENTIAL_CAPTURE_CAP,
+        "claude credentials",
+    ) {
+        Ok(output)
+            if output.stdout.len() < CREDENTIAL_CAPTURE_CAP
+                && output.stderr.len() < CREDENTIAL_CAPTURE_CAP =>
+        {
+            Some(output)
         }
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    #[test]
-    fn repeated_messages_probes_read_usage_and_resets_during_retry_after() {
-        use std::io::{BufRead, BufReader, Read, Write};
-        use std::net::TcpListener;
-        use std::time::Instant;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            for poll in 0..2 {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "probe {poll} never connected");
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("accept failed: {error}"),
-                    }
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                assert!(line.starts_with("POST /v1/messages "));
-                let mut content_length = 0;
-                loop {
-                    line.clear();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("content-length") {
-                            content_length = value.trim().parse::<usize>().unwrap();
-                        }
-                    }
-                }
-                reader.read_exact(&mut vec![0; content_length]).unwrap();
-                let response = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\n\
-                     Retry-After: 7200\r\n\
-                     anthropic-ratelimit-unified-5h-utilization: 1\r\n\
-                     anthropic-ratelimit-unified-7d-utilization: {}\r\n\
-                     anthropic-ratelimit-unified-5h-reset: {}\r\n\
-                     anthropic-ratelimit-unified-7d-reset: {}\r\n\
-                     Content-Length: 2\r\nConnection: close\r\n\r\n{{}}",
-                    if poll == 0 { "0.5" } else { "0.6" },
-                    1_800_000_000 + poll,
-                    1_800_100_000 + poll,
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-        });
-        let url = format!("http://{address}/v1/messages");
-        let readings = [
-            fetch_usage_via_messages_at("fixture-token", &url),
-            fetch_usage_via_messages_at("fixture-token", &url),
-        ];
-        server.join().unwrap();
-        for (poll, result) in readings.into_iter().enumerate() {
-            let data = result.expect("429 headers should remain readable on every poll");
-            assert!(data.session.available && data.weekly.available);
-            assert_eq!(data.session.percentage, 100.0);
-            assert_eq!(data.weekly.percentage, if poll == 0 { 50.0 } else { 60.0 });
-            assert_eq!(
-                data.session.resets_at,
-                unix_to_system_time(Some(1_800_000_000 + poll as i64))
-            );
-            assert_eq!(
-                data.weekly.resets_at,
-                unix_to_system_time(Some(1_800_100_000 + poll as i64))
-            );
-        }
-    }
     #[test]
     fn http_failures_keep_their_status_for_account_display() {
         for status in [401, 403, 429, 500, 503] {
@@ -974,45 +613,48 @@ mod tests {
         }
     }
 
-    /// Ignored by default: proves the default profile resolves usage on a
-    /// machine where only the desktop app holds a token. Run it with
-    /// `cargo test -- --ignored` while signed in to the desktop app.
+    /// Ignored by default: proves an explicit desktop-directory profile
+    /// resolves usage on a machine where only the desktop app holds a token.
+    /// Run it with `cargo test -- --ignored` while signed in to the desktop app.
     #[test]
     #[ignore = "requires a signed-in Claude desktop app on this machine"]
-    fn the_default_profile_resolves_usage_from_the_desktop_app() {
-        let path = crate::accounts::default_credential_path(crate::providers::ProviderId::Claude)
-            .expect("a default credential path");
-        let outcome = poll_account(&path);
+    fn desktop_dir_profile_resolves_usage_from_the_desktop_app() {
+        let dir = claude_desktop::data_directories()
+            .into_iter()
+            .find(|dir| claude_desktop::config_path_for_dir(dir).is_file())
+            .expect("a Claude desktop data directory with a config file");
+        let outcome = poll_desktop_dir(&dir);
         assert!(
             outcome.is_ok(),
-            "the default profile should resolve usage from the desktop app, got {outcome:?}"
+            "the desktop profile should resolve usage from the desktop app, got {outcome:?}"
         );
     }
 
     #[test]
-    fn a_custom_export_never_falls_back_to_the_desktop_app() {
-        // The desktop fallback is scoped to the default CLI path. A profile
-        // pointing somewhere else must stay pinned even on this machine,
-        // where the desktop app does have a usable token.
-        let path = std::env::temp_dir().join("claude-custom-export.json");
-        assert!(desktop_credentials_for_default_path(&path).is_none());
+    fn credential_file_polls_never_reach_another_login() {
+        // Missing files and unknown credential-manager targets report their
+        // own status. Nothing falls through to the desktop app, the global
+        // discovery order, or another account's login.
+        let path = std::env::temp_dir().join("claude-pinned-export.json");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            poll_credential_file(&path, &[]),
+            Err(PollError::NoCredentials)
+        );
+        assert_eq!(
+            poll_credential_file(
+                &path,
+                &["UsageHub-test-nonexistent-target-9f3c4a".to_string()]
+            ),
+            Err(PollError::NoCredentials)
+        );
     }
 
     #[test]
-    fn an_environment_selected_directory_never_uses_the_desktop_login() {
-        let native = Path::new("C:/claude-fallback-test/.claude/.credentials.json");
-        let custom = Path::new("C:/claude-fallback-test/work/.credentials.json");
-        assert!(desktop_fallback_allowed(native, native, false));
-        assert!(!desktop_fallback_allowed(custom, native, false));
-        // The environment-selected path is also returned as the "default".
-        assert!(!desktop_fallback_allowed(custom, custom, true));
-        assert!(!desktop_fallback_allowed(native, native, true));
-    }
-
-    #[test]
-    fn default_profile_watches_desktop_login_and_rotation_without_window_state_noise() {
+    fn desktop_dir_signature_ignores_window_state_and_tracks_rotation() {
+        use crate::accounts::AccountProfile;
         let directory = std::env::temp_dir().join(format!(
-            "claude-desktop-watch-test-{}-{}",
+            "claude-desktop-sig-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1020,66 +662,120 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let native = directory.join(".credentials.json");
         let desktop = directory.join("config.json");
-        // A tokenless CLI file remains unchanged throughout desktop login.
-        std::fs::write(&native, r#"{"claudeAiOauth":{"accessToken":""}}"#).unwrap();
-        let pinned = account_watch_signature_with_desktop(&native, &[]);
-        assert_eq!(pinned, crate::accounts::file_signature(&native));
-        let missing = account_watch_signature_with_desktop(&native, std::slice::from_ref(&desktop));
+        let profile = AccountProfile {
+            desktop_dir: directory.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let missing = profile_signature(&profile);
         std::fs::write(
             &desktop,
             r#"{"oauth:tokenCache":"legacy","oauth:tokenCacheV2":"first","window":1}"#,
         )
         .unwrap();
-        let logged_in =
-            account_watch_signature_with_desktop(&native, std::slice::from_ref(&desktop));
+        let logged_in = profile_signature(&profile);
         assert_ne!(missing, logged_in);
+        // Unrelated window-state rewrites keep the signature.
         std::fs::write(
             &desktop,
             r#"{"oauth:tokenCache":"legacy","oauth:tokenCacheV2":"first","window":2}"#,
         )
         .unwrap();
-        assert_eq!(
-            logged_in,
-            account_watch_signature_with_desktop(&native, std::slice::from_ref(&desktop))
-        );
+        assert_eq!(logged_in, profile_signature(&profile));
+        // Token rotation changes it so only this account resumes.
         std::fs::write(
             &desktop,
             r#"{"oauth:tokenCache":"legacy","oauth:tokenCacheV2":"rotated","window":2}"#,
         )
         .unwrap();
-        assert_ne!(
-            logged_in,
-            account_watch_signature_with_desktop(&native, std::slice::from_ref(&desktop))
-        );
-        assert_eq!(pinned, account_watch_signature_with_desktop(&native, &[]));
+        assert_ne!(logged_in, profile_signature(&profile));
         std::fs::remove_file(&desktop).unwrap();
-        assert_eq!(
-            missing,
-            account_watch_signature_with_desktop(&native, std::slice::from_ref(&desktop))
-        );
-        std::fs::remove_file(&native).unwrap();
+        assert_eq!(missing, profile_signature(&profile));
         std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
-    fn default_profile_watches_both_desktop_installations() {
-        let root = crate::app_settings::app_data_directory();
-        let native = root.join(".credentials.json");
-        let desktops = vec![root.join("regular.json"), root.join("store.json")];
-        std::fs::write(&desktops[0], r#"{"oauth:tokenCacheV2":"regular"}"#).unwrap();
-        let before = account_watch_signature_with_desktop(&native, &desktops);
-        let pinned = account_watch_signature_with_desktop(&native, &[]);
-        std::fs::write(&desktops[1], r#"{"oauth:tokenCacheV2":"store-login"}"#).unwrap();
-        let logged_in = account_watch_signature_with_desktop(&native, &desktops);
-        assert_ne!(before, logged_in);
-        std::fs::write(&desktops[1], r#"{"oauth:tokenCacheV2":"store-rotated"}"#).unwrap();
+    fn desktop_dir_profiles_are_independent_sources() {
+        use crate::accounts::AccountProfile;
+        let root = std::env::temp_dir().join(format!(
+            "claude-desktop-independence-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        for dir in [&first, &second] {
+            std::fs::write(
+                dir.join("config.json"),
+                r#"{"oauth:tokenCacheV2":"shared-login"}"#,
+            )
+            .unwrap();
+        }
+        let first_profile = AccountProfile {
+            desktop_dir: first.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let second_profile = AccountProfile {
+            desktop_dir: second.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        // Path-bound signatures never alias two directories ...
         assert_ne!(
-            logged_in,
-            account_watch_signature_with_desktop(&native, &desktops)
+            profile_signature(&first_profile),
+            profile_signature(&second_profile)
         );
-        assert_eq!(pinned, account_watch_signature_with_desktop(&native, &[]));
+        // ... and rotation in one leaves the other untouched.
+        std::fs::write(
+            first.join("config.json"),
+            r#"{"oauth:tokenCacheV2":"rotated-first-login"}"#,
+        )
+        .unwrap();
+        let unchanged = profile_signature(&second_profile);
+        assert_ne!(profile_signature(&first_profile), unchanged);
+        assert_eq!(profile_signature(&second_profile), unchanged);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn credential_file_signature_tracks_file_and_confirmed_targets() {
+        use crate::accounts::AccountProfile;
+        let directory = std::env::temp_dir().join(format!(
+            "claude-file-sig-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"a"}}"#).unwrap();
+        let mut profile = AccountProfile {
+            config_dir: directory.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let before = profile_signature(&profile);
+        // Longer replacement content changes file metadata deterministically.
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"a-longer-token"}}"#,
+        )
+        .unwrap();
+        assert_ne!(before, profile_signature(&profile));
+        // A confirmed target joins the signature even while it is missing,
+        // so a later login under that target resumes this account.
+        profile
+            .credential_targets
+            .push("UsageHub-test-nonexistent-target-9f3c4a".to_string());
+        let with_target = profile_signature(&profile);
+        assert_ne!(before, with_target);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -1094,56 +790,21 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("export.json");
-        assert_eq!(poll_account(&path), Err(PollError::NoCredentials));
+        assert_eq!(
+            poll_credential_file(&path, &[]),
+            Err(PollError::NoCredentials)
+        );
         std::fs::write(
             &path,
             r#"{"claudeAiOauth":{"accessToken":"fixture-token","expiresAt":0}}"#,
         )
         .unwrap();
-        assert_eq!(poll_account(&path), Err(PollError::TokenExpired));
+        assert_eq!(
+            poll_credential_file(&path, &[]),
+            Err(PollError::TokenExpired)
+        );
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
-    }
-
-    #[test]
-    fn finds_bundled_cli_in_migrated_desktop_data() {
-        let temporary = tempfile::tempdir().unwrap();
-        let legacy = temporary.path().join("Roaming/Claude");
-        let migrated = temporary
-            .path()
-            .join("Local/Claude-Data/claude_pzs8sxrjxfjjc");
-        let older = legacy.join("claude-code/2.1.9/claude.exe");
-        let newer = migrated.join("claude-code/2.1.10/claude.exe");
-        for path in [&older, &newer] {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, "").unwrap();
-        }
-        std::fs::create_dir_all(migrated.join("claude-code/2.1.11")).unwrap();
-        assert_eq!(
-            bundled_desktop_claude_path(vec![migrated.clone()]),
-            Some(newer.clone())
-        );
-        assert_eq!(
-            bundled_desktop_claude_path(vec![migrated.clone(), legacy]),
-            Some(newer.clone())
-        );
-        std::fs::remove_file(newer).unwrap();
-        assert_eq!(bundled_desktop_claude_path(vec![migrated]), None);
-    }
-
-    #[test]
-    fn bundled_claude_versions_sort_numerically() {
-        let older = bundled_claude_version(Path::new("Claude/claude-code/2.1.9/claude.exe"));
-        let newer = bundled_claude_version(Path::new("Claude/claude-code/2.1.10/claude.exe"));
-
-        assert!(newer > older);
-    }
-
-    #[test]
-    fn bundled_claude_versions_reject_non_numeric_directories() {
-        let version = bundled_claude_version(Path::new("Claude/claude-code/current/claude.exe"));
-
-        assert_eq!(version, None);
     }
 
     #[test]
@@ -1248,80 +909,25 @@ mod tests {
     }
 
     #[test]
-    fn utilization_headers_report_windows_without_reset_headers() {
-        for (header, session, weekly) in [
-            ("anthropic-ratelimit-unified-5h-utilization", true, false),
-            ("anthropic-ratelimit-unified-7d-utilization", false, true),
-            ("anthropic-ratelimit-unified-status", false, false),
-        ] {
-            let response = ureq::http::Response::builder()
-                .header(header, "0")
-                .body(ureq::Body::builder().data(Vec::new()))
-                .unwrap();
-            let data = parse_rate_limit_headers(&response);
-            assert_eq!(data.session.available, session);
-            assert_eq!(data.weekly.available, weekly);
-        }
-    }
-
-    #[test]
-    fn shared_reset_headers_do_not_invent_a_session_window() {
-        for status in ["allowed", "rejected"] {
-            for (claim, session, weekly) in [
-                ("five_hour", true, false),
-                ("seven_day", false, true),
-                ("unknown", false, false),
-            ] {
-                let response = ureq::http::Response::builder()
-                    .header("anthropic-ratelimit-unified-status", status)
-                    .header("anthropic-ratelimit-unified-reset", "1787198224")
-                    .header("anthropic-ratelimit-unified-representative-claim", claim)
-                    .body(ureq::Body::builder().data(Vec::new()))
-                    .unwrap();
-                let data = parse_rate_limit_headers(&response);
-                assert_eq!(data.session.available, session);
-                assert_eq!(data.weekly.available, weekly);
-            }
-        }
-    }
-
-    fn status_error(code: u16) -> ureq::Error {
-        ureq::Error::StatusCode(code)
-    }
-
-    #[test]
-    fn rate_limits_and_server_faults_do_not_trigger_the_messages_fallback() {
-        // Spending quota on a Messages request is the wrong answer to being
-        // rate limited, and it feeds the condition that caused it.
-        assert_eq!(
-            classify_usage_failure(&status_error(429)),
-            UsageEndpointFailure::Transient
+    fn usage_resets_keep_exact_server_moments_and_absent_resets_stay_unknown() {
+        let data = usage_from_json(
+            r#"{"five_hour":{"utilization":42.5,"resets_at":"2026-10-26T12:34:56+02:00"},"seven_day":{"utilization":10.0}}"#,
         );
+        assert!(data.session.available);
+        assert_eq!(data.session.percentage, 42.5);
+        // The offset timestamp is preserved exactly: the same instant written
+        // in UTC parses to the identical moment, never an estimate.
+        let moment = parse_iso8601(Some("2026-10-26T12:34:56+02:00"));
+        assert!(moment.is_some());
+        assert_eq!(data.session.resets_at, moment);
         assert_eq!(
-            classify_usage_failure(&status_error(500)),
-            UsageEndpointFailure::Transient
+            data.session.resets_at,
+            parse_iso8601(Some("2026-10-26T10:34:56Z"))
         );
-        assert_eq!(
-            classify_usage_failure(&status_error(503)),
-            UsageEndpointFailure::Transient
-        );
-    }
-
-    #[test]
-    fn rejected_credentials_are_kept_separate_from_an_absent_endpoint() {
-        assert_eq!(
-            classify_usage_failure(&status_error(401)),
-            UsageEndpointFailure::Auth
-        );
-        assert_eq!(
-            classify_usage_failure(&status_error(403)),
-            UsageEndpointFailure::Auth
-        );
-        // A 404 is the case the Messages API fallback exists to cover.
-        assert_eq!(
-            classify_usage_failure(&status_error(404)),
-            UsageEndpointFailure::Unsupported
-        );
+        // A window the server reports without any reset stays unknown.
+        assert!(data.weekly.available);
+        assert_eq!(data.weekly.percentage, 10.0);
+        assert!(data.weekly.resets_at.is_none());
     }
 
     #[test]

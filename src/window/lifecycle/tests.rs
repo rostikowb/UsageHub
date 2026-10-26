@@ -4,7 +4,7 @@ use super::*;
 /// and the controller handle, while the rest of the suite runs concurrently.
 #[test]
 fn shell_surface_loss_preserves_controller_timers_and_state() {
-    const FIXTURE: &str = "CCUM_TEST_SURFACE_LIFETIME";
+    const FIXTURE: &str = "UH_TEST_SURFACE_LIFETIME";
     if std::env::var_os(FIXTURE).is_none() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "window::lifecycle::tests::shell_surface_loss_preserves_controller_timers_and_state", "--nocapture"])

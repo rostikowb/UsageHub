@@ -15,9 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, ShowWindowAsync, MB_ICONERROR, MB_OK, SW_RESTORE, WM_CLOSE,
 };
 
-const DASHBOARD_TITLE: &str = "Usage Monitor";
-const DASHBOARD_MUTEX: &str = "Local\\ClaudeCodeUsageMonitorDashboard";
-const DASHBOARD_REQUEST_EVENT: &str = "Local\\ClaudeCodeUsageMonitorOpenDashboard";
+const DASHBOARD_TITLE: &str = "UsageHub Dashboard";
+const DASHBOARD_MUTEX: &str = "Local\\UsageHubDashboard";
+const DASHBOARD_REQUEST_EVENT: &str = "Local\\UsageHubOpenDashboard";
 
 /// Display-only snapshot shared with the dashboard process. The monitor keeps
 /// the authoritative release descriptor and chooses the installation channel.
@@ -70,7 +70,7 @@ fn monitor_process_id(owner: isize) -> Option<u32> {
             return None;
         }
         let length = GetClassNameW(hwnd, &mut class_name).max(0) as usize;
-        if String::from_utf16_lossy(&class_name[..length]) != "ClaudeCodeUsageMonitor" {
+        if String::from_utf16_lossy(&class_name[..length]) != "UsageHub" {
             return None;
         }
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));

@@ -134,7 +134,7 @@ pub fn handle_cli_mode(args: &[String]) -> bool {
             owner,
             initial_page,
         )
-        .map_err(|error| match std::env::var("CCUM_DASHBOARD_OPENGL_ERROR") {
+        .map_err(|error| match std::env::var("UH_DASHBOARD_OPENGL_ERROR") {
             Ok(gl_error) => format!("OpenGL: {gl_error}; WARP: {error}"),
             Err(_) => format!("WARP: {error}"),
         })
@@ -195,7 +195,7 @@ fn launch_warp_dashboard(args: &[String], gl_error: &str) -> Result<(), String> 
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new(executable);
     command.args(args.iter().skip(1)).arg("--dashboard-warp");
-    command.env("CCUM_DASHBOARD_OPENGL_ERROR", gl_error);
+    command.env("UH_DASHBOARD_OPENGL_ERROR", gl_error);
     if crate::diagnose::is_enabled() {
         command.arg("--diagnose-append");
     }
@@ -242,7 +242,7 @@ fn run_dashboard(
 ) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Usage Monitor")
+            .with_title("UsageHub")
             .with_inner_size([width, height])
             .with_icon(icon),
         renderer: eframe::Renderer::Glow,
@@ -250,7 +250,7 @@ fn run_dashboard(
         ..Default::default()
     };
     eframe::run_native(
-        "ClaudeCodeUsageMonitor.Studio",
+        "UsageHub.Studio",
         options,
         Box::new(move |context| Ok(Box::new(StudioApp::new(context, owner, initial_page)))),
     )
@@ -622,13 +622,14 @@ struct StudioApp {
     context_menu_dirty: bool,
     context_menu_selection: Option<Vec<usize>>,
     delete_context_menu_confirmation: Option<(PathBuf, String)>,
+    manage: studio_manage::ManageState,
 }
 
 mod studio_assets;
 mod studio_context_menus;
 mod studio_core;
 mod studio_diagnostics;
-mod studio_settings;
+mod studio_manage;
 mod studio_theme_workspace;
 mod warp;
 
@@ -979,6 +980,8 @@ mod studio_context_menu_editor;
 use studio_context_menu_editor::*;
 mod studio_inspectors;
 use studio_inspectors::*;
+mod studio_settings;
+use studio_settings::*;
 mod studio_utilities;
 use studio_utilities::*;
 #[cfg(test)]

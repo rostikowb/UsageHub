@@ -33,7 +33,7 @@ fn selects_exact_asset_even_after_an_unrelated_executable() {
 
 #[test]
 fn rejects_missing_wrong_case_and_unrelated_assets() {
-    for name in ["other.exe", "CLAUDE-CODE-USAGE-MONITOR.EXE", "app.zip"] {
+    for name in ["other.exe", "USAGEHUB.EXE", "app.zip"] {
         let mut value = fixture("v2.14.0");
         value["assets"][0]["name"] = json!(name);
         assert!(descriptor(value, "2.13.44")
@@ -86,10 +86,10 @@ fn rejects_oversized_and_empty_assets() {
 #[test]
 fn rejects_unexpected_download_locations() {
     for url in [
-        "http://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases/download/v2.14.0/claude-code-usage-monitor.exe",
-        "https://example.com/claude-code-usage-monitor.exe",
-        "https://github.com/other/repo/releases/download/v2.14.0/claude-code-usage-monitor.exe",
-        "https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases/download/v2.13.44/claude-code-usage-monitor.exe",
+        "http://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases/download/v2.14.0/usagehub.exe",
+        "https://example.com/usagehub.exe",
+        "https://github.com/other/repo/releases/download/v2.14.0/usagehub.exe",
+        "https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases/download/v2.13.44/usagehub.exe",
     ] {
         let mut value = fixture("v2.14.0");
         value["assets"][0]["browser_download_url"] = json!(url);
@@ -206,4 +206,19 @@ fn malformed_versions_are_errors() {
         assert!(descriptor(fixture(version), "2.13.44").is_err());
         assert!(descriptor(fixture("v2.14.0"), version).is_err());
     }
+}
+
+#[test]
+fn fork_never_accepts_the_upstream_executable() {
+    // The upstream project ships `claude-code-usage-monitor.exe`; this fork
+    // only installs `usagehub.exe`, so an upstream asset can never pass the
+    // exact-name gate even if update checks are re-enabled for the fork.
+    let mut value = fixture("v2.14.0");
+    value["assets"][0]["name"] = json!("claude-code-usage-monitor.exe");
+    value["assets"][0]["browser_download_url"] = json!(
+        "https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases/download/v2.14.0/claude-code-usage-monitor.exe"
+    );
+    assert!(descriptor(value, "2.13.44")
+        .unwrap_err()
+        .contains("missing"));
 }

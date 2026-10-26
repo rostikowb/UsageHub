@@ -85,11 +85,91 @@ pub struct PollFailure {
 /// Polling and cache readers must agree on all files an account can read.
 pub fn account_source_signature(provider: ProviderId, path: &std::path::Path) -> String {
     match provider {
-        ProviderId::Claude => claude::account_watch_signature(path),
+        ProviderId::Claude => claude::credential_file_signature(path, &[]),
         _ => crate::accounts::file_signature(path),
     }
 }
 
+/// Content signature for one account profile: desktop-directory profiles
+/// cover their `config.json` + `Local State`, credential-file profiles cover
+/// the file plus confirmed credential-manager targets, and legacy
+/// provider-default profiles keep the dynamic discovery snapshot. Token
+/// rotation changes the signature so only the owning account resumes.
+pub fn profile_source_signature(
+    provider: ProviderId,
+    profile: &crate::accounts::AccountProfile,
+) -> String {
+    match provider {
+        ProviderId::Claude => claude::profile_signature(profile),
+        _ => match profile.credential_path(provider) {
+            Ok(Some(path)) => crate::accounts::file_signature(&path),
+            Ok(None) => crate::accounts::fingerprint(&format!(
+                "{:?}",
+                credential_watch_snapshot(CredentialWatchMode::ActiveSource(provider))
+            )),
+            Err(error) => crate::accounts::fingerprint(&error),
+        },
+    }
+}
+
+/// The single explicit source file an account result points at: the desktop
+/// `config.json` for desktop-directory profiles, the credentials file for
+/// credential-file profiles, and none for legacy provider-default discovery.
+/// Used for result provenance and cache-invalidation comparisons; it never
+/// touches the network or the credential store.
+pub fn explicit_source_path(
+    provider: ProviderId,
+    profile: &crate::accounts::AccountProfile,
+) -> Option<std::path::PathBuf> {
+    match provider {
+        ProviderId::Claude if !profile.desktop_dir.trim().is_empty() => profile
+            .desktop_dir_resolved()
+            .ok()
+            .flatten()
+            .map(|dir| dir.join("config.json")),
+        _ => profile.credential_path(provider).ok().flatten(),
+    }
+}
+
+/// Human-readable source provenance for CLI/UI status, e.g.
+/// `desktop "C:\...\Claude"`, `credentials file "..."`, or
+/// `provider default`. Never exposes tokens or secrets.
+pub fn account_source_provenance(
+    provider: ProviderId,
+    profile: &crate::accounts::AccountProfile,
+) -> String {
+    if provider == ProviderId::Claude && !profile.desktop_dir.trim().is_empty() {
+        return match profile.desktop_dir_resolved() {
+            Ok(Some(dir)) => format!("desktop {}", dir.display()),
+            _ => format!("desktop {} (unresolved)", profile.desktop_dir.trim()),
+        };
+    }
+    match profile.credential_path(provider) {
+        Ok(Some(path)) => {
+            if provider == ProviderId::Claude && !profile.credential_targets.is_empty() {
+                format!(
+                    "credentials file {} (+{} credential target{})",
+                    path.display(),
+                    profile.credential_targets.len(),
+                    if profile.credential_targets.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            } else {
+                format!("credentials file {}", path.display())
+            }
+        }
+        Ok(None) => "provider default".to_string(),
+        Err(error) => format!("unresolved source ({error})"),
+    }
+}
+
+/// Read-only usage poll: runs the original usageBar server GET per distinct
+/// account source and reports exact server percentages plus absolute reset
+/// timestamps. It never writes settings, usage caches, credential files, or
+/// token stores, and never refreshes or exports tokens.
 pub fn poll(
     enabled_providers: ProviderSet,
     settings: &crate::accounts::AccountSettings,
@@ -385,6 +465,29 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
         .clone()
 }
 
+/// Loopback fixtures must not inherit the process proxy: ureq resolves a
+/// proxy from the environment by default, which would intercept 127.0.0.1
+/// traffic and fail the request before the fixture sees it (the retry_after
+/// fixture already bypasses it per request with `.proxy(None)`). Tests inject
+/// this agent so they exercise the real request/auth/parse path with no
+/// production localhost special-casing.
+#[cfg(test)]
+pub(super) fn build_loopback_test_agent() -> Result<ureq::Agent, PollError> {
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    Ok(ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .tls_config(tls)
+        // Inspect Retry-After before converting error statuses below.
+        .http_status_as_error(false)
+        .middleware(retry_after::middleware)
+        .proxy(None)
+        .build()
+        .into())
+}
+
 type HttpResponse = ureq::http::Response<ureq::Body>;
 
 fn check_http_status(response: HttpResponse) -> Result<HttpResponse, ureq::Error> {
@@ -394,23 +497,6 @@ fn check_http_status(response: HttpResponse) -> Result<HttpResponse, ureq::Error
     } else {
         Ok(response)
     }
-}
-
-fn get_header_f64(response: &HttpResponse, name: &str) -> f64 {
-    response
-        .headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn get_header_i64(response: &HttpResponse, name: &str) -> Option<i64> {
-    response
-        .headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok())
 }
 
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {

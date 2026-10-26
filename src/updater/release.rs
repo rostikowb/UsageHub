@@ -4,7 +4,7 @@ use serde::Deserialize;
 use super::download::AssetIntegrity;
 use super::github_repo;
 
-pub(super) const RELEASE_ASSET_NAME: &str = "claude-code-usage-monitor.exe";
+pub(super) const RELEASE_ASSET_NAME: &str = "usagehub.exe";
 
 #[derive(Clone, Debug)]
 pub struct ReleaseDescriptor {

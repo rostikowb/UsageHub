@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::ProviderId;
 use crate::ui::components::helper::{
     show_helper, Caret, HelperInsertion, HelperState, HelperStatus, HelperView, InsertMode,
 };
@@ -492,6 +493,7 @@ fn app_with_surfaces(surfaces: Vec<SceneObject>) -> StudioApp {
         context_menu_dirty: false,
         context_menu_selection: None,
         delete_context_menu_confirmation: None,
+        manage: studio_manage::ManageState::default(),
     }
 }
 
@@ -514,7 +516,7 @@ mod monitor_reconnection {
             ) -> LRESULT {
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
             }
-            let class = native_interop::wide_str("ClaudeCodeUsageMonitor");
+            let class = native_interop::wide_str("UsageHub");
             unsafe {
                 let module = GetModuleHandleW(PCWSTR::null()).unwrap();
                 REGISTERED.call_once(|| {
@@ -917,9 +919,41 @@ fn preview_renderer_returns_results_from_its_worker_thread() {
 #[test]
 fn unchanged_usage_cache_does_not_invalidate_the_preview() {
     let mut app = app_with_surfaces(vec![root("main")]);
-    let cache = UsageCache {
-        poll_ok: false,
+    // Coherent configured account: the cached profile matches the registry
+    // entry, so `select_accounts` retains (not filters) it and the second
+    // identical cache is genuinely unchanged.
+    let profile = crate::accounts::AccountProfile {
+        id: "personal".into(),
+        name: "Personal".into(),
+        config_dir: "C:\\Users\\Test\\.claude-personal".into(),
+        enabled: true,
         ..Default::default()
+    };
+    app.settings.accounts.claude.profiles = vec![profile.clone()];
+    app.settings.accounts.claude.selected = "personal".into();
+    let usage = crate::models::UsageData {
+        limits: Vec::new(),
+        session: crate::models::UsageSection {
+            available: true,
+            percentage: 42.0,
+            resets_at: None,
+        },
+        ..Default::default()
+    };
+    let mut data = AppUsageData::from_iter([(ProviderId::Claude, usage.clone())]);
+    data.accounts = vec![crate::models::AccountUsage {
+        provider: ProviderId::Claude,
+        profile: profile.clone(),
+        source_signature: "fixture-source".into(),
+        source_path: None,
+        usage: Some(usage),
+        error: None,
+        selected: false,
+    }];
+    let cache = UsageCache {
+        poll_ok: true,
+        updated_unix: 1,
+        data,
     };
     assert!(app.update_usage_cache(cache.clone()));
     app.preview_dirty = false;
@@ -999,6 +1033,15 @@ fn context_menu_item_ids_are_unique_across_nested_items() {
 fn context_menu_action_scripts_round_trip_every_action_kind() {
     let actions = [
         ContextMenuAction::OpenDashboard,
+        ContextMenuAction::OpenAccount {
+            provider: ContextMenuProvider::Claude,
+            id: "account_1".into(),
+        },
+        ContextMenuAction::FocusAccount {
+            provider: ContextMenuProvider::Codex,
+            id: "default".into(),
+        },
+        ContextMenuAction::ManageAccounts,
         ContextMenuAction::Refresh,
         ContextMenuAction::SetUpdateFrequency {
             seconds: POLL_5_MIN_SECONDS,

@@ -1,3 +1,20 @@
+[build]
+# Native Windows builds use the self-contained toolchain in
+# D:/Tools/usagehub-toolchain (see docs/build-windows.md). Host and target are
+# both x86_64-pc-windows-gnullvm (host triple from rust-toolchain.toml), linked
+# LLVM-natively via the wrapper below -- nothing ever passes -lgcc_eh/-lgcc.
+# (The previous plain windows-gnu host did: lld "unable to find library
+# -lgcc_eh", because llvm-mingw does not ship those libs.)
+target = "x86_64-pc-windows-gnullvm"
+
+[target.x86_64-pc-windows-gnullvm]
+# Clang wrapper as linker driver; -L points at staticlibs/libunwind.a so the
+# link pulls static libunwind instead of libunwind.dll (verified: final exe
+# imports only KERNEL32/api-ms-win-crt-*/ntdll). Keep llvm-mingw bin/ on PATH
+# for llvm-windres/llvm-ar used by winresource (build.rs).
+linker = "D:/Tools/usagehub-toolchain/llvm-mingw/llvm-mingw-20261020-ucrt-x86_64/bin/x86_64-w64-mingw32-gcc.exe"
+rustflags = ["-L", "D:/Tools/usagehub-toolchain/staticlibs"]
+
 [target.'cfg(all(target_os = "windows", target_env = "msvc"))']
 # Embed the MSVC runtime so the executable needs no Visual C++ Redistributable.
 rustflags = ["-C", "target-feature=+crt-static"]

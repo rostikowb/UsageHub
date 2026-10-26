@@ -575,9 +575,8 @@ mod tests {
             if let Some(sample) = reader.read(taskbar).unwrap() {
                 measured += 1;
                 println!("taskbar={:?} occupied={:?}", sample.bounds, sample.occupied);
-                if let Some(widget) =
-                    native_interop::find_child_window(taskbar.hwnd, "ClaudeCodeUsageMonitor")
-                        .and_then(native_interop::get_window_rect_safe)
+                if let Some(widget) = native_interop::find_child_window(taskbar.hwnd, "UsageHub")
+                    .and_then(native_interop::get_window_rect_safe)
                 {
                     println!(
                         "widget={widget:?} collision={} restore={}",

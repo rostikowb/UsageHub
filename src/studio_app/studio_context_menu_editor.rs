@@ -339,6 +339,21 @@ pub(super) fn context_menu_action_script(action: &ContextMenuAction) -> String {
         }
         ContextMenuAction::OpenUrl { url } => format!("open_url({})", string_arg(url)),
         ContextMenuAction::Exit => "exit()".into(),
+        ContextMenuAction::OpenAccount { provider, id } => {
+            format!(
+                "open_account({}, {})",
+                string_arg(provider.descriptor().key),
+                string_arg(id)
+            )
+        }
+        ContextMenuAction::FocusAccount { provider, id } => {
+            format!(
+                "focus_account({}, {})",
+                string_arg(provider.descriptor().key),
+                string_arg(id)
+            )
+        }
+        ContextMenuAction::ManageAccounts => "manage_accounts()".into(),
     }
 }
 
@@ -363,6 +378,7 @@ pub(super) fn parse_context_menu_action_script(script: &str) -> Result<ContextMe
             ContextMenuAction::ToggleAntigravityExternal,
         ),
         ("exit", ContextMenuAction::Exit),
+        ("manage_accounts", ContextMenuAction::ManageAccounts),
     ] {
         if script == format!("{name}()") {
             return Ok(action);
@@ -387,6 +403,56 @@ pub(super) fn parse_context_menu_action_script(script: &str) -> Result<ContextMe
         } else {
             Ok(value)
         }
+    };
+    let account_args = |name: &str, value: &str| -> Result<(ContextMenuProvider, String), String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut escaped = false;
+        for ch in value.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' if in_quotes => {
+                    escaped = true;
+                    current.push(ch);
+                }
+                '"' => {
+                    in_quotes = !in_quotes;
+                    current.push(ch);
+                }
+                ',' if !in_quotes => {
+                    parts.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        parts.push(current.trim().to_string());
+        if parts.len() != 2 {
+            return Err(format!("{name} needs a provider and an account id"));
+        }
+        let decode = |part: &str| -> Result<String, String> {
+            let part = part.trim();
+            if part.starts_with('"') {
+                serde_json::from_str(part).map_err(|_| format!("{name} needs valid quoted values"))
+            } else if part.is_empty() {
+                Err(format!("{name} needs a provider and an account id"))
+            } else {
+                Ok(part.to_string())
+            }
+        };
+        let provider = decode(&parts[0])?;
+        let id = decode(&parts[1])?;
+        if id.trim().is_empty() {
+            return Err(format!("{name} needs a value"));
+        }
+        let provider = ContextMenuProvider::from_key(&provider.to_ascii_lowercase())
+            .ok_or_else(|| format!("Unknown provider: {provider}"))?;
+        Ok((provider, id))
     };
     if let Some(value) = call_arg("set_update_frequency") {
         let seconds = value
@@ -432,6 +498,14 @@ pub(super) fn parse_context_menu_action_script(script: &str) -> Result<ContextMe
             return Err("URL must start with http:// or https://".into());
         }
         return Ok(ContextMenuAction::OpenUrl { url });
+    }
+    if let Some(value) = call_arg("open_account") {
+        let (provider, id) = account_args("open_account", value)?;
+        return Ok(ContextMenuAction::OpenAccount { provider, id });
+    }
+    if let Some(value) = call_arg("focus_account") {
+        let (provider, id) = account_args("focus_account", value)?;
+        return Ok(ContextMenuAction::FocusAccount { provider, id });
     }
     Err("Choose an action in Builder, or enter a supported action".into())
 }

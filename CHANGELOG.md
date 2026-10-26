@@ -1,8 +1,53 @@
 # Changelog
 
-Notable changes to Claude Code Usage Monitor are documented here, newest first.
+Notable changes to UsageHub (fork of Claude Code Usage Monitor) are documented here, newest first.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 changes grouped into Added, Changed, Fixed, and Removed where applicable.
+
+## [Unreleased]
+
+### Added
+
+- UsageHub fork identity: package and binary renamed to `usagehub` / `usagehub.exe`; product name UsageHub; settings moved to `%APPDATA%\UsageHub`; diagnostics to `%TEMP%\usagehub.log`; single-instance mutex, dashboard mutex/event, window classes, Run key, and temp files all use UsageHub namespaces so the fork runs side-by-side with the upstream app.
+- Multi-account manager for Claude Code and Codex with a noninteractive `--manage` JSON surface: `list`, `create`, `import`, `rename`, `open`, `focus`, `status`, `stop`, `pin`, `cli`, `poll`, `snapshot`, `cleanup`, `backup`, `skills`, `migration`, and `doctor`. Success JSON goes to stdout, the error envelope to stderr, and exit codes stay `0`/`2`/`3`, so it works from redirected shells without allocating a console.
+- Managed accounts: a default Claude create is a Desktop account under `%LOCALAPPDATA%\UsageHub\profiles` with a nested isolated `claude-config`; imported directories are adopted in place, rename is display-only, and ids are retired from an append-only set so a theme binding never retargets a new account. Accounts keep credentials, config, and history isolated; only the skills library is shared.
+- Encrypted seven-day deletion-undo snapshots: framed AES-256-GCM streaming archive, random per-archive data key wrapped with DPAPI `CurrentUser`, current-user file ACLs, manifest verification before deletion, all-or-nothing restore that refuses live conflicts, expiry purge on startup/resume/hourly, and explicit immediate purge or irreversible deletion.
+- Scoped cleanup with read-only preview and typed confirmation: `cache` (proven regenerable browser caches), `logout` (auth material only), `delete` (logout plus account config/history), and `reset` (all known user-owned sources for the selected account; external Default data only when that account is explicitly selected). Unknown junctions and links hard-stop before mutation, and skill links are removed by inode without traversing the shared library. There is no Windows forensic erasure, no browser-wide wipe, no system DNS flush, and no other provider's data is touched.
+- Deliberate shared skills library: per-account `skills` junctions are created natively without a shell, imports preview conflicts and never overwrite, credentials/session files are refused as sources, and link metadata alone enters backups.
+- Account-aware taskbar rows: one slot per enabled and pinned account with pins, width budget, overflow popup, a stable busy state, and a non-removing error slot.
+- Legacy migration: `migration preview|import|cutover --confirm cutover` plus explicit `migration legacy-backup --path PATH --action encrypt|purge|leave --confirm NAME` for recognized `.claude_backup_*` generations. Cutover snapshots the task, disables and stops the exact legacy sync task, verifies one encrypted archive per plaintext export, and generates a restore-based rollback script.
+- Bounded console execution for OS queries, provider CLI runs, and UI backend calls: hidden console, concurrent stream drain, captured-byte caps, monotonic deadlines, and a kill-on-close job object with disarm on successful long-lived GUI launches. Budgets are 15 s for OS queries, 10 s for ACL/link helpers, 120 s for the provider CLI (overridable with `--timeout-seconds` 1–3600 before `--`), 60 s for ordinary dashboard backend calls, and 900 s for backup/cleanup/migration/skills operations, with the elapsed/deadline counter shown while a data operation is pending.
+- [docs/build-windows.md](docs/build-windows.md) documents the self-contained `D:/Tools/usagehub-toolchain` layout, the `1.95.0-x86_64-pc-windows-gnullvm` host/target pin, the llvm-mingw linker and `llvm-windres` setup, and the repository-local `.cargo/config.toml`/`rust-toolchain.toml` values.
+- New dependencies for the hash/encryption/vault work: `sha2`, `aes-gcm`, `zeroize`, `getrandom`, plus Windows Credential, Authorization, ProcessStatus/ToolHelp, IO, and security crate features.
+- Fork refusal tests proving update checks/installs never contact the network and the updater never accepts the upstream `claude-code-usage-monitor.exe` asset.
+
+### Changed
+
+- The Settings dashboard (the Theme Studio window) gained account, backup, cleanup, skills, and migration panels that drive the manager through `--manage` on worker threads, reload settings after completion, and show the absolute server reset timestamp, countdown, provenance, and update time.
+- Ukrainian localization covers the new manager surfaces alongside English.
+- Window titles, themes bindings fallback, dashboard title, and all locale `window_title` values now read UsageHub.
+- In-app repository link follows the package `repository` metadata instead of a hardcoded upstream URL.
+- Version-resource metadata (product, file, and internal names) rebranded to UsageHub; the Code Zeno copyright notice and MIT license are preserved.
+- Canonical path comparison and deletion guards normalize slash styles and `\\?\` / `\\?\UNC\` / `\??\` / `\??\UNC\` prefixes before case comparison, so imported `C:/` paths and junction targets compare correctly.
+- `--manage poll` stays a read-only server GET (no settings or usage-cache writes and no token-refresh prompts), while `--manage snapshot` returns the exact bar cache with timestamped stale flags; neither path estimates limits, reset dates, or manual values.
+- Preserve the existing `left-dock-usage` taskbar design verbatim: reuse its original Rust renderer, segmented `5h`/`7d` rows, colors, typography and reset formatting. Extra pinned accounts clone the authored provider column at runtime; the legacy Second column is not duplicated, and authored surface width is measured before overflow.
+
+### Fixed
+
+- Console execution clears `HANDLE_FLAG_INHERIT` on this process's own standard handles before spawning, so a child cannot keep a caller's response pipes open after the backend exits and stall the bounded drain until its deadline.
+- Fixed native taskbar identity heap corruption: the owning Windows `PROPVARIANT` now clears its string exactly once, rather than manually freeing it before the SDK destructor.
+- Discover the officially registered Claude MSIX executable with native package APIs; keep unquoted App Paths containing spaces intact and never mistake the Claude CLI on PATH for the desktop app.
+- Bind the canonical migrated Default to its Desktop cache rather than an unrelated CLI login, while preserving marker-less vendor windows and strict attribution for custom External mappings.
+- Refresh committed account changes even when a later open stage fails. “Delete account…” now opens and scrolls to the selected account's local-data preview, clearing prior confirmations without applying deletion.
+- Use the SDK's actual `System.AppUserModel` property keys for taskbar identities and relaunch metadata, replacing hand-copied identifiers that Windows did not recognize.
+- Read current Desktop `acct:<account>|<organization>:<client>:…` cache identities without confusing organization/client identifiers with the bound account, retaining legacy cache support and refusing another account's token.
+- Normalize Windows Shell parsing paths without losing UTF-16 filenames, and keep scheduled taskbar identity refreshes from retagging disabled profiles.
+- Migration rollback accepts quoted Windows startup commands and writes lossless UTF-16LE registry data. Recovery uses the installed executable without relying on PATH, checks data/skills restoration before restoring legacy launchers, and propagates native registry import failures.
+
+### Removed
+
+- Automatic update checks, background downloads, WinGet upgrades, and self-update are disabled in UsageHub builds: the updater refuses before any network or binary change and reports that updates are disabled, so an unknown upstream release can never replace this install. The dormant channel machinery stays in-tree for a future fork-owned channel.
+- Automatic `claude -p` token refresh probes: Claude usage is read from stored login files, the desktop app's token cache, WSL, or confirmed owned Credential Manager targets, and fetching stays a read-only server GET.
 
 ## [2.22.4] - 2026-10-25
 

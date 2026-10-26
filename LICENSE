@@ -19,3 +19,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+UsageHub fork attribution
+
+UsageHub is a fork of Claude Code Usage Monitor
+(https://github.com/CodeZeno/Claude-Code-Usage-Monitor), MIT-licensed,
+Copyright (C) 2026 Code Zeno Pty Ltd. The full upstream license text is
+reproduced above and its copyright notice is preserved in this fork.
+
+Portions of the multi-account management implementation are adapted from
+the Claude Desktop multi-account work by Leonxlnx, used under the MIT
+License. Upstream copyright notices are retained in the adapted sources.

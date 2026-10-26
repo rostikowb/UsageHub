@@ -13,6 +13,7 @@
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::diagnose;
 
@@ -122,6 +123,10 @@ pub(super) fn read_token(config_path: &Path) -> Option<DesktopToken> {
         diagnose::log("Claude desktop config held no OAuth token cache");
         return None;
     }
+    // The config's own identity binding: when present, only cache entries
+    // for this account UUID may be selected. Any other UUID's entries are
+    // never a fallback, even when fresher or better scoped.
+    let current = current_account_uuid(&config);
     let key = os_crypt_key(&local_state_path(config_path))?;
 
     for (name, cache) in &caches {
@@ -133,7 +138,7 @@ pub(super) fn read_token(config_path: &Path) -> Option<DesktopToken> {
             diagnose::log(format!("Claude desktop {name} was not valid UTF-8"));
             continue;
         };
-        if let Some(token) = select_token(&plaintext) {
+        if let Some(token) = select_token_for(&plaintext, current.as_deref()) {
             return Some(token);
         }
         diagnose::log(format!(
@@ -144,20 +149,67 @@ pub(super) fn read_token(config_path: &Path) -> Option<DesktopToken> {
     None
 }
 
+/// The config's `lastKnownAccountUuid` identity binding, when present and
+/// non-empty. Missing or blank means the install predates the binding and
+/// keeps the legacy scope/expiry selection.
+fn current_account_uuid(config: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(config)
+        .ok()?
+        .get("lastKnownAccountUuid")?
+        .as_str()
+        .filter(|uuid| !uuid.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Config + Local State signature for one explicit desktop data directory.
+/// The token-cache contents identify a login change; the `Local State` file
+/// carries the OSCrypt key, so a key rotation must read as a change too.
+/// Both are content-based: unrelated `config.json` rewrites (window
+/// placement) stay invisible while a token rotation resumes only this account.
+pub(super) fn signature_for_dir(dir: &Path) -> String {
+    let config_path = dir.join("config.json");
+    let mut signature = watch_signature(&config_path);
+    signature.push_str("|local-state:");
+    signature.push_str(&crate::accounts::file_signature(&local_state_path(
+        &config_path,
+    )));
+    signature
+}
+
+/// The `config.json` holding the OAuth token cache for an explicit desktop
+/// data directory (`SourceKind::DesktopDir` profiles).
+pub(super) fn config_path_for_dir(dir: &Path) -> PathBuf {
+    dir.join("config.json")
+}
+
+/// Read-only token read for an explicit desktop data directory. Never falls
+/// back to CLI credential discovery or another directory's cache.
+pub(super) fn read_token_for_dir(dir: &Path) -> Option<DesktopToken> {
+    read_token(&config_path_for_dir(dir))
+}
+
 /// Signature over the encrypted cache rather than the file's mtime: the
 /// desktop app rewrites `config.json` for unrelated state such as window
 /// placement, and that must not read as a credential change.
 pub(super) fn watch_signature(config_path: &Path) -> String {
     let key = format!("desktop:{}", config_path.display());
-    let caches = std::fs::read_to_string(config_path)
-        .ok()
-        .map(|config| token_cache_values(&config))
+    let config = std::fs::read_to_string(config_path).ok();
+    let caches = config
+        .as_deref()
+        .map(token_cache_values)
         .unwrap_or_default();
+    // The identity binding is credential material: an account switch that
+    // reuses cache bytes must still read as a change.
+    let uuid = config
+        .as_deref()
+        .and_then(current_account_uuid)
+        .map(|uuid| format!("|uuid:{}", fnv1a(uuid.as_bytes())))
+        .unwrap_or_else(|| "|uuid:missing".to_string());
     if caches.is_empty() {
-        return format!("{key}|missing");
+        return format!("{key}|missing{uuid}");
     }
 
-    let mut signature = format!("{key}|present");
+    let mut signature = format!("{key}|present{uuid}");
     for (name, cache) in caches {
         signature.push_str(&format!("|{name}:{}", fnv1a(cache.as_bytes())));
     }
@@ -178,13 +230,32 @@ fn token_cache_values(config: &str) -> Vec<(&'static str, String)> {
         .collect()
 }
 
+/// Legacy unbound selection: scope/expiry ranking only (tests only).
+#[cfg(test)]
+fn select_token(plaintext: &str) -> Option<DesktopToken> {
+    select_token_for(plaintext, None)
+}
+
 /// Prefer both scopes required for usage, then inference-only, then unknown
 /// layouts for compatibility. Expiry breaks ties within each scope group.
-fn select_token(plaintext: &str) -> Option<DesktopToken> {
+///
+/// When the config binds an account UUID (`current`), ONLY entries for that
+/// UUID may be selected: any other UUID's entries are never a fallback, even
+/// when fresher or better scoped. A bound UUID with no matching entry reads
+/// as no login; a matching but expired entry still surfaces so the caller
+/// reports the owning account's expiry (`TokenExpired`). Without a binding
+/// the legacy scope/expiry selection applies.
+fn select_token_for(plaintext: &str, current: Option<&str>) -> Option<DesktopToken> {
     let json: serde_json::Value = serde_json::from_str(plaintext).ok()?;
     let entries = json.as_object()?;
 
-    let mut best: Option<((bool, bool, i64), DesktopToken)> = None;
+    struct Candidate<'a> {
+        user: &'a str,
+        scopes: Vec<&'a str>,
+        access_token: &'a str,
+        expires_at: Option<i64>,
+    }
+    let mut candidates = Vec::new();
     for (key, entry) in entries {
         let Some(access_token) = entry.get("token").and_then(|value| value.as_str()) else {
             continue;
@@ -192,13 +263,33 @@ fn select_token(plaintext: &str) -> Option<DesktopToken> {
         if access_token.trim().is_empty() {
             continue;
         }
-        let expires_at = entry.get("expiresAt").and_then(|value| value.as_i64());
-        let scopes = entry_scopes(key);
-        let inference = scopes.contains(&INFERENCE_SCOPE);
+        let user = entry_user(key);
+        if current.is_some_and(|current| user != current) {
+            continue;
+        }
+        candidates.push(Candidate {
+            user,
+            scopes: entry_scopes(key),
+            access_token,
+            expires_at: entry.get("expiresAt").and_then(|value| value.as_i64()),
+        });
+    }
+    // A missing `expiresAt` matches the CLI reader: no known expiry means
+    // the token is still usable.
+    let any_current = candidates
+        .iter()
+        .any(|candidate| !is_expired(candidate.expires_at));
+    let mut best: Option<((bool, bool, i64, &str), DesktopToken)> = None;
+    for candidate in candidates {
+        if any_current && is_expired(candidate.expires_at) {
+            continue;
+        }
+        let inference = candidate.scopes.contains(&INFERENCE_SCOPE);
         let rank = (
-            inference && scopes.contains(&PROFILE_SCOPE),
+            inference && candidate.scopes.contains(&PROFILE_SCOPE),
             inference,
-            expires_at.unwrap_or(i64::MIN),
+            candidate.expires_at.unwrap_or(i64::MIN),
+            candidate.user,
         );
         if best
             .as_ref()
@@ -209,8 +300,8 @@ fn select_token(plaintext: &str) -> Option<DesktopToken> {
         best = Some((
             rank,
             DesktopToken {
-                access_token: access_token.to_string(),
-                expires_at,
+                access_token: candidate.access_token.to_string(),
+                expires_at: candidate.expires_at,
             },
         ));
     }
@@ -218,6 +309,49 @@ fn select_token(plaintext: &str) -> Option<DesktopToken> {
     best.map(|(_, token)| token)
 }
 
+/// Account identity in a desktop cache key. Current caches use
+/// `acct:<account>|<organization>:<client>:<base URL>:<scopes>`; older
+/// caches use `<install>:<account>:<base URL>:<scopes>`.
+fn entry_user(key: &str) -> &str {
+    let first = key.split_whitespace().next().unwrap_or_default();
+    let Some(scheme) = first.rfind("://") else {
+        return "";
+    };
+    let Some(url_colon) = first[..scheme].rfind(':') else {
+        return "";
+    };
+    let Some(first_colon) = first.find(':') else {
+        return "";
+    };
+    if first_colon >= url_colon {
+        return "";
+    }
+    let identity = &first[first_colon + 1..url_colon];
+    if &first[..first_colon] == "acct" {
+        let Some((account, organization_client)) = identity.split_once('|') else {
+            return "";
+        };
+        let Some((organization, client)) = organization_client.split_once(':') else {
+            return "";
+        };
+        if account.is_empty() || organization.is_empty() || client.is_empty() {
+            return "";
+        }
+        account
+    } else {
+        identity
+    }
+}
+
+fn is_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|expires_at| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        now >= expires_at
+    })
+}
 fn entry_scopes(key: &str) -> Vec<&str> {
     let mut words = key.split_whitespace();
     let first = words.next().unwrap_or_default();
@@ -669,6 +803,73 @@ mod tests {
     }
 
     #[test]
+    fn stale_other_account_entries_lose_to_a_current_identity() {
+        // The previous account's entry is expired; the current account holds
+        // a usable token. Scope preference still applies within the current
+        // set: the usage-scoped token wins over a fresher inference-only one.
+        let token = select_token(
+            r#"{
+            "install:stale-uuid:https://api.anthropic.com:user:inference user:profile": {"token":"stale-other","expiresAt":1518644595762},
+            "install:current-uuid:https://api.anthropic.com:user:inference": {"token":"current-inference","expiresAt":9000000000000},
+            "install:current-uuid:https://api.anthropic.com:user:inference user:profile": {"token":"current-usage","expiresAt":8000000000000}
+        }"#,
+        )
+        .expect("a current identity should be selected");
+        assert_eq!(token.access_token, "current-usage");
+    }
+
+    #[test]
+    fn all_expired_cache_still_reports_the_best_token() {
+        // With no usable identity left, selection falls back to scope ranking
+        // so the caller reports an expired login instead of no login.
+        let token = select_token(
+            r#"{
+            "install:old-a:https://api.anthropic.com:user:inference": {"token":"old-inference","expiresAt":1518644595762},
+            "install:old-b:https://api.anthropic.com:user:inference user:profile": {"token":"old-usage","expiresAt":1418644595762}
+        }"#,
+        )
+        .expect("an expired cache still selects a token");
+        assert_eq!(token.access_token, "old-usage");
+    }
+    #[test]
+    fn bound_uuid_wins_over_better_scoped_fresher_other_uuid() {
+        // Both entries are unexpired; the wrong account holds both scopes
+        // with a far-future expiry. The bound current UUID must still win,
+        // with scope preference applying only within it.
+        let cache = r#"{
+            "acct:wrong-uuid|current-uuid:client-id:https://api.anthropic.com:user:inference user:profile": {"token":"wrong-usage","expiresAt":9000000000000},
+            "acct:current-uuid|other-org:client-id:https://api.anthropic.com:user:inference": {"token":"current-inference","expiresAt":8000000000000}
+        }"#;
+        let token = select_token_for(cache, Some("current-uuid"))
+            .expect("the bound UUID must select its own entry");
+        assert_eq!(token.access_token, "current-inference");
+        // No entry for the bound UUID: refuse, never borrow another login.
+        assert!(select_token_for(cache, Some("absent-uuid")).is_none());
+        // A matching but expired entry still surfaces so the caller reports
+        // the owning account's expiry instead of another account's token.
+        let stale = r#"{
+            "install:wrong-uuid:https://api.anthropic.com:user:inference user:profile": {"token":"wrong-usage","expiresAt":9000000000000},
+            "install:current-uuid:https://api.anthropic.com:user:inference": {"token":"current-stale","expiresAt":1518644595762}
+        }"#;
+        let token = select_token_for(stale, Some("current-uuid"))
+            .expect("the owning account's stale entry must surface");
+        assert_eq!(token.access_token, "current-stale");
+    }
+
+    #[test]
+    fn current_account_uuid_reads_the_config_binding() {
+        assert_eq!(
+            current_account_uuid(r#"{"lastKnownAccountUuid":"abc-123"}"#).as_deref(),
+            Some("abc-123")
+        );
+        assert!(current_account_uuid(r#"{"locale":"en-US"}"#).is_none());
+        assert!(current_account_uuid(r#"{"lastKnownAccountUuid":""}"#).is_none());
+        assert!(current_account_uuid(r#"{"lastKnownAccountUuid":"   "}"#).is_none());
+        assert!(current_account_uuid("not json").is_none());
+    }
+
+    #[test]
+
     fn ignores_entries_without_a_usable_token() {
         assert!(select_token(r#"{"install:user:scope": {"expiresAt": 1}}"#).is_none());
         assert!(select_token(r#"{"install:user:scope": {"token": ""}}"#).is_none());
@@ -743,6 +944,6 @@ mod tests {
     #[test]
     fn watch_signature_reports_missing_config() {
         let signature = watch_signature(Path::new("C:/nonexistent/Claude/config.json"));
-        assert!(signature.ends_with("|missing"), "{signature}");
+        assert!(signature.ends_with("|missing|uuid:missing"), "{signature}");
     }
 }

@@ -51,8 +51,8 @@ pub(super) fn mouse_handler_exists(
 ) -> bool {
     let state = lock_state();
     state.as_ref().is_some_and(|state| {
-        state.active_theme.as_ref().is_some_and(|theme| {
-            theme_engine::mouse_event_script(theme, surface_index, object_id, event).is_some()
+        effective_theme_from_state(state).is_some_and(|theme| {
+            theme_engine::mouse_event_script(&theme, surface_index, object_id, event).is_some()
         })
     })
 }
@@ -67,11 +67,12 @@ pub(super) fn dispatch_mouse_event(
         let Some(state) = state.as_ref() else {
             return false;
         };
-        let Some(theme) = state.active_theme.as_ref() else {
+        let Some(theme) = effective_theme_from_state(state) else {
             return false;
         };
-        let Some(source) = theme_engine::mouse_event_script(theme, surface_index, object_id, event)
-            .map(str::to_string)
+        let Some(source) =
+            theme_engine::mouse_event_script(&theme, surface_index, object_id, event)
+                .map(str::to_string)
         else {
             return false;
         };
@@ -90,7 +91,9 @@ pub(super) fn execute_mouse_action_source(
         let Some(state) = state.as_mut() else {
             return false;
         };
-        let Some(theme) = state.active_theme.clone() else {
+        // Generated account cards live in the expanded effective theme, not
+        // the authored active theme.
+        let Some(theme) = effective_theme_from_state(state) else {
             return false;
         };
         let data = state.data.clone();
@@ -130,6 +133,15 @@ pub(super) fn execute_mouse_action_source(
                         menu.as_deref(),
                         Some((surface_index, object_id.to_string())),
                     ),
+                    MouseActionEffect::OpenAccount { provider, id } => {
+                        open_account_slot(owner, provider, id, false);
+                    }
+                    MouseActionEffect::FocusAccount { provider, id } => {
+                        open_account_slot(owner, provider, id, true);
+                    }
+                    MouseActionEffect::ShowAccountOverflow => {
+                        show_account_overflow_menu(owner);
+                    }
                 }
             }
             true
@@ -143,6 +155,44 @@ pub(super) fn execute_mouse_action_source(
     }
 }
 
+/// Open/focus one widget account slot on a worker thread. Lifecycle owns the
+/// process launch; the controller never blocks on it. Busy accounts (poll
+/// job or deletion in flight) report a transient status instead of stacking
+/// another operation.
+pub(super) fn open_account_slot(_owner: HWND, provider: String, id: String, focus_only: bool) {
+    std::thread::Builder::new()
+        .name("usagehub-open-account".into())
+        .spawn(move || {
+            let provider_id = match crate::manager::widget::provider_from_key(&provider) {
+                Some(provider) => provider,
+                None => {
+                    diagnose::log(format!(
+                        "open account failed: unknown provider '{provider}'"
+                    ));
+                    return;
+                }
+            };
+            if crate::manager::widget::account_busy(provider_id, &id) {
+                diagnose::log(format!(
+                    "account {}/{} busy (оновлення/операція); open deferred",
+                    provider, id
+                ));
+                return;
+            }
+            let result = if focus_only {
+                crate::manager::widget::focus_account_card(provider_id, &id).map(|_| ())
+            } else {
+                crate::manager::widget::open_account_card(provider_id, &id)
+            };
+            if let Err(error) = result {
+                diagnose::log(format!("account {provider}/{id} open failed: {error}"));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            diagnose::log(format!("account open thread could not start: {error}"));
+        });
+}
 pub(super) fn schedule_or_dispatch_click(hwnd: HWND, surface_index: usize, object_id: String) {
     let has_click = mouse_handler_exists(surface_index, &object_id, MouseEventKind::Click);
     if !has_click {

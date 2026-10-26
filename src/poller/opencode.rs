@@ -191,6 +191,14 @@ fn fetch_go_status(
     credentials: &DashboardCredentials,
     url: &str,
 ) -> Result<DashboardUsage, PollError> {
+    fetch_go_status_with(&build_agent()?, credentials, url)
+}
+
+fn fetch_go_status_with(
+    agent: &ureq::Agent,
+    credentials: &DashboardCredentials,
+    url: &str,
+) -> Result<DashboardUsage, PollError> {
     let cookie = if credentials.auth_cookie.split(';').any(|part| {
         let part = part.trim_start();
         part.starts_with("auth=") || part.starts_with("__Host-console_session=")
@@ -202,7 +210,7 @@ fn fetch_go_status(
         format!("auth={}", credentials.auth_cookie)
     };
 
-    let mut response = match build_agent()?
+    let mut response = match agent
         .get(url)
         .header("Accept", "application/json")
         .header("x-org-id", &credentials.workspace_id)
@@ -470,12 +478,45 @@ mod tests {
         assert_eq!(section_from_window(&window).percentage, 100.0);
     }
 
+    /// Read a complete HTTP request (headers plus any Content-Length body) so
+    /// the fixture never closes the socket with unread request bytes, which
+    /// surfaces as WSAECONNRESET on Windows.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            assert!(request.len() < 64 * 1024, "request headers too large");
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "client closed before sending headers");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        let header_end = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(content_length < 1024 * 1024, "request body too large");
+        while request.len() < header_end + content_length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "client closed before sending body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        request
+    }
+
     fn mock_status_request(
         status: u16,
         body: &str,
         cookie: &str,
     ) -> (Result<DashboardUsage, PollError>, String) {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::time::Duration;
 
@@ -488,6 +529,7 @@ mod tests {
             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -496,17 +538,26 @@ mod tests {
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 1024];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let count = stream.read(&mut buffer).unwrap();
-                assert_ne!(count, 0);
-                request.extend_from_slice(&buffer[..count]);
-            }
+            let request = read_http_request(&mut stream);
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            // Hold the server socket until the client has consumed or rejected
+            // the complete response. This avoids a Windows FIN/RST race under
+            // the parallel suite without retrying a failed request.
+            finished_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("client did not finish the fixture request");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             String::from_utf8(request).unwrap()
         });
-        let result = fetch_go_status(
+        // Bypass the process proxy for loopback: ureq resolves a proxy from
+        // the environment by default, which would route 127.0.0.1 through the
+        // proxy and fail before the fixture responds. Production keeps the
+        // shared agent (and its proxy behavior) unchanged.
+        let agent =
+            super::super::build_loopback_test_agent().expect("loopback test agent should build");
+        let result = fetch_go_status_with(
+            &agent,
             &DashboardCredentials {
                 workspace_id: "wrk_example".into(),
                 auth_cookie: cookie.into(),
@@ -514,6 +565,7 @@ mod tests {
             },
             &url,
         );
+        let _ = finished_tx.send(());
         (result, server.join().unwrap())
     }
 

@@ -1,28 +1,35 @@
 use super::*;
-use crate::accounts::{fingerprint, AccountProfile, AccountSettings};
+use crate::accounts::{fingerprint, AccountProfile, AccountSettings, SourceKind};
 use crate::models::AccountUsage;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 struct Target {
     provider: ProviderId,
     profile: Option<AccountProfile>,
-    path: Result<Option<PathBuf>, String>,
+    kind: SourceKind,
+    credential: Result<Option<PathBuf>, String>,
+    desktop_dir: Option<PathBuf>,
+    /// Stable grouping identity: same source shares one poll job, while
+    /// content-sensitive rotation stays in `signature()` so only the owning
+    /// account resumes.
+    group: String,
 }
 
 impl Target {
     fn signature(&self) -> String {
-        if self.profile.is_none() {
-            return String::new();
+        match &self.profile {
+            None => String::new(),
+            Some(profile) => profile_source_signature(self.provider, profile),
         }
-        match &self.path {
-            Ok(Some(path)) => account_source_signature(self.provider, path),
-            Ok(None) => fingerprint(&format!(
-                "{:?}",
-                credential_watch_snapshot(CredentialWatchMode::ActiveSource(self.provider))
-            )),
-            Err(error) => fingerprint(error),
-        }
+    }
+
+    fn credential_path(&self) -> Option<&Path> {
+        self.credential
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(PathBuf::as_path)
     }
 }
 
@@ -38,13 +45,31 @@ pub(super) fn poll_accounts(
         settings,
         previous,
         force,
-        |provider, path| match path {
-            Some(path) => match provider {
-                ProviderId::Claude => claude::poll_account(path),
-                ProviderId::Codex => codex::poll_account(path),
-                _ => poll_provider(provider),
+        |target: &Target| match target.provider {
+            ProviderId::Claude => match target.kind {
+                SourceKind::DesktopDir => match &target.desktop_dir {
+                    Some(dir) => claude::poll_desktop_dir(dir),
+                    None => Err(PollError::NoCredentials),
+                },
+                _ => match &target.credential {
+                    Err(_) => Err(PollError::NoCredentials),
+                    Ok(Some(path)) => claude::poll_credential_file(
+                        path,
+                        target
+                            .profile
+                            .as_ref()
+                            .map(|profile| profile.credential_targets.as_slice())
+                            .unwrap_or(&[]),
+                    ),
+                    Ok(None) => poll_provider(target.provider),
+                },
             },
-            None => poll_provider(provider),
+            ProviderId::Codex => match &target.credential {
+                Err(_) => Err(PollError::NoCredentials),
+                Ok(Some(path)) => codex::poll_account(path),
+                Ok(None) => poll_provider(target.provider),
+            },
+            _ => poll_provider(target.provider),
         },
         on_progress,
     )
@@ -57,10 +82,15 @@ fn poll_accounts_with<F>(
     poll: F,
 ) -> Result<AppUsageData, PollFailure>
 where
-    F: Fn(ProviderId, Option<&std::path::Path>) -> Result<UsageData, PollError> + Sync,
+    F: Fn(&Target) -> Result<UsageData, PollError> + Sync,
 {
     poll_accounts_with_history(enabled, settings, None, false, poll)
 }
+
+#[cfg(test)]
+/// Account-exclusive guards are process-wide named mutexes: serialize
+/// account-poll tests so parallel tests never observe each other as busy.
+static ACCOUNT_POLL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 fn poll_accounts_with_history<F>(
@@ -71,9 +101,105 @@ fn poll_accounts_with_history<F>(
     poll: F,
 ) -> Result<AppUsageData, PollFailure>
 where
-    F: Fn(ProviderId, Option<&std::path::Path>) -> Result<UsageData, PollError> + Sync,
+    F: Fn(&Target) -> Result<UsageData, PollError> + Sync,
 {
+    let _serial = ACCOUNT_POLL_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     poll_accounts_with_progress(enabled, settings, previous, force, poll, |_| {})
+}
+
+/// Resolve one enabled profile to its explicit poll source. Desktop
+/// directories are Claude-only and read `config.json` + `Local State`
+/// directly; every other profile keeps the legacy credential-file
+/// resolution. Nothing here guesses or borrows another account's login.
+fn resolve_target(provider: ProviderId, profile: &AccountProfile) -> Target {
+    if !profile.desktop_dir.trim().is_empty() && provider != ProviderId::Claude {
+        let error = format!(
+            "desktop_dir is Claude-only; account '{}' sets it for {provider:?}",
+            profile.id
+        );
+        return Target {
+            provider,
+            profile: Some(profile.clone()),
+            kind: SourceKind::ProviderDefault,
+            credential: Err(error.clone()),
+            desktop_dir: None,
+            group: format!("invalid|{}", fingerprint(&error)),
+        };
+    }
+    let kind = profile.source_kind(provider);
+    let desktop_dir = if matches!(kind, SourceKind::DesktopDir) {
+        profile.desktop_dir_resolved().ok().flatten()
+    } else {
+        None
+    };
+    // Desktop profiles never consult credential files; other profiles keep
+    // the legacy file/env discovery fallbacks for their own login only.
+    let credential = if matches!(kind, SourceKind::DesktopDir) {
+        Ok(None)
+    } else {
+        profile.credential_path(provider).map(|path| {
+            path.or_else(|| match provider {
+                ProviderId::Codex => codex::codex_auth_path(),
+                ProviderId::Claude => crate::accounts::environment_directory(provider)
+                    .map(|directory| directory.join(".credentials.json"))
+                    .or_else(claude::native_credential_path),
+                _ => None,
+            })
+        })
+    };
+    let group = group_key_for(provider, kind, &credential, &desktop_dir, profile);
+    Target {
+        provider,
+        profile: Some(profile.clone()),
+        kind,
+        credential,
+        desktop_dir,
+        group,
+    }
+}
+
+/// Stable grouping identity: paths and target names only, never file
+/// contents, secrets, or write stamps, so a token rotation never splits a
+/// shared source into two concurrent jobs.
+fn group_key_for(
+    provider: ProviderId,
+    kind: SourceKind,
+    credential: &Result<Option<PathBuf>, String>,
+    desktop_dir: &Option<PathBuf>,
+    profile: &AccountProfile,
+) -> String {
+    if provider == ProviderId::Claude {
+        match kind {
+            SourceKind::DesktopDir => match desktop_dir {
+                Some(dir) => format!("claude-desktop|{}", crate::accounts::source_key(dir)),
+                None => format!(
+                    "claude-desktop-invalid|{}",
+                    fingerprint(&profile.desktop_dir)
+                ),
+            },
+            _ => match credential {
+                Ok(Some(path)) => {
+                    let mut targets = profile.credential_targets.clone();
+                    targets.sort();
+                    targets.dedup();
+                    format!(
+                        "claude-file|{}|targets:{}",
+                        crate::accounts::source_key(path),
+                        targets.join(",")
+                    )
+                }
+                Ok(None) => "claude-default".to_string(),
+                Err(error) => format!("claude-invalid|{}", fingerprint(error)),
+            },
+        }
+    } else {
+        match credential {
+            Ok(Some(path)) => crate::accounts::source_key(path),
+            other => format!("{other:?}"),
+        }
+    }
 }
 
 fn poll_accounts_with_progress<F>(
@@ -85,32 +211,22 @@ fn poll_accounts_with_progress<F>(
     mut on_progress: impl FnMut(AppUsageData),
 ) -> Result<AppUsageData, PollFailure>
 where
-    F: Fn(ProviderId, Option<&std::path::Path>) -> Result<UsageData, PollError> + Sync,
+    F: Fn(&Target) -> Result<UsageData, PollError> + Sync,
 {
     let mut targets = Vec::new();
     for provider in enabled.iter() {
         if let Some(accounts) = settings.get(provider) {
             for profile in accounts.profiles.iter().filter(|profile| profile.enabled) {
-                let path = profile.credential_path(provider).map(|path| {
-                    path.or_else(|| match provider {
-                        ProviderId::Codex => codex::codex_auth_path(),
-                        ProviderId::Claude => crate::accounts::environment_directory(provider)
-                            .map(|directory| directory.join(".credentials.json"))
-                            .or_else(claude::native_credential_path),
-                        _ => None,
-                    })
-                });
-                targets.push(Target {
-                    provider,
-                    profile: Some(profile.clone()),
-                    path,
-                });
+                targets.push(resolve_target(provider, profile));
             }
         } else {
             targets.push(Target {
                 provider,
                 profile: None,
-                path: Ok(None),
+                kind: SourceKind::ProviderDefault,
+                credential: Ok(None),
+                desktop_dir: None,
+                group: format!("legacy|{provider:?}"),
             });
         }
     }
@@ -118,10 +234,10 @@ where
     // Each distinct source has one job, while unrelated accounts run concurrently.
     let mut groups: Vec<Vec<Target>> = Vec::new();
     for target in targets {
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group[0].provider == target.provider
-                && source_key(&group[0].path) == source_key(&target.path)
-        }) {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group[0].provider == target.provider && group[0].group == target.group)
+        {
             group.push(target);
         } else {
             groups.push(vec![target]);
@@ -129,7 +245,8 @@ where
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut results = std::thread::scope(|scope| {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) =
+            std::sync::mpsc::channel::<(usize, Target, String, Result<UsageData, PollError>)>();
         for _ in 0..groups.len().min(MAX_CONCURRENT_PROVIDER_POLLS) {
             let sender = sender.clone();
             let groups = &groups;
@@ -153,23 +270,59 @@ where
                         )
                     })
                 };
+                // One in-flight job per account: an account whose guard is
+                // busy (open/rename/backup/cleanup in progress) skips this
+                // cycle with a transient error instead of borrowing a source.
+                // The guards stay held through the response and the
+                // source-signature check below.
+                let mut _account_guards = Vec::new();
+                let mut busy = false;
+                for target in group.iter() {
+                    if let Some(profile) = target.profile.as_ref() {
+                        match crate::manager::state::AccountOperationGuard::acquire(
+                            target.provider,
+                            &profile.id,
+                            0,
+                        ) {
+                            Ok(guard) => _account_guards.push(guard),
+                            Err(_) => {
+                                busy = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 let mut result = Err(paused_error.unwrap_or(PollError::RequestFailed));
+                if busy {
+                    diagnose::log_lazy(|| {
+                        format!(
+                            "{} account {} poll skipped: account busy",
+                            target.provider.descriptor().display_name,
+                            target
+                                .profile
+                                .as_ref()
+                                .map(|profile| profile.name.as_str())
+                                .unwrap_or("default"),
+                        )
+                    });
+                    result = Err(PollError::RequestFailed);
+                }
                 diagnose::log_lazy(|| {
                     format!(
-                        "{} account {} polling source={:?} paused={paused_error:?}",
+                        "{} account {} polling group={} paused={paused_error:?} busy={busy:?}",
                         target.provider.descriptor().display_name,
                         target
                             .profile
                             .as_ref()
                             .map(|profile| profile.name.as_str())
                             .unwrap_or("default"),
-                        target.path
+                        target.group
                     )
                 });
-                for _ in 0..if paused_error.is_some() { 0 } else { 2 } {
-                    result = retry_after::with_manual_refresh(force, || match &target.path {
+                for _ in 0..if paused_error.is_some() || busy { 0 } else { 2 } {
+                    result = retry_after::with_manual_refresh(force, || match &target.credential {
                         Err(_) => Err(PollError::NoCredentials),
-                        Ok(path) => poll(target.provider, path.as_deref()),
+                        Ok(_) => poll(target),
                     });
                     let current_signature = target.signature();
                     if signature == current_signature {
@@ -256,7 +409,7 @@ fn append_account_result(
             provider: target.provider,
             profile: profile.clone(),
             source_signature: signature.to_string(),
-            source_path: target.path.as_ref().ok().cloned().flatten(),
+            source_path: explicit_source_path(target.provider, profile),
             usage: result.as_ref().ok().cloned(),
             error: result.as_ref().err().copied(),
             selected: false,
@@ -266,20 +419,13 @@ fn append_account_result(
     }
 }
 
-fn source_key(path: &Result<Option<PathBuf>, String>) -> String {
-    match path {
-        Ok(Some(path)) => crate::accounts::source_key(path),
-        other => format!("{other:?}"),
-    }
-}
-
 pub(super) fn carry_accounts(fresh: &mut AppUsageData, previous: &AppUsageData) {
     for account in &mut fresh.accounts {
         if account.usage.is_some() {
             continue;
         }
         // Only transient failures may keep a reading, and only for the same
-        // configured source and unchanged credentials file.
+        // configured source and unchanged content signature.
         if !account.error.is_some_and(PollError::is_transient) {
             continue;
         }
@@ -303,7 +449,6 @@ pub(super) fn carry_accounts(fresh: &mut AppUsageData, previous: &AppUsageData) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::file_signature;
     use crate::accounts::ProviderAccounts;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -340,6 +485,11 @@ mod tests {
     #[test]
     fn ready_accounts_are_published_while_another_provider_is_waiting() {
         let mut settings = settings();
+        // Shares the account-poll serial so parallel tests never observe
+        // this test's in-flight jobs as busy (see poll_accounts_with_history).
+        let _serial = ACCOUNT_POLL_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         settings.claude.profiles.truncate(1);
         settings.claude.selected = "personal".into();
         settings.codex.profiles[0].config_dir = "C:\\account-tests\\codex".into();
@@ -352,8 +502,8 @@ mod tests {
             &settings,
             None,
             false,
-            |provider, _| {
-                if provider == ProviderId::Claude {
+            |target| {
+                if target.provider == ProviderId::Claude {
                     wait.lock()
                         .unwrap()
                         .recv_timeout(Duration::from_secs(5))
@@ -383,7 +533,7 @@ mod tests {
     fn partial_account_results_preserve_selection_and_error_rules() {
         let settings = settings();
         let previous =
-            poll_accounts_with(ProviderSet::default(), &settings, |_, _| Ok(usage(25.0))).unwrap();
+            poll_accounts_with(ProviderSet::default(), &settings, |_| Ok(usage(25.0))).unwrap();
         let personal = previous
             .accounts
             .iter()
@@ -457,8 +607,11 @@ mod tests {
             PollError::HttpStatus(401),
             PollError::HttpStatus(403),
         ] {
-            let first = poll_accounts_with(ProviderSet::default(), &settings, |_, path| {
-                if path.unwrap().to_string_lossy().contains("work") {
+            let first = poll_accounts_with(ProviderSet::default(), &settings, |target| {
+                if target
+                    .credential_path()
+                    .is_some_and(|path| path.to_string_lossy().contains("work"))
+                {
                     Err(error)
                 } else {
                     Ok(usage(25.0))
@@ -472,9 +625,11 @@ mod tests {
                 &settings,
                 Some(&first),
                 false,
-                |_, path| {
+                |target| {
                     assert!(
-                        !path.unwrap().to_string_lossy().contains("work"),
+                        !target
+                            .credential_path()
+                            .is_some_and(|path| path.to_string_lossy().contains("work")),
                         "paused account must not refresh its CLI token"
                     );
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -500,7 +655,7 @@ mod tests {
                 &settings,
                 Some(&second),
                 true,
-                |_, _| {
+                |_| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err(error)
                 },
@@ -527,18 +682,17 @@ mod tests {
         let mut settings = settings();
         settings.claude.profiles.truncate(1);
         settings.claude.profiles[0].config_dir = directory.to_string_lossy().into_owned();
-        let first = poll_accounts_with(ProviderSet::default(), &settings, |_, _| {
+        let first = poll_accounts_with(ProviderSet::default(), &settings, |_| {
             Err(PollError::TokenExpired)
         })
         .unwrap();
         assert!(first.is_empty());
-        assert_eq!(first.new_auth_failures(None, false).len(), 1);
         let waiting = poll_accounts_with_history(
             ProviderSet::default(),
             &settings,
             Some(&first),
             false,
-            |_, _| panic!("unchanged expired credentials must stay paused"),
+            |_| panic!("unchanged expired credentials must stay paused"),
         )
         .unwrap();
         assert!(waiting.new_auth_failures(Some(&first), false).is_empty());
@@ -548,7 +702,7 @@ mod tests {
             &settings,
             Some(&waiting),
             false,
-            |_, _| Ok(usage(80.0)),
+            |_| Ok(usage(80.0)),
         )
         .unwrap();
         assert!(resumed.new_auth_failures(Some(&waiting), false).is_empty());
@@ -566,7 +720,7 @@ mod tests {
             &settings,
             Some(&resumed),
             false,
-            |_, _| Err(PollError::AuthRequired),
+            |_| Err(PollError::AuthRequired),
         )
         .unwrap();
         assert_eq!(
@@ -580,8 +734,11 @@ mod tests {
     #[test]
     fn failing_selected_account_never_borrows_another_accounts_usage() {
         let settings = settings();
-        let data = poll_accounts_with(ProviderSet::default(), &settings, |_, path| {
-            if path.unwrap().to_string_lossy().contains("work") {
+        let data = poll_accounts_with(ProviderSet::default(), &settings, |target| {
+            if target
+                .credential_path()
+                .is_some_and(|path| path.to_string_lossy().contains("work"))
+            {
                 Err(PollError::AuthRequired)
             } else {
                 Ok(usage(25.0))
@@ -602,7 +759,7 @@ mod tests {
     fn stale_data_requires_the_same_profile_source_and_transient_error() {
         let settings = settings();
         let previous =
-            poll_accounts_with(ProviderSet::default(), &settings, |_, _| Ok(usage(42.0))).unwrap();
+            poll_accounts_with(ProviderSet::default(), &settings, |_| Ok(usage(42.0))).unwrap();
         for (error, change_source, change_path, expected) in [
             (PollError::RequestFailed, false, false, true),
             (PollError::RequestFailed, true, false, false),
@@ -618,7 +775,7 @@ mod tests {
             (PollError::NoCredentials, false, false, false),
         ] {
             let mut fresh =
-                poll_accounts_with(ProviderSet::default(), &settings, |_, _| Err(error)).unwrap();
+                poll_accounts_with(ProviderSet::default(), &settings, |_| Err(error)).unwrap();
             if change_source {
                 fresh.accounts[1].source_signature.push('x');
             }
@@ -636,7 +793,7 @@ mod tests {
     #[test]
     fn http_failure_survives_cache_and_clears_after_success() {
         let settings = settings();
-        let failed = poll_accounts_with(ProviderSet::default(), &settings, |_, _| {
+        let failed = poll_accounts_with(ProviderSet::default(), &settings, |_| {
             Err(PollError::HttpStatus(429))
         })
         .unwrap();
@@ -650,7 +807,7 @@ mod tests {
             &settings,
             Some(&failed),
             false,
-            |_, _| {
+            |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(usage(35.0))
             },
@@ -678,12 +835,17 @@ mod tests {
     #[test]
     fn cache_round_trip_selection_removal_and_path_changes_are_isolated() {
         let mut settings = settings();
-        let mut data = poll_accounts_with(ProviderSet::default(), &settings, |_, path| {
-            Ok(usage(if path.unwrap().to_string_lossy().contains("work") {
-                80.0
-            } else {
-                20.0
-            }))
+        let mut data = poll_accounts_with(ProviderSet::default(), &settings, |target| {
+            Ok(usage(
+                if target
+                    .credential_path()
+                    .is_some_and(|path| path.to_string_lossy().contains("work"))
+                {
+                    80.0
+                } else {
+                    20.0
+                },
+            ))
         })
         .unwrap();
         let json = serde_json::to_string(&data).unwrap();
@@ -713,7 +875,7 @@ mod tests {
         let mut settings = settings();
         settings.claude.profiles[0].config_dir.clear();
         settings.claude.profiles[1].enabled = false;
-        let data = poll_accounts_with(ProviderSet::default(), &settings, |_, _| {
+        let data = poll_accounts_with(ProviderSet::default(), &settings, |_| {
             panic!("invalid profile polled")
         })
         .unwrap();
@@ -739,7 +901,7 @@ mod tests {
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let calls = AtomicUsize::new(0);
-        let data = poll_accounts_with(ProviderSet::default(), &settings, |_, _| {
+        let data = poll_accounts_with(ProviderSet::default(), &settings, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(current, Ordering::SeqCst);
@@ -771,7 +933,7 @@ mod tests {
         settings.claude.profiles.truncate(1);
         settings.claude.profiles[0].config_dir = directory.to_string_lossy().into_owned();
         let calls = AtomicUsize::new(0);
-        let data = poll_accounts_with(ProviderSet::default(), &settings, |_, _| {
+        let data = poll_accounts_with(ProviderSet::default(), &settings, |_| {
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 std::fs::write(&path, "fixture after token rotation, different length").unwrap();
                 Ok(usage(10.0))
@@ -785,7 +947,10 @@ mod tests {
             data.get(ProviderId::Claude).unwrap().session.percentage,
             80.0
         );
-        assert_eq!(data.accounts[0].source_signature, file_signature(&path));
+        assert_eq!(
+            data.accounts[0].source_signature,
+            super::super::claude::credential_file_signature(&path, &[])
+        );
         let mut cached = data;
         std::fs::write(&path, "another login").unwrap();
         cached.invalidate_changed_credentials();
@@ -794,5 +959,163 @@ mod tests {
         assert!(cached.accounts[0].usage.is_none());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn desktop_dir_profiles_share_one_job_per_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-desktop-group-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let shared = root.join("shared");
+        let other = root.join("other");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let settings = AccountSettings {
+            claude: ProviderAccounts {
+                profiles: vec![
+                    ("first", shared.clone()),
+                    ("second", shared.clone()),
+                    ("third", other.clone()),
+                ]
+                .into_iter()
+                .map(|(id, dir)| AccountProfile {
+                    id: id.into(),
+                    name: id.into(),
+                    desktop_dir: dir.to_string_lossy().into_owned(),
+                    ..Default::default()
+                })
+                .collect(),
+                selected: "first".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let calls = AtomicUsize::new(0);
+        let data = poll_accounts_with(ProviderSet::default(), &settings, |target| {
+            assert_eq!(target.kind, SourceKind::DesktopDir);
+            assert!(target.desktop_dir.is_some());
+            assert!(target.credential_path().is_none());
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(usage(42.0))
+        })
+        .unwrap();
+        // Two directories mean two jobs, even with three profiles.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(data.accounts.len(), 3);
+        assert!(data
+            .accounts
+            .iter()
+            .all(|account| account.usage.as_ref().is_some_and(|usage| !usage.stale)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rotation_in_one_account_does_not_resume_a_paused_sibling() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-sibling-pause-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let personal_dir = root.join("sibling-personal");
+        let work_dir = root.join("sibling-work");
+        std::fs::create_dir_all(&personal_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let personal_file = personal_dir.join(".credentials.json");
+        let work_file = work_dir.join(".credentials.json");
+        std::fs::write(&personal_file, "personal login").unwrap();
+        std::fs::write(&work_file, "work login").unwrap();
+        let mut settings = settings();
+        settings.claude.profiles[0].config_dir = personal_dir.to_string_lossy().into_owned();
+        settings.claude.profiles[1].config_dir = work_dir.to_string_lossy().into_owned();
+        let first = poll_accounts_with(ProviderSet::default(), &settings, |target| {
+            if target
+                .credential_path()
+                .is_some_and(|path| path.to_string_lossy().contains("sibling-personal"))
+            {
+                Err(PollError::TokenExpired)
+            } else {
+                Ok(usage(25.0))
+            }
+        })
+        .unwrap();
+        assert_eq!(first.new_auth_failures(None, false).len(), 1);
+        // The sibling rotates its own login while personal stays paused.
+        std::fs::write(&work_file, "work login after rotation, longer").unwrap();
+        let calls = AtomicUsize::new(0);
+        let second = poll_accounts_with_history(
+            ProviderSet::default(),
+            &settings,
+            Some(&first),
+            false,
+            |target| {
+                let personal = target
+                    .credential_path()
+                    .is_some_and(|path| path.to_string_lossy().contains("sibling-personal"));
+                assert!(!personal, "paused sibling must not be re-polled");
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(usage(30.0))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second
+                .accounts
+                .iter()
+                .find(|account| account.profile.id == "personal")
+                .unwrap()
+                .error,
+            Some(PollError::TokenExpired)
+        );
+        assert_eq!(
+            second
+                .accounts
+                .iter()
+                .find(|account| account.profile.id == "work")
+                .and_then(|account| account.usage.as_ref())
+                .unwrap()
+                .session
+                .percentage,
+            30.0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn busy_account_skips_with_a_transient_error() {
+        // The account guard is held by an in-progress exclusive operation:
+        // the poll job skips this account instead of borrowing a source.
+        let _serial = super::ACCOUNT_POLL_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _held = crate::manager::state::AccountOperationGuard::acquire(
+            ProviderId::Claude,
+            "personal",
+            0,
+        )
+        .expect("account guard acquires");
+        let mut settings = settings();
+        settings.claude.profiles.truncate(1);
+        assert_eq!(settings.claude.profiles[0].id, "personal");
+        let data = poll_accounts_with_progress(
+            ProviderSet::default(),
+            &settings,
+            None,
+            false,
+            |_| panic!("busy account must not run its poll job"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(data.accounts.len(), 1);
+        assert!(data.accounts[0].usage.is_none());
+        assert_eq!(data.accounts[0].error, Some(PollError::RequestFailed));
+        assert!(PollError::RequestFailed.is_transient());
     }
 }

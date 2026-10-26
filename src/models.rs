@@ -293,24 +293,28 @@ impl AppUsageData {
             .map(|account| account.profile.name.as_str())
     }
 
-    /// A cached reading must not outlive a login change or a different inherited
-    /// config directory. This only stats files; it never starts a CLI or WSL.
+    /// A cached reading must not outlive a login change or a different
+    /// explicit source. This only stats files (and reads credential-manager
+    /// write stamps); it never starts a CLI or WSL, and never touches secrets.
     pub fn invalidate_changed_credentials(&mut self) {
         for account in &mut self.accounts {
-            let expected = account
-                .profile
-                .credential_path(account.provider)
-                .ok()
-                .flatten()
-                .or_else(|| crate::accounts::default_credential_path(account.provider));
-            let changed = match &account.source_path {
-                Some(path) => {
-                    expected.as_ref().is_none_or(|expected| {
-                        crate::accounts::source_key(expected) != crate::accounts::source_key(path)
-                    }) || crate::poller::account_source_signature(account.provider, path)
-                        != account.source_signature
+            // The explicit source this result was polled from: the desktop
+            // `config.json` for desktop-directory profiles, the credentials
+            // file for credential-file profiles.
+            let current = crate::poller::explicit_source_path(account.provider, &account.profile);
+            let changed = match (&account.source_path, &current) {
+                (Some(stored), Some(current)) => {
+                    crate::accounts::source_key(current) != crate::accounts::source_key(stored)
+                        || crate::poller::profile_source_signature(
+                            account.provider,
+                            &account.profile,
+                        ) != account.source_signature
                 }
-                None => crate::accounts::environment_directory(account.provider).is_some(),
+                // The profile gained or dropped its explicit source.
+                (Some(_), None) | (None, Some(_)) => true,
+                // Legacy provider-default discovery: only an explicit config-dir
+                // override inherited from the environment invalidates the cache.
+                (None, None) => crate::accounts::environment_directory(account.provider).is_some(),
             };
             if changed {
                 account.usage = None;
@@ -453,16 +457,33 @@ mod tests {
     }
 
     #[test]
-    fn default_claude_cache_keeps_poll_results_until_source_changes() {
+    fn credential_file_cache_keeps_poll_results_until_source_changes() {
+        use std::time::{SystemTime, UNIX_EPOCH};
         let provider = ProviderId::Claude;
-        let path = crate::accounts::default_credential_path(provider).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "usage-models-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".credentials.json");
+        std::fs::write(&path, "cache fixture").unwrap();
+        let profile = crate::accounts::AccountProfile {
+            id: "personal".into(),
+            name: "personal".into(),
+            config_dir: directory.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         // Fingerprints only: no tokens are decrypted, used, or changed.
-        let signature = crate::poller::account_source_signature(provider, &path);
+        let signature = crate::poller::profile_source_signature(provider, &profile);
         for error in [None, Some(crate::poller::PollError::HttpStatus(429))] {
             let mut data = AppUsageData::default();
             data.accounts.push(AccountUsage {
                 provider,
-                profile: crate::accounts::AccountProfile::default(),
+                profile: profile.clone(),
                 source_signature: signature.clone(),
                 source_path: Some(path.clone()),
                 usage: error.is_none().then(UsageData::default),
@@ -478,6 +499,65 @@ mod tests {
             assert!(cached.accounts[0].usage.is_none());
             assert!(cached.accounts[0].error.is_none());
         }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn desktop_cache_invalidation_is_per_account() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let provider = ProviderId::Claude;
+        let root = std::env::temp_dir().join(format!(
+            "usage-models-desktop-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        for dir in [&first_dir, &second_dir] {
+            std::fs::write(dir.join("config.json"), r#"{"oauth:tokenCacheV2":"login"}"#).unwrap();
+        }
+        let profile_for = |id: &str, dir: &std::path::Path| crate::accounts::AccountProfile {
+            id: id.into(),
+            name: id.into(),
+            desktop_dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut data = AppUsageData::default();
+        for (id, dir) in [("first", &first_dir), ("second", &second_dir)] {
+            let profile = profile_for(id, dir);
+            data.accounts.push(AccountUsage {
+                provider,
+                profile: profile.clone(),
+                source_signature: crate::poller::profile_source_signature(provider, &profile),
+                source_path: crate::poller::explicit_source_path(provider, &profile),
+                usage: Some(UsageData::default()),
+                error: None,
+                selected: id == "first",
+            });
+        }
+        let json = serde_json::to_string(&data).unwrap();
+        let mut cached: AppUsageData = serde_json::from_str(&json).unwrap();
+        cached.invalidate_changed_credentials();
+        assert!(cached
+            .accounts
+            .iter()
+            .all(|account| account.usage.is_some()));
+        // Rotation in the first directory clears only the owning account.
+        std::fs::write(
+            first_dir.join("config.json"),
+            r#"{"oauth:tokenCacheV2":"rotated-login"}"#,
+        )
+        .unwrap();
+        cached.invalidate_changed_credentials();
+        assert!(cached.accounts[0].usage.is_none());
+        assert!(cached.accounts[1].usage.is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

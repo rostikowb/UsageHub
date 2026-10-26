@@ -15,6 +15,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
+const PBT_APMRESUMESUSPEND: u32 = 0x7;
 use windows::Win32::UI::Controls::{HOVER_DEFAULT, WM_MOUSEHOVER, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -220,6 +221,38 @@ const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 const WINDOW_STATE_INTERVAL_MS: u32 = 250;
+/// Controller timer that expires 7-day deletion-undo snapshots on a worker
+/// thread. Hourly is cheap (one directory walk) and keeps the safety net
+/// tight; startup and resume always purge immediately.
+const TIMER_BACKUP_PURGE: usize = 41;
+const BACKUP_PURGE_INTERVAL_MS: u32 = 3_600_000;
+/// Modest periodic taskbar identity maintenance (shortcut/COM stamping).
+/// The worker coalesces behind one in-flight flag; the native helper owns
+/// snapshot caching so a tick never shells out per account.
+const TIMER_TASKBAR_IDENTITIES: usize = 42;
+const TASKBAR_IDENTITIES_INTERVAL_MS: u32 = 20_000;
+
+/// Width budget for dynamic account columns. The native collision pass still
+/// ejects genuinely over-wide bars to floating, and anything past this budget
+/// flows to the overflow account chooser — the bar can never cover Start or
+/// pinned icons because of one more account.
+fn account_bar_budget(state: &AppState) -> f64 {
+    let fallback = theme_engine::account_layout::ACCOUNT_MAX_WIDTH_FALLBACK;
+    let taskbars = native_interop::find_taskbars();
+    let taskbar = taskbars
+        .get(state.taskbar_index)
+        .or_else(|| taskbars.first());
+    let Some(rect) = taskbar.map(|taskbar| taskbar.rect) else {
+        return fallback;
+    };
+    let length = if native_interop::is_taskbar_horizontal(rect) {
+        rect.right - rect.left
+    } else {
+        rect.bottom - rect.top
+    } as f64
+        / display_scale(state.taskbar_index.max(0));
+    (length * 0.5).clamp(220.0, 560.0)
+}
 
 fn language_menu_command_id(language: LanguageId) -> u16 {
     IDM_LANG_FIRST
@@ -265,7 +298,7 @@ const UI_PROBE_TIMEOUT_MS: u32 = 1_000;
 /// freezes in turn, behind an explorer.exe that stays hung for instance, is
 /// given twice as long as the previous one before the next attempt, instead of
 /// being replaced every half minute for as long as the cause lasts.
-const ENV_HANG_RELAUNCHES: &str = "CCUM_HANG_RELAUNCHES";
+const ENV_HANG_RELAUNCHES: &str = "UH_HANG_RELAUNCHES";
 
 /// A hang relaunch only extends the streak when the replacement freezes within
 /// this long of being started; past it, the next hang starts over at 30 s.
@@ -432,10 +465,10 @@ const RELAUNCH_THROTTLE_SECS: u64 = 10;
 const RELAUNCH_BACKOFF_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
-const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
+const ENV_RELAUNCH: &str = "UH_RELAUNCH";
 /// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
 /// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
+const ENV_LAST_RELAUNCH_UNIX: &str = "UH_LAST_RELAUNCH_UNIX";
 
 /// A process restart is reserved for an unresponsive UI thread. Shell-hosted
 /// surface loss is recovered in place by the controller.
@@ -882,6 +915,44 @@ fn theme_with_placement(state: &AppState, auto_ejected: bool) -> Option<ThemeDoc
         };
         positioning::override_primary_placement(&mut theme, placement);
     }
+    // Dynamic account slots: regenerate columns/rows from the pinned registry
+    // on every layout. Non-aware custom themes pass through untouched; the
+    // third pinned account appears without any manual theme JSON.
+    let budget = account_bar_budget(state);
+    let cards = crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref());
+    let mut layout = theme_engine::account_layout::layout_accounts(&cards, budget);
+    if theme_engine::account_layout::is_left_dock_classic(&theme) {
+        // The shared estimate accounts for cards but not the other enabled
+        // provider columns. Measure the expanded authored width with the same
+        // runtime bindings used for rendering, including the overflow chip.
+        let surface_index = theme
+            .surfaces
+            .iter()
+            .position(|surface| surface.id == "main")
+            .expect("classic layout has a main surface");
+        loop {
+            let expanded = theme_engine::account_layout::expand_theme_for_accounts(&theme, &layout);
+            let runtime = theme_runtime_for_surface(
+                &expanded,
+                surface_index,
+                theme_runtime_from_state(state),
+            );
+            let (width, _) = theme_engine::resolve_surface_size(
+                &expanded,
+                surface_index,
+                state.data.as_ref(),
+                runtime,
+            );
+            if f64::from(width) <= budget || layout.visible.len() <= 1 {
+                theme = expanded;
+                break;
+            }
+            let card = layout.visible.pop().expect("more than one visible card");
+            layout.overflow.insert(0, card);
+        }
+    } else {
+        theme = theme_engine::account_layout::expand_theme_for_accounts(&theme, &layout);
+    }
     Some(theme)
 }
 
@@ -1303,7 +1374,7 @@ fn tray_icon_tooltip_from_state() -> String {
         lock_state()
             .as_ref()
             .map(|state| state.language.strings().window_title.to_string())
-            .unwrap_or_else(|| "Claude Code Usage Monitor".to_string())
+            .unwrap_or_else(|| "UsageHub".to_string())
     })
 }
 
@@ -1738,7 +1809,7 @@ fn begin_winget_update(hwnd: HWND) {
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "ClaudeCodeUsageMonitor";
+const STARTUP_REGISTRY_KEY: &str = "UsageHub";
 
 /// Returns true only if the startup registry value points to this executable.
 pub(crate) fn is_startup_enabled() -> bool {
@@ -2003,7 +2074,7 @@ fn sync_surface_windows_with(mut create_desktop: impl FnMut() -> HWND) {
     let Some(primary) = primary else {
         return;
     };
-    if !lifecycle::surface_has_class(primary, "ClaudeCodeUsageSurface") {
+    if !lifecycle::surface_has_class(primary, "UsageHubSurface") {
         let replacement = unsafe { lifecycle::create_primary_surface() };
         if replacement.is_invalid() {
             diagnose::log_recovery("unable to recreate primary surface; will retry");
@@ -2033,7 +2104,7 @@ fn sync_surface_windows_with(mut create_desktop: impl FnMut() -> HWND) {
         .map(|state| state.mirror_hwnds.clone())
         .unwrap_or_default();
     for (index, mirror) in mirrors.into_iter().enumerate() {
-        if !lifecycle::surface_has_class(mirror.to_hwnd(), "CCUMThemeMirror") {
+        if !lifecycle::surface_has_class(mirror.to_hwnd(), "UHThemeMirror") {
             let replacement = unsafe { create_mirror_window() };
             // Window creation can re-enter; never index a list it may shrink.
             let orphaned = match lock_state()
@@ -2126,7 +2197,7 @@ fn sync_surface_windows_with(mut create_desktop: impl FnMut() -> HWND) {
         for (surface_index, window) in state.desktop_hwnds.iter_mut().enumerate() {
             let wanted = desktop_surfaces.get(surface_index) == Some(&true);
             let valid = window.is_some_and(|window| {
-                lifecycle::surface_has_class(window.to_hwnd(), "CCUMDesktopSurface")
+                lifecycle::surface_has_class(window.to_hwnd(), "UHDesktopSurface")
             });
             if !wanted || !valid {
                 if let Some(window) = window.take() {
@@ -2138,7 +2209,7 @@ fn sync_surface_windows_with(mut create_desktop: impl FnMut() -> HWND) {
     };
     for window in stale_desktop_windows {
         unsafe {
-            if lifecycle::surface_has_class(window.to_hwnd(), "CCUMDesktopSurface") {
+            if lifecycle::surface_has_class(window.to_hwnd(), "UHDesktopSurface") {
                 lifecycle::destroy_surface(window.to_hwnd());
             } else {
                 crate::desktop_compositor::remove(window.to_hwnd());
@@ -2185,7 +2256,7 @@ unsafe fn create_desktop_surface_window() -> HWND {
 
 unsafe fn create_desktop_surface_window_in(desktop: native_interop::DesktopHost) -> HWND {
     let instance = GetModuleHandleW(PCWSTR::null()).unwrap();
-    let class = native_interop::wide_str("CCUMDesktopSurface");
+    let class = native_interop::wide_str("UHDesktopSurface");
     let title = native_interop::wide_str("");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -2227,7 +2298,7 @@ unsafe fn create_desktop_surface_window_in(desktop: native_interop::DesktopHost)
 
 unsafe fn create_mirror_window() -> HWND {
     let instance = GetModuleHandleW(PCWSTR::null()).unwrap();
-    let class = native_interop::wide_str("CCUMThemeMirror");
+    let class = native_interop::wide_str("UHThemeMirror");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_DBLCLKS,
@@ -2361,9 +2432,9 @@ pub fn run() {
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
     let mutex_name = native_interop::wide_str(&if allow_multiple {
-        format!("Local\\ClaudeCodeUsageMonitor-{}", std::process::id())
+        format!("Local\\UsageHub-{}", std::process::id())
     } else {
-        "Local\\ClaudeCodeUsageMonitor".to_string()
+        "Local\\UsageHub".to_string()
     });
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
@@ -2401,7 +2472,7 @@ pub fn run() {
         }
     };
 
-    let class_name = native_interop::wide_str("ClaudeCodeUsageMonitor");
+    let class_name = native_interop::wide_str("UsageHub");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -2477,6 +2548,41 @@ pub fn run() {
                 // built-in theme's Render value, so no copy is necessary.
                 settings.consume_legacy_widget_visibility();
                 save_settings_or_log(&settings, "unable to consume legacy visibility");
+            }
+        }
+        // Seed selected accounts for a fresh namespace; the built-in Classic
+        // remains the default and explicit theme selections are untouched.
+        if configured_theme.is_none() && settings.active_theme_path.is_none() {
+            if crate::manager::widget::visible_cards(&settings.accounts, None).is_empty() {
+                let enabled = settings.enabled_providers();
+                let mut seeded = Vec::new();
+                for provider in [ProviderId::Claude, ProviderId::Codex] {
+                    if !enabled.contains(provider) {
+                        continue;
+                    }
+                    let selected = settings
+                        .accounts
+                        .get(provider)
+                        .and_then(|configured| configured.selected())
+                        .map(|profile| profile.id.clone());
+                    if let Some(id) = selected {
+                        let target = match provider {
+                            ProviderId::Claude => &mut settings.accounts.claude,
+                            ProviderId::Codex => &mut settings.accounts.codex,
+                            _ => continue,
+                        };
+                        if let Some(profile) = target.find_mut(&id) {
+                            if !profile.pinned {
+                                profile.pinned = true;
+                                seeded.push(format!("{}/{}", provider.descriptor().key, id));
+                            }
+                        }
+                    }
+                }
+                if !seeded.is_empty() {
+                    save_settings_or_log(&settings, "unable to persist seeded account pins");
+                    diagnose::log(format!("seeded initial account pins: {}", seeded.join(",")));
+                }
             }
         }
         let (active_theme_path, active_theme) = configured_theme
@@ -2669,6 +2775,24 @@ pub fn run() {
         };
         set_controller_timer(Some(hwnd), TIMER_POLL, initial_poll_ms, None);
         sync_window_state_timer(hwnd);
+        // Expired deletion-undo snapshots purge on a worker thread: at startup
+        // and hourly afterwards. The controller never blocks on it.
+        set_controller_timer(
+            Some(hwnd),
+            TIMER_BACKUP_PURGE,
+            BACKUP_PURGE_INTERVAL_MS,
+            None,
+        );
+        crate::manager::widget::schedule_backup_purge();
+        // Real shortcut/COM stamping on a worker: at startup, on settings
+        // updates, on resume, and every 20s (coalesced, never UI-blocking).
+        set_controller_timer(
+            Some(hwnd),
+            TIMER_TASKBAR_IDENTITIES,
+            TASKBAR_IDENTITIES_INTERVAL_MS,
+            None,
+        );
+        crate::manager::widget::schedule_taskbar_identity_refresh("startup");
 
         // Sample collision geometry off-thread and ask the stable controller to
         // reconcile shell-hosted windows every two seconds.
@@ -3461,6 +3585,10 @@ fn reload_external_settings(hwnd: HWND) {
     if providers_changed {
         request_poll(hwnd);
     }
+    // Regenerated layouts are picked up by render_layered through the
+    // expanded effective theme. Real shortcut/COM stamping runs on a worker
+    // (coalesced), never on the UI thread.
+    crate::manager::widget::schedule_taskbar_identity_refresh("settings");
     sync_tray_icon(hwnd);
     position_at_taskbar();
     render_layered();

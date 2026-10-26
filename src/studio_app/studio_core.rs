@@ -161,6 +161,7 @@ impl StudioApp {
             asset_page_selected: None,
             asset_error: None,
             settings_error: None,
+            manage: studio_manage::ManageState::default(),
             theme_error: None,
             pending_unsaved_action: None,
             asset_delete_confirmation: None,
@@ -816,6 +817,7 @@ impl StudioApp {
             self.usage_poll_ok = poll_ok;
             self.usage_has_error = has_error;
         }
+        self.manage.last_snapshot_unix = Some(cache.updated_unix);
         changed
     }
 
@@ -983,7 +985,7 @@ impl StudioApp {
     }
 
     pub(super) fn shell(&mut self, ui: &mut egui::Ui) {
-        const GITHUB_URL: &str = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor";
+        const GITHUB_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
         let language = self.language();
         let full_height = ui.available_height();

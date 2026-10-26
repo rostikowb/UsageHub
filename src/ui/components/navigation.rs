@@ -73,7 +73,7 @@ mod tests {
     fn github_click_calls_the_browser_opener_directly() {
         let context = egui::Context::default();
         crate::ui::theme::configure_style(&context, crate::localization::LanguageId::English);
-        let url = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor";
+        let url = "https://github.com/example/usagehub";
         let mut center = egui::Pos2::ZERO;
         let mut opened = Vec::new();
         for pressed in [None, Some(true), Some(false)] {
