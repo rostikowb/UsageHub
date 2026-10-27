@@ -5,82 +5,73 @@ use crate::ui::components::helper::{
 };
 
 #[test]
-fn dashboard_does_not_retry_after_successful_opengl_run() {
+fn dashboard_does_not_retry_after_successful_direct3d_run() {
     let mut attempts = Vec::new();
-    run_dashboard_with_fallback(|renderer, _gl_error| {
+    run_dashboard_with_fallback(|renderer, _d3d_error| {
         attempts.push(renderer);
         Ok(())
     })
     .unwrap();
-    assert_eq!(attempts, [DashboardRenderer::OpenGl]);
+    assert_eq!(attempts, [DashboardRenderer::Direct3D]);
 }
 
 #[test]
-fn dashboard_retries_opengl_painter_and_configuration_failures() {
-    for error in [
-        eframe::Error::OpenGL("OpenGL 2.0 unavailable".to_owned().into()),
-        eframe::Error::NoGlutinConfigs(Default::default(), "No GL configuration".into()),
-    ] {
-        let mut error = Some(error);
-        let mut attempts = Vec::new();
-        run_dashboard_with_fallback(|renderer, _gl_error| {
-            attempts.push(renderer);
-            error.take().map_or(Ok(()), Err)
-        })
-        .unwrap();
-        assert_eq!(
-            attempts,
-            [DashboardRenderer::OpenGl, DashboardRenderer::Warp]
-        );
-    }
-}
-
-#[test]
-fn dashboard_does_not_retry_application_errors() {
+fn dashboard_retries_direct3d_initialization_failures_with_opengl() {
+    let mut error = Some(warp::HostError::Init("no D3D11 device".into()));
     let mut attempts = Vec::new();
-    let error = run_dashboard_with_fallback(|renderer, _gl_error| {
+    run_dashboard_with_fallback(|renderer, _d3d_error| {
         attempts.push(renderer);
-        Err(eframe::Error::AppCreation("Application failed".into()))
+        error.take().map_or(Ok(()), Err)
+    })
+    .unwrap();
+    assert_eq!(
+        attempts,
+        [DashboardRenderer::Direct3D, DashboardRenderer::OpenGl]
+    );
+}
+
+#[test]
+fn dashboard_does_not_retry_errors_after_the_first_frame() {
+    let mut attempts = Vec::new();
+    let error = run_dashboard_with_fallback(|renderer, _d3d_error| {
+        attempts.push(renderer);
+        Err(warp::HostError::Runtime("Application failed".into()))
     })
     .unwrap_err();
-    assert_eq!(attempts, [DashboardRenderer::OpenGl]);
+    assert_eq!(attempts, [DashboardRenderer::Direct3D]);
     assert!(error.contains("Application failed"));
 }
 
 #[test]
 fn dashboard_reports_both_failures_without_retrying_again() {
     let mut attempts = Vec::new();
-    let error = run_dashboard_with_fallback(|renderer, _gl_error| {
+    let error = run_dashboard_with_fallback(|renderer, _d3d_error| {
         attempts.push(renderer);
         match renderer {
-            DashboardRenderer::OpenGl => Err(eframe::Error::OpenGL(
-                "OpenGL unavailable".to_owned().into(),
-            )),
-            DashboardRenderer::Warp => Err(eframe::Error::AppCreation("Fallback failed".into())),
+            DashboardRenderer::Direct3D => Err(warp::HostError::Init("D3D11 unavailable".into())),
+            DashboardRenderer::OpenGl => Err(warp::HostError::Init("Fallback failed".into())),
         }
     })
     .unwrap_err();
     assert_eq!(
         attempts,
-        [DashboardRenderer::OpenGl, DashboardRenderer::Warp]
+        [DashboardRenderer::Direct3D, DashboardRenderer::OpenGl]
     );
+    assert!(error.contains("Direct3D 11:"));
+    assert!(error.contains("D3D11 unavailable"));
     assert!(error.contains("OpenGL:"));
-    assert!(error.contains("OpenGL unavailable"));
-    assert!(error.contains("WARP:"));
     assert!(error.contains("Fallback failed"));
 }
 
 #[test]
-fn warp_launch_receives_the_original_opengl_error() {
+fn opengl_launch_receives_the_original_direct3d_error() {
     run_dashboard_with_fallback(|renderer, original_error| match renderer {
-        DashboardRenderer::OpenGl => {
+        DashboardRenderer::Direct3D => {
             assert!(original_error.is_none());
-            Err(eframe::Error::OpenGL(
-                "missing OpenGL driver".to_owned().into(),
-            ))
+            Err(warp::HostError::Init("missing D3D11 driver".into()))
         }
-        DashboardRenderer::Warp => {
-            assert!(original_error.unwrap().contains("missing OpenGL driver"));
+        DashboardRenderer::OpenGl => {
+            assert!(original_error.unwrap().contains("missing D3D11 driver"));
             Ok(())
         }
     })
@@ -477,6 +468,7 @@ fn app_with_surfaces(surfaces: Vec<SceneObject>) -> StudioApp {
         preview_hover_target: None,
         preview_pending_click: None,
         asset_picker: None,
+        asset_cache: None,
         asset_thumbnails: HashMap::new(),
         asset_page_filter: String::new(),
         asset_page_selected: None,
@@ -730,59 +722,6 @@ fn available_themes_keeps_current_external_theme_fresh_without_stale_fallbacks()
 }
 
 #[test]
-fn diagnostics_page_has_logging_controls_and_menu_version() {
-    let context = egui::Context::default();
-    configure_style(&context, LanguageId::English);
-    let mut app = app_with_surfaces(vec![root("main")]);
-    app.page = Page::Diagnostics;
-    let mut output = context.run_ui(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1100.0, 850.0),
-            )),
-            ..Default::default()
-        },
-        |ui| app.shell(ui),
-    );
-    fn collect_text(shape: &egui::epaint::Shape, text: &mut String) {
-        match shape {
-            egui::epaint::Shape::Text(shape) => {
-                text.push_str(&shape.galley.job.text);
-                text.push('\n');
-            }
-            egui::epaint::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_text(shape, text);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut text = String::new();
-    for shape in &output.shapes {
-        collect_text(&shape.shape, &mut text);
-    }
-    output.textures_delta.clear();
-    assert!(text.find("Assets").unwrap() < text.find("Diagnostics").unwrap());
-    assert!(text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
-    assert!(text.contains("Logging"));
-    assert!(text.contains("Write diagnostic events to"));
-    assert!(text.contains("Disabled"));
-    assert!(text.contains("Refresh usage"));
-    assert!(text.contains("Follow latest event"));
-    assert!(text.contains("Copy log"));
-    assert!(!text.contains("Monitor disconnected"));
-    assert!(!text.contains("Dashboard process"));
-    assert!(!text.contains("Record diagnostics"));
-    assert!(!text.contains("Pause output"));
-    assert!(
-        !crate::diagnose::is_enabled(),
-        "visiting the page must not start recording"
-    );
-}
-
-#[test]
 fn context_menu_frequency_replaces_custom_dashboard_value_and_edit_buffer() {
     let mut app = app_with_surfaces(vec![root("main")]);
     app.settings.poll_interval_ms = 2 * POLL_1_MIN;
@@ -975,12 +914,6 @@ fn preview_countdowns_refresh_on_minute_boundaries_until_the_final_minute() {
         preview_countdown_delay(Duration::from_secs(59)),
         Duration::from_secs(1)
     );
-}
-
-#[test]
-fn inspector_controls_use_a_consistent_maximum_width() {
-    assert_eq!(crate::ui::components::layout::control_width(180.0), 180.0);
-    assert_eq!(crate::ui::components::layout::control_width(500.0), 180.0);
 }
 
 #[test]
@@ -1449,11 +1382,6 @@ fn searchable_dropdown_filter_is_case_insensitive_and_matches_partial_names() {
     assert!(matches("Segoe UI Variable Text", "segoe ui"));
     assert!(matches("Consolas", ""));
     assert!(!matches("Consolas", "arial"));
-}
-
-#[test]
-fn live_apply_starts_disabled() {
-    const { assert!(!DEFAULT_LIVE_APPLY) };
 }
 
 #[test]

@@ -89,6 +89,10 @@ pub(super) fn position_at_taskbar() {
 
     let (mut x, mut y) = (rect.left, rect.top);
     if embedded {
+        // The legacy segmented bar also needs the Explorer reorder hook.
+        if unsafe { GetParent(hwnd).ok() } == Some(taskbar_hwnd) {
+            super::taskbar_zorder::ensure_reorder_hook(taskbar_hwnd);
+        }
         // Child window: coordinates relative to parent (taskbar)
         let mut point = [POINT { x, y }];
         unsafe { MapWindowPoints(None, Some(taskbar_hwnd), &mut point) };
@@ -318,6 +322,7 @@ pub(super) fn position_custom_theme_internal(
                 };
                 native_interop::embed_as_child(hwnd, taskbar.hwnd);
                 ensure_tray_event_hook_for_taskbar(hwnd, taskbar.hwnd);
+                super::taskbar_zorder::ensure_reorder_hook(taskbar.hwnd);
                 let mut point = [POINT { x, y }];
                 MapWindowPoints(None, Some(taskbar.hwnd), &mut point);
                 let _ = SetWindowPos(

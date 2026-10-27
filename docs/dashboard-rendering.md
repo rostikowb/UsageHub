@@ -1,61 +1,81 @@
 # Dashboard rendering
 
-The dashboard tries its existing eframe/OpenGL renderer first. If OpenGL context,
-configuration or painter initialization fails, it starts the same executable with
-`--studio --dashboard-warp`, retaining the owner window, initial page and diagnostic
-logging. Application errors do not trigger a renderer retry.
+The settings dashboard and Theme Studio share a Rust egui UI. Their default host
+uses the existing vendored `egui-directx11` painter and a native D3D11 swap chain.
+It tries `D3D_DRIVER_TYPE_HARDWARE` first, then Windows' WARP software rasterizer
+if hardware device/swap-chain initialization fails. This does not replace the
+original taskbar bar renderer or its authored theme.
 
-The WARP dashboard uses D3D11 with `D3D_DRIVER_TYPE_WARP` and feature level 11.0.
-Windows 10 and Windows 11 supply the CPU rasterizer. It requires no OpenGL driver,
-DirectX SDK, downloadable runtime, shader compiler DLL or companion executable.
-The two small shader-model-5 binaries are included with their source in
-`vendor/egui-directx11/shaders`. The project continues to link the MSVC runtime
-statically. `wgpu` and its backend/shader-translation dependencies are removed.
+WARP is **CPU software rendering**, not a GPU optimization. The diagnostic log
+records the selected driver and adapter; do not infer hardware acceleration merely
+from “D3D11”. Feature level 11.0 is required. Both D3D11 paths embed the shader-model-5
+binaries in `vendor/egui-directx11/shaders`; no downloaded runtime, DirectX SDK,
+shader compiler DLL or companion executable is required. Painter adaptations and
+upstream attribution remain in `vendor/egui-directx11/PATCH.md`.
 
-Winit permits only one event loop per process, and eframe owns that loop after
-trying OpenGL. The failed dashboard therefore releases its named instance guard
-and launches a fresh process, which claims the same guard. The original process
-exits rather than waiting. Concurrent requests still pass through that guard;
-the WARP process never retries OpenGL. If WARP initialization also fails, its
-error dialog and diagnostic log include the original OpenGL error, passed in the
-child's `CCUM_DASHBOARD_OPENGL_ERROR` environment variable.
+If D3D11 initialization fails on both paths, the dashboard releases its instance
+guard and starts the same executable with `--dashboard-opengl`, retaining the
+owner, initial page, original arguments and diagnostic logging. Winit permits
+only one event loop per process, so this fallback uses a new process. The original
+D3D11 error is carried in `UH_DASHBOARD_D3D11_ERROR`. The child claims the same
+guard and never retries D3D11. Errors after the first successful D3D11 frame are
+reported as runtime failures rather than silently restarting the application.
 
-Both renderers share the dashboard UI, fonts, theme preview, settings, native
-titlebar styling and save-on-close logic. The WARP host uses the existing patched
-egui-winit integration for keyboard, pointer, IME, clipboard and file-drop input.
-It embeds secondary egui viewports in the main window. The application does not
-use custom GPU paint callbacks; the vendored painter does not support those.
-The painter adaptation and upstream attribution are recorded in
-`vendor/egui-directx11/PATCH.md`.
+The fallback uses the existing eframe/OpenGL host. All paths share settings,
+fonts, theme previews, native titlebar styling, account safeguards and
+save-on-close behavior. D3D11 uses the patched egui-winit integration for keyboard,
+pointer, IME, clipboard and file drops; secondary egui viewports are embedded in
+the main window. Custom GPU paint callbacks are not used or supported by the
+vendored painter.
 
-## Testing
+## Repaint and preview work
 
-To force software rendering for diagnosis:
+Redraws are event driven. A minimized/zero-sized window does not paint or keep a
+polling redraw loop alive; a restore/resize requests a fresh frame. An open
+settings window still has timed updates for live usage/countdown state. Closing
+settings removes its process; the resident taskbar process remains separate.
+
+Theme and context-menu previews resolve host dimensions against the existing
+monitor/taskbar geometry snapshot, lazily refreshed at most once per second in
+the separate Studio process. Surface selection, placement, providers and language
+are resolved from current state, not a cached whole `ThemeRuntime`. Context-menu
+library discovery runs when its picker opens or a menu is saved rather than on
+every paint. Asset lists use a shared snapshot invalidated by imports, deletion,
+picker changes and entering the Assets page.
+
+These changes reduce repeated work; a hardware backend alone does not eliminate
+CPU layout, filesystem or native-window-query latency. See `HANDOFF.md` for the
+latest **observed** machine-specific timings, not performance guarantees.
+
+## Diagnostics and verification
+
+For the local pinned GNU/LLVM target:
 
 ```powershell
-.\target\release\claude-code-usage-monitor.exe --studio --dashboard-warp --diagnose
+.\target\x86_64-pc-windows-gnullvm\release\usagehub.exe --studio --diagnose
 ```
 
-The log records the D3D11 WARP adapter and first successful presentation. Normally
-omit `--dashboard-warp` to exercise OpenGL and automatic fallback. The software
-path uses more CPU than hardware rendering; it schedules redraws when needed.
+Normally omit renderer switches to exercise hardware-first selection. To force
+software rendering use `--dashboard-warp`; to diagnose the eframe host directly
+use `--dashboard-opengl`. The software path can consume more CPU than hardware.
 
-`cargo test` includes a real off-screen WARP readback test covering odd-width
-partial texture updates, nearest sampling, zoom and deferred texture deletion,
-plus fallback selection, original-error propagation and close cancellation tests.
+For bounded frame samples, set `UH_UI_FRAME_TIMINGS=1` **only for the diagnostic
+launch**, with `--diagnose`. The host records at most 512 successful frames:
 
-The VM flow exercises stock Hyper-V graphics where OpenGL initialization fails:
-
-```powershell
-.\tests\windows-vm\Invoke-Lab.ps1 `
-  -ConfigPath C:\work\CCUM-Lab\lab.runtime.json `
-  -Credential (Import-Clixml C:\work\CCUM-Lab\credential.clixml) `
-  -CandidateExe .\target\release\claude-code-usage-monitor.exe `
-  -Flows portable-dashboard-warp -Taskbars baseline
+```text
+dashboard frame timing page=... ui_us=... paint_us=... present_us=... total_us=...
 ```
 
-It restores only the configured disposable VM checkpoints before and after each
-scenario. Evidence includes renderer logs, OS/build and binary identity,
-assertions, and screenshots of settings and the theme studio. Each run's
-`summary.md` and `summary.json` record the outcome and evidence paths. See
-[Windows VM testing](windows-vm-testing.md) for selection and reporting details.
+This option neither changes pages nor schedules extra frames. Navigate actual
+tabs and distinguish CPU UI time from painting/Present/vsync and cold font or
+preview initialization. Remove the environment variable after diagnosis. Normal
+runs retain only bounded slow-frame diagnostics; the old automatic
+`UH_PROFILE_PAGES` page-cycling harness is removed.
+
+`cargo test --locked --quiet -- --test-threads=1` includes existing renderer
+fallback/runtime-error selection, off-screen WARP texture readback, close
+cancellation and geometry/preview state regressions. Passing tests does not prove
+native focus, taskbar coverage, GPU selection or narrow-window interaction:
+verify those on the real app. Existing disposable VM flows are described in
+[Windows VM testing](windows-vm-testing.md); no Hyper-V run is implied by a local
+hardware smoke.

@@ -10,13 +10,7 @@ impl StudioApp {
                 "Add images once, reuse them across themes, or drop image files here to import them.",
             ),
         );
-        let assets = match theme_engine::list_assets() {
-            Ok(assets) => assets,
-            Err(error) => {
-                self.asset_error = Some(error);
-                Vec::new()
-            }
-        };
+        let assets = self.cached_assets();
         self.ensure_asset_thumbnails(ui.ctx(), &assets);
         if self
             .asset_page_selected
@@ -34,7 +28,7 @@ impl StudioApp {
             .map(|asset| asset.clone());
         let mut add_image = false;
         let mut delete_asset = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 singleline_text_edit(&mut filter)
                     .desired_width(300.0)
@@ -140,6 +134,7 @@ impl StudioApp {
                 if let Err(error) = theme_engine::delete_asset(path) {
                     self.asset_error = Some(error);
                 } else {
+                    self.asset_cache = None;
                     if theme_engine::remove_asset_references(&mut self.theme, path) > 0 {
                         self.theme.prepare_runtime();
                         self.preview_dirty = true;

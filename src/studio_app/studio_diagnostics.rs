@@ -114,7 +114,7 @@ impl StudioApp {
         let language = self.language();
         let mut recording = crate::diagnose::is_enabled();
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(32, 8))
+            .inner_margin(egui::Margin::symmetric(16, 8))
             .show(ui, |ui| {
                 settings_group(ui, |ui| {
                     let description = language
@@ -148,7 +148,6 @@ impl StudioApp {
                 ui.add_space(18.0);
                 settings_group(ui, |ui| {
                     let mut resume_follow = false;
-                    ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add(lucide_labeled_button(

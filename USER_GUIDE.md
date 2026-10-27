@@ -11,6 +11,8 @@ The instructions below use the app's English labels.
 - [Choose providers and refresh usage](#choose-providers-and-refresh-usage)
 - [Show used or remaining allowance](#show-used-or-remaining-allowance)
 - [Windows VM testing for developers](#windows-vm-testing-for-developers)
+- [Account management and safe cleanup](README.md#accounts-and-data-safety)
+- [GPU rendering and performance diagnostics](docs/dashboard-rendering.md)
 
 ## Open the dashboard
 
@@ -70,6 +72,10 @@ reverse or restore edits. With Live apply disabled, save again to apply an undo
 to the running widget. If you close the dashboard or switch themes with unsaved
 changes, choose **Save and continue**, **Discard changes**, or **Cancel**.
 
+At narrow window widths, horizontally scroll the editor workspace to reach the
+other panes; the navigation sidebar stays fixed. Inspector labels wrap inside
+their column, with full text on hover, rather than squeezing the controls.
+
 ### Switch back to a built-in theme
 
 Select the original theme from the **Theme** dropdown in Theme Studio. You can
@@ -79,7 +85,7 @@ the selected theme; your saved custom copy remains available in the dropdown.
 Custom theme files are stored in:
 
 ```text
-%APPDATA%\ClaudeCodeUsageMonitor\themes
+%APPDATA%\UsageHub\themes
 ```
 
 ## Choose providers and refresh usage

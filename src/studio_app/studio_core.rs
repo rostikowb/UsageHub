@@ -156,6 +156,7 @@ impl StudioApp {
             preview_hover_target: None,
             preview_pending_click: None,
             asset_picker: None,
+            asset_cache: None,
             asset_thumbnails: HashMap::new(),
             asset_page_filter: String::new(),
             asset_page_selected: None,
@@ -988,13 +989,16 @@ impl StudioApp {
         const GITHUB_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
         let language = self.language();
+        let previous_page = self.page;
+        // Leave enough room for longer localized navigation labels.
+        let menu_width = DEFAULT_MENU_WIDTH.max(190.0);
         let full_height = ui.available_height();
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
-                egui::vec2(DEFAULT_MENU_WIDTH, full_height),
+                egui::vec2(menu_width, full_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.set_width(DEFAULT_MENU_WIDTH);
+                    ui.set_width(menu_width);
                     ui.set_min_height(full_height);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, menu_surface());
                     egui::Frame::new()
@@ -1005,7 +1009,7 @@ impl StudioApp {
                             bottom: 4,
                         })
                         .show(ui, |ui| {
-                            ui.set_width(DEFAULT_MENU_WIDTH - 16.0);
+                            ui.set_width(menu_width - 16.0);
                             nav(
                                 ui,
                                 &mut self.page,
@@ -1032,6 +1036,9 @@ impl StudioApp {
                                 Page::Diagnostics,
                                 language.text("Diagnostics"),
                             );
+                            if self.page != previous_page && self.page == Page::Assets {
+                                self.asset_cache = None;
+                            }
                             ui.allocate_ui_with_layout(
                                 ui.available_size(),
                                 egui::Layout::bottom_up(egui::Align::Min),

@@ -12,7 +12,7 @@ impl StudioApp {
                 .as_deref()
                 .is_some_and(theme_engine::is_managed_theme_path);
         let mut save_after_enabling_live_apply = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(language.text("Theme")).color(muted()));
             Dropdown::from_id_salt("studio-theme")
                 .width(240.0)
@@ -104,17 +104,17 @@ impl StudioApp {
             {
                 self.redo_theme();
             }
-            if !read_only {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let changed = Toggle::new(&mut self.live_apply)
-                        .labels(language.text("Enabled"), language.text("Disabled"))
-                        .show(ui)
-                        .changed();
-                    save_after_enabling_live_apply = changed && self.live_apply && self.dirty;
-                    ui.label(language.text("Live apply"));
-                });
-            }
         });
+        if !read_only {
+            ui.horizontal(|ui| {
+                ui.label(language.text("Live apply"));
+                let changed = Toggle::new(&mut self.live_apply)
+                    .labels(language.text("Enabled"), language.text("Disabled"))
+                    .show(ui)
+                    .changed();
+                save_after_enabling_live_apply = changed && self.live_apply && self.dirty;
+            });
+        }
         if save_after_enabling_live_apply {
             let _ = self.save_theme();
         }
@@ -142,107 +142,115 @@ impl StudioApp {
             return;
         }
 
-        let row_height = (ui.available_height() - 8.0).max(1.0);
-        let total_width = ui.available_width();
-        const SPLITTER_WIDTH: f32 = 8.0;
-        const MIN_SCENE_WIDTH: f32 = 170.0;
-        const MIN_CANVAS_WIDTH: f32 = 240.0;
-        const MIN_INSPECTOR_WIDTH: f32 = 320.0;
-        let usable = (total_width - SPLITTER_WIDTH * 2.0).max(1.0);
-        let (scene_width, canvas_width) =
-            if usable >= MIN_SCENE_WIDTH + MIN_CANVAS_WIDTH + MIN_INSPECTOR_WIDTH {
-                self.scene_width = self.scene_width.clamp(
-                    MIN_SCENE_WIDTH,
-                    usable - MIN_CANVAS_WIDTH - MIN_INSPECTOR_WIDTH,
+        egui::ScrollArea::horizontal()
+            .id_salt("theme-workspace-scroll")
+            .show(ui, |ui| {
+                ui.set_min_width(746.0);
+                let row_height = (ui.available_height() - 8.0).max(1.0);
+                let total_width = ui.available_width();
+                const SPLITTER_WIDTH: f32 = 8.0;
+                const MIN_SCENE_WIDTH: f32 = 170.0;
+                const MIN_CANVAS_WIDTH: f32 = 240.0;
+                const MIN_INSPECTOR_WIDTH: f32 = 320.0;
+                let usable = (total_width - SPLITTER_WIDTH * 2.0).max(1.0);
+                let (scene_width, canvas_width) =
+                    if usable >= MIN_SCENE_WIDTH + MIN_CANVAS_WIDTH + MIN_INSPECTOR_WIDTH {
+                        self.scene_width = self.scene_width.clamp(
+                            MIN_SCENE_WIDTH,
+                            usable - MIN_CANVAS_WIDTH - MIN_INSPECTOR_WIDTH,
+                        );
+                        self.inspector_width = self.inspector_width.clamp(
+                            MIN_INSPECTOR_WIDTH,
+                            usable - MIN_CANVAS_WIDTH - self.scene_width,
+                        );
+                        (
+                            self.scene_width,
+                            usable - self.scene_width - self.inspector_width,
+                        )
+                    } else {
+                        // The native minimum normally keeps us above this point, but
+                        // proportional fallback guarantees no pane can force overflow.
+                        let scene = usable * 0.23;
+                        let inspector = usable * 0.39;
+                        (scene, usable - scene - inspector)
+                    };
+                let mut scene_delta = 0.0;
+                let mut inspector_delta = 0.0;
+                let (workspace_rect, _) = ui
+                    .allocate_exact_size(egui::vec2(total_width, row_height), egui::Sense::hover());
+                let scene_rect = egui::Rect::from_min_size(
+                    workspace_rect.min,
+                    egui::vec2(scene_width, row_height),
                 );
-                self.inspector_width = self.inspector_width.clamp(
-                    MIN_INSPECTOR_WIDTH,
-                    usable - MIN_CANVAS_WIDTH - self.scene_width,
+                let left_splitter_rect = egui::Rect::from_min_size(
+                    egui::pos2(scene_rect.right(), workspace_rect.top()),
+                    egui::vec2(SPLITTER_WIDTH, row_height),
                 );
-                (
-                    self.scene_width,
-                    usable - self.scene_width - self.inspector_width,
-                )
-            } else {
-                // The native minimum normally keeps us above this point, but
-                // proportional fallback guarantees no pane can force overflow.
-                let scene = usable * 0.23;
-                let inspector = usable * 0.39;
-                (scene, usable - scene - inspector)
-            };
-        let mut scene_delta = 0.0;
-        let mut inspector_delta = 0.0;
-        let (workspace_rect, _) =
-            ui.allocate_exact_size(egui::vec2(total_width, row_height), egui::Sense::hover());
-        let scene_rect =
-            egui::Rect::from_min_size(workspace_rect.min, egui::vec2(scene_width, row_height));
-        let left_splitter_rect = egui::Rect::from_min_size(
-            egui::pos2(scene_rect.right(), workspace_rect.top()),
-            egui::vec2(SPLITTER_WIDTH, row_height),
-        );
-        let canvas_rect = egui::Rect::from_min_size(
-            egui::pos2(left_splitter_rect.right(), workspace_rect.top()),
-            egui::vec2(canvas_width, row_height),
-        );
-        let right_splitter_rect = egui::Rect::from_min_size(
-            egui::pos2(canvas_rect.right(), workspace_rect.top()),
-            egui::vec2(SPLITTER_WIDTH, row_height),
-        );
-        let inspector_rect = egui::Rect::from_min_max(
-            egui::pos2(right_splitter_rect.right(), workspace_rect.top()),
-            workspace_rect.right_bottom(),
-        );
+                let canvas_rect = egui::Rect::from_min_size(
+                    egui::pos2(left_splitter_rect.right(), workspace_rect.top()),
+                    egui::vec2(canvas_width, row_height),
+                );
+                let right_splitter_rect = egui::Rect::from_min_size(
+                    egui::pos2(canvas_rect.right(), workspace_rect.top()),
+                    egui::vec2(SPLITTER_WIDTH, row_height),
+                );
+                let inspector_rect = egui::Rect::from_min_max(
+                    egui::pos2(right_splitter_rect.right(), workspace_rect.top()),
+                    workspace_rect.right_bottom(),
+                );
 
-        let mut scene_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("scene-pane")
-                .max_rect(scene_rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        scene_ui.set_clip_rect(scene_rect);
-        studio_region(&mut scene_ui, scene_width, row_height, |ui| {
-            self.scene_tree(ui, read_only)
-        });
+                let mut scene_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("scene-pane")
+                        .max_rect(scene_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                scene_ui.shrink_clip_rect(scene_rect);
+                studio_region(&mut scene_ui, scene_width, row_height, |ui| {
+                    self.scene_tree(ui, read_only)
+                });
 
-        let left_splitter = workspace_splitter(ui, left_splitter_rect, "left-splitter");
-        if left_splitter.dragged() {
-            scene_delta = ui.input(|input| input.pointer.delta().x);
-        }
+                let left_splitter = workspace_splitter(ui, left_splitter_rect, "left-splitter");
+                if left_splitter.dragged() {
+                    scene_delta = ui.input(|input| input.pointer.delta().x);
+                }
 
-        let mut canvas_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("canvas-pane")
-                .max_rect(canvas_rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        canvas_ui.set_clip_rect(canvas_rect);
-        studio_region(&mut canvas_ui, canvas_width, row_height, |ui| {
-            self.canvas_preview(ui)
-        });
+                let mut canvas_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("canvas-pane")
+                        .max_rect(canvas_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                canvas_ui.shrink_clip_rect(canvas_rect);
+                studio_region(&mut canvas_ui, canvas_width, row_height, |ui| {
+                    self.canvas_preview(ui)
+                });
 
-        let right_splitter = workspace_splitter(ui, right_splitter_rect, "right-splitter");
-        if right_splitter.dragged() {
-            inspector_delta = -ui.input(|input| input.pointer.delta().x);
-        }
+                let right_splitter = workspace_splitter(ui, right_splitter_rect, "right-splitter");
+                if right_splitter.dragged() {
+                    inspector_delta = -ui.input(|input| input.pointer.delta().x);
+                }
 
-        let mut inspector_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt("inspector-pane")
-                .max_rect(inspector_rect)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-        );
-        inspector_ui.set_clip_rect(inspector_rect);
-        studio_region(
-            &mut inspector_ui,
-            inspector_rect.width(),
-            row_height,
-            |ui| self.inspector(ui, read_only),
-        );
-        self.scene_width += scene_delta;
-        self.inspector_width += inspector_delta;
+                let mut inspector_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("inspector-pane")
+                        .max_rect(inspector_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                inspector_ui.shrink_clip_rect(inspector_rect);
+                studio_region(
+                    &mut inspector_ui,
+                    inspector_rect.width(),
+                    row_height,
+                    |ui| self.inspector(ui, read_only),
+                );
+                self.scene_width += scene_delta;
+                self.inspector_width += inspector_delta;
+            });
     }
 
     pub(super) fn open_asset_picker(&mut self, target: Selection, background: &LayerBackground) {
+        self.asset_cache = None;
         let selected_path = match background {
             LayerBackground::Image { path, .. } if !path.is_empty() => Some(path.clone()),
             _ => None,
@@ -253,6 +261,21 @@ impl StudioApp {
             selected_path,
             filter: String::new(),
         });
+    }
+    pub(super) fn cached_assets(&mut self) -> std::sync::Arc<Vec<theme_engine::ManagedAsset>> {
+        if let Some(assets) = &self.asset_cache {
+            return assets.clone();
+        }
+        let assets = match theme_engine::list_assets() {
+            Ok(assets) => assets,
+            Err(error) => {
+                self.asset_error = Some(error);
+                Vec::new()
+            }
+        };
+        let assets = std::sync::Arc::new(assets);
+        self.asset_cache = Some(assets.clone());
+        assets
     }
 
     pub(super) fn import_asset_from_dialog(&mut self) -> Option<theme_engine::ManagedAsset> {
@@ -276,6 +299,7 @@ impl StudioApp {
     ) -> Option<theme_engine::ManagedAsset> {
         match theme_engine::import_asset(source) {
             Ok(asset) => {
+                self.asset_cache = None;
                 self.asset_thumbnails.remove(&asset.relative_path);
                 self.asset_error = None;
                 Some(asset)
@@ -371,13 +395,7 @@ impl StudioApp {
             return;
         };
         let language = self.language();
-        let assets = match theme_engine::list_assets() {
-            Ok(assets) => assets,
-            Err(error) => {
-                self.asset_error = Some(error);
-                Vec::new()
-            }
-        };
+        let assets = self.cached_assets();
         self.ensure_asset_thumbnails(ui.ctx(), &assets);
         let mut close = false;
         let mut add_image = false;
@@ -419,7 +437,7 @@ impl StudioApp {
                     });
                 });
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
                         singleline_text_edit(&mut picker.filter)
                             .desired_width(300.0)
@@ -536,10 +554,8 @@ impl StudioApp {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(
-                        !read_only,
-                        lucide_labeled_button(LucideIcon::Plus, language.text("Add layer")),
-                    )
+                    .add_enabled(!read_only, lucide_icon_button(LucideIcon::Plus))
+                    .on_hover_text(language.text("Add layer"))
                     .clicked()
                 {
                     self.add_layer();
@@ -564,14 +580,15 @@ impl StudioApp {
                 let surface_count = self.theme.surfaces.len();
                 for surface_index in 0..surface_count {
                     let selected = self.selection == Selection::Surface(surface_index);
-                    let mut surface = self.theme.surfaces[surface_index].clone();
-                    let (preview_width, preview_height) = theme_engine::resolve_surface_size(
-                        &self.theme,
-                        surface_index,
-                        self.usage.as_ref(),
-                        self.theme_runtime_for_surface(surface_index),
-                    );
+                    let ((preview_width, preview_height), preview_bounds) =
+                        theme_engine::resolve_scene_preview_bounds(
+                            &self.theme,
+                            surface_index,
+                            self.usage.as_ref(),
+                            self.theme_runtime_for_surface(surface_index),
+                        );
                     let preview_size = egui::vec2(preview_width as f32, preview_height as f32);
+                    let surface = &self.theme.surfaces[surface_index];
                     let roots: Vec<usize> = surface
                         .children
                         .iter()
@@ -586,7 +603,7 @@ impl StudioApp {
                         let responses = scene_row_style(ui, selected, |ui| {
                             scene_row_contents(
                                 ui,
-                                &mut surface,
+                                &mut self.theme.surfaces[surface_index],
                                 selection,
                                 preview_size,
                                 None,
@@ -595,7 +612,7 @@ impl StudioApp {
                             )
                         });
                         if responses.name_changed {
-                            self.theme.surfaces[surface_index].name = surface.name.clone();
+                            // The row edited the surface name in place.
                             self.changed();
                         }
                         if responses.item.hovered() || responses.drag_handle.hovered() {
@@ -624,7 +641,7 @@ impl StudioApp {
                         let responses = scene_row_style(ui, selected, |ui| {
                             scene_row_contents(
                                 ui,
-                                &mut surface,
+                                &mut self.theme.surfaces[surface_index],
                                 selection,
                                 preview_size,
                                 Some(is_open),
@@ -633,7 +650,7 @@ impl StudioApp {
                             )
                         });
                         if responses.name_changed {
-                            self.theme.surfaces[surface_index].name = surface.name.clone();
+                            // The row edited the surface name in place.
                             self.changed();
                         }
                         let row_response = responses.item.clone();
@@ -671,6 +688,7 @@ impl StudioApp {
                                             index,
                                             1,
                                             read_only,
+                                            &preview_bounds,
                                         );
                                     } else {
                                         self.object_tree_row(
@@ -679,6 +697,7 @@ impl StudioApp {
                                             index,
                                             1,
                                             read_only,
+                                            &preview_bounds,
                                         );
                                     }
                                 }
@@ -706,10 +725,11 @@ impl StudioApp {
                 .add_enabled_ui(!read_only, |ui| {
                     ui.add_sized(
                         [button_width, CONTROL_HEIGHT],
-                        lucide_labeled_button(LucideIcon::Copy, language.text("Duplicate")),
+                        lucide_icon_button(LucideIcon::Copy),
                     )
                 })
                 .inner
+                .on_hover_text(language.text("Duplicate"))
                 .clicked()
             {
                 action = 1;
@@ -718,10 +738,11 @@ impl StudioApp {
                 .add_enabled_ui(!read_only && can_delete, |ui| {
                     ui.add_sized(
                         [button_width, CONTROL_HEIGHT],
-                        lucide_labeled_button(LucideIcon::Trash, language.text("Delete")),
+                        lucide_icon_button(LucideIcon::Trash),
                     )
                 })
                 .inner
+                .on_hover_text(language.text("Delete"))
                 .clicked()
             {
                 action = 2;
@@ -743,23 +764,16 @@ impl StudioApp {
         index: usize,
         depth: usize,
         read_only: bool,
+        preview_bounds: &[Option<(f64, f64, f64, f64)>],
     ) -> Option<(Selection, SceneDropTarget)> {
         let language = self.language();
-        let mut object = self
-            .theme
-            .surfaces
-            .get(surface)
-            .and_then(|s| s.children.get(index))
-            .cloned()?;
-        let preview_size = theme_engine::resolve_object_bounds_with_runtime(
-            &self.theme,
-            surface,
-            index,
-            self.usage.as_ref(),
-            self.theme_runtime_for_surface(surface),
-        )
-        .map(|(_, _, width, height)| egui::vec2(width as f32, height as f32))
-        .unwrap_or_else(|| egui::vec2(24.0, 24.0));
+        let object = self.theme.surfaces.get(surface)?.children.get(index)?;
+        let preview_size = preview_bounds
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|(_, _, width, height)| egui::vec2(width as f32, height as f32))
+            .unwrap_or_else(|| egui::vec2(24.0, 24.0));
         let children: Vec<usize> = self.theme.surfaces[surface]
             .children
             .iter()
@@ -781,7 +795,7 @@ impl StudioApp {
             let responses = scene_row_style(ui, selected, |ui| {
                 scene_row_contents(
                     ui,
-                    &mut object,
+                    &mut self.theme.surfaces[surface].children[index],
                     Selection::Object(surface, index),
                     preview_size,
                     Some(is_open),
@@ -791,7 +805,7 @@ impl StudioApp {
             });
             let selection = Selection::Object(surface, index);
             if responses.name_changed {
-                self.theme.surfaces[surface].children[index].name = object.name.clone();
+                // The row edited the object name in place.
                 self.changed();
             }
             let row_response = responses.item.clone();
@@ -819,10 +833,23 @@ impl StudioApp {
                     *ui.visuals_mut() = body_visuals;
                     for child in children {
                         if pending_drop.is_none() {
-                            pending_drop =
-                                self.object_tree_row(ui, surface, child, depth + 1, read_only);
+                            pending_drop = self.object_tree_row(
+                                ui,
+                                surface,
+                                child,
+                                depth + 1,
+                                read_only,
+                                preview_bounds,
+                            );
                         } else {
-                            self.object_tree_row(ui, surface, child, depth + 1, read_only);
+                            self.object_tree_row(
+                                ui,
+                                surface,
+                                child,
+                                depth + 1,
+                                read_only,
+                                preview_bounds,
+                            );
                         }
                     }
                 });
@@ -835,7 +862,7 @@ impl StudioApp {
         let responses = scene_row_style(ui, selected, |ui| {
             scene_row_contents(
                 ui,
-                &mut object,
+                &mut self.theme.surfaces[surface].children[index],
                 selection,
                 preview_size,
                 None,
@@ -844,7 +871,7 @@ impl StudioApp {
             )
         });
         if responses.name_changed {
-            self.theme.surfaces[surface].children[index].name = object.name;
+            // The row edited the object name in place.
             self.changed();
         }
         if responses.item.hovered() || responses.drag_handle.hovered() {
@@ -862,12 +889,12 @@ impl StudioApp {
 
     pub(super) fn canvas_preview(&mut self, ui: &mut egui::Ui) {
         let language = self.language();
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(language.text("Preview"))
-                    .size(16.0)
-                    .strong(),
-            );
+        ui.label(
+            egui::RichText::new(language.text("Preview"))
+                .size(16.0)
+                .strong(),
+        );
+        ui.horizontal_wrapped(|ui| {
             if crate::ui::components::zoom::zoom_control(
                 ui,
                 &mut self.zoom,
@@ -877,14 +904,12 @@ impl StudioApp {
             ) {
                 self.preview_pan = egui::Vec2::ZERO;
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.dirty {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(232, 188, 95),
-                        language.text("Unsaved changes"),
-                    );
-                }
-            });
+            if self.dirty {
+                ui.colored_label(
+                    egui::Color32::from_rgb(232, 188, 95),
+                    language.text("Unsaved changes"),
+                );
+            }
         });
         let surface_index = match self.selection {
             Selection::Surface(index) | Selection::Object(index, _) => {
@@ -1039,23 +1064,24 @@ impl StudioApp {
         if !canvas_rect.contains(pointer) {
             return None;
         }
-        let theme =
-            theme_engine::apply_mouse_action_overrides(&self.theme, &self.preview_mouse_overrides);
+        let effective_theme;
+        let theme = if self.preview_mouse_overrides.is_empty() {
+            &self.theme
+        } else {
+            effective_theme = theme_engine::apply_mouse_action_overrides(
+                &self.theme,
+                &self.preview_mouse_overrides,
+            );
+            &effective_theme
+        };
         let runtime = self.theme_runtime_for_surface(surface_index);
         let (width, height) =
-            theme_engine::resolve_surface_size(&theme, surface_index, self.usage.as_ref(), runtime);
+            theme_engine::resolve_surface_size(theme, surface_index, self.usage.as_ref(), runtime);
         let x = (pointer.x - canvas_rect.left()) as f64 / canvas_rect.width().max(1.0) as f64
             * width as f64;
         let y = (pointer.y - canvas_rect.top()) as f64 / canvas_rect.height().max(1.0) as f64
             * height as f64;
-        theme_engine::hit_test_mouse_event(
-            &theme,
-            surface_index,
-            x,
-            y,
-            self.usage.as_ref(),
-            runtime,
-        )
+        theme_engine::hit_test_mouse_event(theme, surface_index, x, y, self.usage.as_ref(), runtime)
     }
 
     pub(super) fn execute_preview_mouse_event(

@@ -127,6 +127,12 @@ pub(crate) fn configure_style(context: &egui::Context, language: LanguageId) {
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 48, 48);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(58, 58, 58);
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(65, 54, 51);
+    visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_gray(220);
+    visuals.widgets.hovered.fg_stroke.color = egui::Color32::from_gray(245);
+    visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent());
+    visuals.selection.stroke = egui::Stroke::new(1.0, accent());
     visuals.selection.bg_fill = egui::Color32::from_rgb(76, 78, 84);
     visuals.faint_bg_color = egui::Color32::from_rgb(37, 37, 37);
     // Text edits use `extreme_bg_color`, while dropdowns and numeric fields use

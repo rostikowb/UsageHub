@@ -4,6 +4,26 @@ Notable changes to UsageHub (fork of Claude Code Usage Monitor) are documented h
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
+## [Unreleased]
+
+### Changed
+
+- Prefer the existing native Direct3D 11 hardware dashboard host, retaining WARP software rendering and an eframe/OpenGL initialization fallback. Keep the original taskbar theme and renderer rather than adding another GUI toolkit.
+- Simplify account cards into aligned Period/Used/Reset rows, move source paths and secondary actions into details, expose a short Default cleanup action, and improve enabled secondary-text contrast without removing cleanup confirmations.
+- Wrap editor actions, keep Live apply on a separate row, bound inspector rows and labels, and horizontally scroll narrow workspaces without painting over the sidebar.
+- Cache resource lists and reuse host geometry; discover menu libraries on demand and share per-surface thumbnail geometry instead of cloning and resolving each scene object independently.
+
+### Fixed
+
+- Prefer attributed ordinary account windows over tool/notification windows, including a hidden primary behind a visible Codex companion. Follow enabled owned modal chains and revalidate HWND/PID/process identity before asynchronous focus; do not alter vendor topmost styles or block normal activation just because a tray helper exists.
+- Coalesce non-activating restacks of embedded bar children when overlapping shell siblings are raised; cover both authored themes and the legacy embedding path.
+- Stop minimized dashboard repaint polling and retain redraw on restore/resize.
+
+### Removed
+
+- Temporary automatic page-cycling profiling. Explicit `UH_UI_FRAME_TIMINGS=1` with diagnostics now records only a bounded number of actual event-driven frames, without creating animation or changing pages.
+- Unused source-provenance display helpers and incidental wording/default tests.
+
 ## [2.22.5] - 2026-10-27
 
 ### Added
@@ -1590,3 +1610,4 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.3]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.2...v2.22.3
 [2.22.4]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.3...v2.22.4
 [2.22.5]: https://github.com/rostikowb/UsageHub/releases/tag/v2.22.5
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...usagehub

@@ -164,29 +164,50 @@ pub(crate) fn setting_separator(ui: &mut egui::Ui) {
 }
 
 pub(crate) fn inspector_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(INSPECTOR_LABEL_WIDTH, CONTROL_HEIGHT),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.label(egui::RichText::new(label).color(muted()));
-            },
-        );
-        let available_width = ui.available_width().max(1.0);
-        let control_width = control_width(available_width - INSPECTOR_RIGHT_GUTTER);
-        ui.allocate_ui_with_layout(
-            egui::vec2(available_width, CONTROL_HEIGHT),
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                ui.add_space(INSPECTOR_RIGHT_GUTTER);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(control_width, CONTROL_HEIGHT),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    body,
-                );
-            },
-        );
-    });
+    // Reserve enough room for compound fields and their expression buttons.
+    // On narrow panels place the label above the control instead of squeezing it.
+    let stacked = ui.available_width()
+        < INSPECTOR_LABEL_WIDTH + ui.spacing().item_spacing.x + INSPECTOR_RIGHT_GUTTER + 140.0;
+    let layout = if stacked {
+        egui::Layout::top_down(egui::Align::Min)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    // Bound the initial row height so centered children do not consume the
+    // remaining panel height; the allocation still grows for wrapped content.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), CONTROL_HEIGHT),
+        layout,
+        |ui| {
+            let label_width = if stacked {
+                (ui.available_width() - INSPECTOR_RIGHT_GUTTER).max(1.0)
+            } else {
+                INSPECTOR_LABEL_WIDTH
+            };
+            ui.allocate_ui_with_layout(
+                egui::vec2(label_width, CONTROL_HEIGHT),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(label).color(muted())).wrap())
+                        .on_hover_text(label);
+                },
+            );
+            let available_width = ui.available_width().max(1.0);
+            let control_width = control_width(available_width - INSPECTOR_RIGHT_GUTTER);
+            ui.allocate_ui_with_layout(
+                egui::vec2(available_width, CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.add_space(INSPECTOR_RIGHT_GUTTER);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(control_width, CONTROL_HEIGHT),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        body,
+                    );
+                },
+            );
+        },
+    );
 }
 
 pub(crate) fn available_control_width(ui: &egui::Ui) -> f32 {

@@ -1388,6 +1388,25 @@ fn floating_card_inset_preserves_content_layout_clipping_and_mouse_targets() {
         resolve_object_bounds_with_runtime(&theme, 0, 1, None, floating),
         Some((10.0, 4.0, 40.0, 12.0))
     );
+    for runtime in [docked, floating] {
+        let (size, bounds) = resolve_scene_preview_bounds(&theme, 0, None, runtime);
+        assert_eq!(size, resolve_surface_size(&theme, 0, None, runtime));
+        for (index, bounds) in bounds.into_iter().enumerate() {
+            assert_eq!(
+                bounds,
+                resolve_object_bounds_with_runtime(&theme, 0, index, None, runtime)
+            );
+        }
+    }
+    let mut hidden_theme = theme.clone();
+    hidden_theme.surfaces[0].children[0].render = 0.0.into();
+    let (_, hidden_bounds) = resolve_scene_preview_bounds(&hidden_theme, 0, None, floating);
+    for (index, bounds) in hidden_bounds.into_iter().enumerate() {
+        assert_eq!(
+            bounds,
+            resolve_object_bounds_with_runtime(&hidden_theme, 0, index, None, floating)
+        );
+    }
     assert_eq!(
         hit_test_mouse_event(&theme, 0, 10.0, 10.0, None, floating).as_deref(),
         Some("edge")

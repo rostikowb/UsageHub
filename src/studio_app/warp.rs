@@ -1,12 +1,15 @@
-//! Native D3D11/WARP host. Runs in a fresh dashboard process after OpenGL fails.
-//! Windows supplies the software rasterizer; the painter embeds precompiled shaders.
+//! Native Direct3D 11 dashboard host: the default renderer.
+//! It prefers the hardware GPU and falls back to Windows' WARP software
+//! rasterizer in the same process. The painter embeds precompiled shaders.
 
 use super::{egui, style_native_titlebar, Page, StudioApp};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::time::{Duration, Instant};
 use windows::core::{Interface, BOOL};
 use windows::Win32::Foundation::{HMODULE, HWND};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::{Common::*, *};
 use winit::application::ApplicationHandler;
@@ -23,12 +26,43 @@ struct Painter {
     size: [u32; 2],
 }
 
+/// Failure of the Direct3D host. Only initialization failures justify
+/// retrying with another renderer; later errors are reported as they are.
+#[derive(Debug)]
+pub(super) enum HostError {
+    Init(String),
+    Runtime(String),
+}
+
 impl Painter {
-    fn new(window: &Window) -> Result<Self, String> {
+    /// Hardware first; WARP when the GPU path cannot create a device or a
+    /// swap chain (no driver, remote session, feature level below 11.0).
+    fn new(window: &Window, force_warp: bool) -> Result<Self, String> {
+        if force_warp {
+            return Self::with_driver(window, D3D_DRIVER_TYPE_WARP);
+        }
+        match Self::with_driver(window, D3D_DRIVER_TYPE_HARDWARE) {
+            Ok(painter) => Ok(painter),
+            Err(hardware) => {
+                crate::diagnose::log(format!(
+                    "dashboard D3D11 hardware unavailable, using WARP: {hardware}"
+                ));
+                Self::with_driver(window, D3D_DRIVER_TYPE_WARP)
+                    .map_err(|warp| format!("hardware: {hardware}; WARP: {warp}"))
+            }
+        }
+    }
+
+    fn with_driver(window: &Window, driver: D3D_DRIVER_TYPE) -> Result<Self, String> {
+        let driver_name = if driver == D3D_DRIVER_TYPE_WARP {
+            "WARP"
+        } else {
+            "hardware"
+        };
         let RawWindowHandle::Win32(handle) =
             window.window_handle().map_err(|e| e.to_string())?.as_raw()
         else {
-            return Err("WARP requires a Windows window".into());
+            return Err("Direct3D requires a Windows window".into());
         };
         let size = window.inner_size();
         let desc = DXGI_SWAP_CHAIN_DESC {
@@ -53,7 +87,7 @@ impl Painter {
         unsafe {
             D3D11CreateDeviceAndSwapChain(
                 None,
-                D3D_DRIVER_TYPE_WARP,
+                driver,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&[D3D_FEATURE_LEVEL_11_0]),
@@ -64,11 +98,11 @@ impl Painter {
                 None,
                 Some(&mut context),
             )
-            .map_err(|e| format!("create D3D11 WARP device: {e}"))?;
+            .map_err(|e| format!("create D3D11 {driver_name} device: {e}"))?;
         }
-        let device = device.ok_or("WARP returned no device")?;
-        let context = context.ok_or("WARP returned no context")?;
-        let swap_chain = swap_chain.ok_or("WARP returned no swap chain")?;
+        let device = device.ok_or("D3D11 returned no device")?;
+        let context = context.ok_or("D3D11 returned no context")?;
+        let swap_chain = swap_chain.ok_or("D3D11 returned no swap chain")?;
         // Disable DXGI's automatic Alt+Enter transition; window state belongs to winit.
         unsafe {
             let factory: IDXGIFactory = swap_chain.GetParent().map_err(|e| e.to_string())?;
@@ -82,7 +116,7 @@ impl Painter {
             let info = adapter.GetDesc().map_err(|e| e.to_string())?;
             let name = String::from_utf16_lossy(&info.Description);
             crate::diagnose::log(format!(
-                "dashboard renderer=D3D11 WARP adapter={}",
+                "dashboard renderer=D3D11 {driver_name} adapter={}",
                 name.trim_end_matches('\0')
             ));
         }
@@ -115,7 +149,8 @@ impl Painter {
         size: [u32; 2],
         context: &egui::Context,
         output: egui_directx11::RendererOutput,
-    ) -> Result<(), String> {
+    ) -> Result<(Duration, Duration), String> {
+        let paint_started = Instant::now();
         if size != self.size {
             unsafe {
                 self.context.OMSetRenderTargets(None, None);
@@ -133,7 +168,7 @@ impl Painter {
             self.size = size;
             self.create_target()?;
         }
-        let target = self.target.as_ref().ok_or("WARP render target missing")?;
+        let target = self.target.as_ref().ok_or("D3D11 render target missing")?;
         unsafe {
             self.context
                 .ClearRenderTargetView(target, &[0.125, 0.125, 0.125, 1.0]);
@@ -141,13 +176,15 @@ impl Painter {
         self.renderer
             .render(&self.context, target, context, output)
             .map_err(|e| e.to_string())?;
+        let paint_elapsed = paint_started.elapsed();
+        let present_started = Instant::now();
         unsafe {
             self.swap_chain
                 .Present(1, DXGI_PRESENT(0))
                 .ok()
-                .map_err(|e| format!("WARP present: {e}"))?;
+                .map_err(|e| format!("D3D11 present: {e}"))?;
         }
-        Ok(())
+        Ok((paint_elapsed, present_started.elapsed()))
     }
 }
 
@@ -159,6 +196,11 @@ struct Desktop {
     window: Window,
     close_requested: bool,
 }
+
+/// Frames slower than this are logged in diagnostic mode. `total_us` includes
+/// `Present`, which can wait for vsync; `ui_us` is the layout work alone.
+const SLOW_FRAME: Duration = Duration::from_millis(24);
+const FRAME_TIMING_LIMIT: u32 = 512;
 
 struct Repaint {
     at: Instant,
@@ -173,9 +215,12 @@ struct Host {
     icon: egui::IconData,
     owner: isize,
     page: Page,
-    next_repaint: Instant,
+    force_warp: bool,
+    next_repaint: Option<Instant>,
     error: Option<String>,
     painted: bool,
+    slow_frames_logged: u32,
+    frame_timings_remaining: u32,
 }
 
 impl Host {
@@ -205,7 +250,7 @@ impl Host {
                 pos.y + (screen.height.saturating_sub(size.height) / 2) as i32,
             ));
         }
-        let painter = Painter::new(&window)?;
+        let painter = Painter::new(&window, self.force_warp)?;
         let state = egui_winit::State::new(
             self.context.clone(),
             egui::ViewportId::ROOT,
@@ -239,7 +284,7 @@ impl Host {
         if !desktop.close_requested
             && (size.width == 0 || size.height == 0 || desktop.window.is_minimized() == Some(true))
         {
-            self.next_repaint = Instant::now() + Duration::from_millis(100);
+            self.next_repaint = None;
             return Ok(());
         }
         let info = desktop
@@ -253,14 +298,16 @@ impl Host {
             info.events.push(egui::ViewportEvent::Close);
         }
         let input = desktop.state.take_egui_input(&desktop.window);
+        let frame_started = Instant::now();
         let output = self.context.run_ui(input, |ui| desktop.app.draw(ui));
+        let ui_elapsed = frame_started.elapsed();
         let (render, platform, viewports) = egui_directx11::split_output(output);
         desktop
             .state
             .handle_platform_output(&desktop.window, platform);
         let mut close = desktop.close_requested;
         desktop.close_requested = false;
-        let mut delay = Duration::from_millis(500);
+        let mut delay = Duration::MAX;
         if let Some(root) = viewports.get(&egui::ViewportId::ROOT) {
             delay = root.repaint_delay;
             close = close_after_commands(close, &root.commands);
@@ -286,12 +333,39 @@ impl Host {
         } else {
             [size.width, size.height]
         };
-        desktop.painter.paint(paint_size, &self.context, render)?;
+        let (paint_elapsed, present_elapsed) =
+            desktop.painter.paint(paint_size, &self.context, render)?;
+        let frame_elapsed = frame_started.elapsed();
+        if self.frame_timings_remaining > 0 && crate::diagnose::is_enabled() {
+            self.frame_timings_remaining -= 1;
+            crate::diagnose::log(format!(
+                "dashboard frame timing page={} ui_us={} paint_us={} present_us={} total_us={}",
+                desktop.app.page.diagnostic_name(),
+                ui_elapsed.as_micros(),
+                paint_elapsed.as_micros(),
+                present_elapsed.as_micros(),
+                frame_elapsed.as_micros()
+            ));
+        }
+        if frame_elapsed >= SLOW_FRAME
+            && crate::diagnose::is_enabled()
+            && self.slow_frames_logged < 100
+        {
+            self.slow_frames_logged += 1;
+            crate::diagnose::log(format!(
+                "dashboard slow frame page={} ui_us={} paint_us={} present_us={} total_us={}",
+                desktop.app.page.diagnostic_name(),
+                ui_elapsed.as_micros(),
+                paint_elapsed.as_micros(),
+                present_elapsed.as_micros(),
+                frame_elapsed.as_micros()
+            ));
+        }
         if !self.painted {
-            crate::diagnose::log("dashboard WARP first frame presented");
+            crate::diagnose::log("dashboard D3D11 first frame presented");
             self.painted = true;
         }
-        self.next_repaint = Instant::now() + delay.min(Duration::from_secs(1));
+        self.next_repaint = Instant::now().checked_add(delay);
         if close {
             event_loop.exit();
         }
@@ -328,7 +402,7 @@ impl ApplicationHandler<Repaint> for Host {
         // Repaint callbacks can arrive after their frame was already rendered.
         let current = self.context.cumulative_pass_nr();
         if current == event.pass || current == event.pass.saturating_add(1) {
-            self.next_repaint = self.next_repaint.min(event.at);
+            self.next_repaint = Some(self.next_repaint.map_or(event.at, |at| at.min(event.at)));
         }
     }
 
@@ -353,6 +427,9 @@ impl ApplicationHandler<Repaint> for Host {
                     self.fail(event_loop, error);
                 }
             }
+            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                desktop.window.request_redraw();
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.draw(event_loop) {
                     self.fail(event_loop, error);
@@ -365,12 +442,20 @@ impl ApplicationHandler<Repaint> for Host {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(desktop) = &self.desktop {
-            if self.next_repaint <= Instant::now() {
-                desktop.window.request_redraw();
-                // Hidden/minimized windows may not receive redraw events.
-                self.next_repaint = Instant::now() + Duration::from_millis(100);
+            if desktop.window.is_minimized() == Some(true) {
+                self.next_repaint = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else if let Some(at) = self.next_repaint {
+                if at <= Instant::now() {
+                    self.next_repaint = None;
+                    desktop.window.request_redraw();
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_repaint));
         }
     }
 
@@ -387,10 +472,18 @@ pub(super) fn run(
     icon: egui::IconData,
     owner: isize,
     page: Page,
-) -> Result<(), String> {
+    force_warp: bool,
+) -> Result<(), HostError> {
+    // This diagnostic never schedules frames; it samples the normal event-driven cadence.
+    let frame_timings_remaining =
+        if std::env::var_os("UH_UI_FRAME_TIMINGS").is_some_and(|value| value == "1") {
+            FRAME_TIMING_LIMIT
+        } else {
+            0
+        };
     let event_loop = EventLoop::<Repaint>::with_user_event()
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| HostError::Init(e.to_string()))?;
     let context = egui::Context::default();
     let proxy = event_loop.create_proxy();
     context.set_request_repaint_callback(move |info| {
@@ -409,12 +502,20 @@ pub(super) fn run(
         icon,
         owner,
         page,
-        next_repaint: Instant::now(),
+        force_warp,
+        next_repaint: None,
         error: None,
         painted: false,
+        slow_frames_logged: 0,
+        frame_timings_remaining,
     };
-    event_loop.run_app(&mut host).map_err(|e| e.to_string())?;
-    host.error.map_or(Ok(()), Err)
+    let run = event_loop.run_app(&mut host);
+    let error = host.error.or(run.err().map(|e| e.to_string()));
+    match error {
+        None => Ok(()),
+        Some(error) if host.painted => Err(HostError::Runtime(error)),
+        Some(error) => Err(HostError::Init(error)),
+    }
 }
 
 #[cfg(test)]

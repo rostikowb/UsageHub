@@ -137,6 +137,10 @@ pub(super) unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        super::taskbar_zorder::WM_APP_TASKBAR_ZORDER => {
+            super::taskbar_zorder::raise_if_covered(hwnd);
+            LRESULT(0)
+        }
         native_interop::WM_APP_TRAY_REPOSITION => {
             // Watchdog requests must wait for shell layout to settle too.
             schedule_tray_reposition(hwnd);
@@ -1024,6 +1028,7 @@ pub(super) unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            super::taskbar_zorder::forget_surface(hwnd);
             lifecycle::surface_destroyed(hwnd);
             LRESULT(0)
         }

@@ -223,8 +223,7 @@ fn account_settings(
     let header = egui::CollapsingHeader::new(language.text("Accounts"))
         .default_open(accounts.profiles.len() > 1);
     header.show(ui, |ui| {
-        ui.label(language.text("Themes use the default account unless they specify an account. Custom themes can display multiple accounts."));
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(language.text("Default account"));
             let selected = accounts.selected().map(|p| p.name.as_str()).unwrap_or("None");
             Dropdown::from_id_salt("widget_account")
@@ -242,11 +241,10 @@ fn account_settings(
             let managed = profile.ownership == crate::accounts::AccountOwnership::Managed;
             ui.push_id(profile.id.clone(), |ui| {
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     changed |= ui.checkbox(&mut profile.enabled, language.text("Monitor")).changed();
                     if managed {
                         ui.label(egui::RichText::new(&profile.name).strong());
-                        ui.weak(language.text("Managed accounts are edited through the account manager above."));
                     } else {
                         let name = ui.add(crate::ui::components::text_field::singleline(&mut profile.name)
                             .desired_width(220.0).hint_text(language.text("Account name")));
@@ -277,15 +275,17 @@ fn account_settings(
                         ui.weak(format!("{}: accounts.{}.{}", language.text("Theme binding"), provider.descriptor().key, profile.id));
                     });
                 }
-                match profile.credential_path(provider) {
-                    Err(error) => { ui.colored_label(egui::Color32::from_rgb(196, 64, 64), error); }
-                    Ok(None) => { ui.weak(if provider == ProviderId::Claude {
-                        language.text("Uses CLAUDE_CONFIG_DIR when set; otherwise detects CLI, Desktop or WSL credentials.")
-                    } else {
-                        language.text("Uses CODEX_HOME when set; otherwise ~/.codex/auth.json.")
-                    }); }
-                    Ok(Some(path)) => { ui.weak(path.display().to_string()); }
-                }
+                ui.collapsing(language.text("Account details and advanced actions"), |ui| {
+                    match profile.credential_path(provider) {
+                        Err(error) => { ui.colored_label(egui::Color32::from_rgb(196, 64, 64), error); }
+                        Ok(None) => { ui.weak(if provider == ProviderId::Claude {
+                            language.text("Uses CLAUDE_CONFIG_DIR when set; otherwise detects CLI, Desktop or WSL credentials.")
+                        } else {
+                            language.text("Uses CODEX_HOME when set; otherwise ~/.codex/auth.json.")
+                        }); }
+                        Ok(Some(path)) => { ui.weak(path.display().to_string()); }
+                    }
+                });
                 if !provider_enabled || !profile.enabled {
                     ui.weak(language.text("Monitoring disabled"));
                 } else if let Some(account) = data.and_then(|data| data.accounts.iter().find(|account| {

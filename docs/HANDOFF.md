@@ -1,8 +1,62 @@
 # UsageHub: передача наступній сесії
 
-Актуальний знімок — **2026-10-27, v2.22.5**; нижче збережено також історичні результати 2026-10-26. Це не гарантія поточного стану машини. Джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID з документації. `origin` — власний форк https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`, початковий інтеграційний коміт — `9536978`. Не робіть руйнівних `reset` або `clean`.
+Актуальний знімок — **2026-10-27, локальна 2.22.6; публічний release v2.22.5**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
+
+## 2.22.6: GPU-налаштування, редактори й фокус бару
+
+### Встановлення та межі публікації
+
+- Репозиторій: `D:/Work/programming/node/usagehub`. Встановлено `D:/Soft/UsageHub/usagehub.exe`, **8 563 200 байтів**, SHA-256 **`9524B1716B20131E1476A0C05080218C0D4758EE1DD5A8C3FA58AD37513B26BE`**. Hash встановленого файлу перевірено після копіювання; збірка сама його не замінює.
+- Backup попереднього встановленого EXE: `D:/Soft/UsageHub/usagehub-2.22.5-before-ui-1793105710.exe`. Це лише виконуваний файл, не резервна копія акаунтів. Для заміни спершу закривайте тільки перевірені процеси UsageHub; Claude/Codex не завершуйте.
+- Публічний release **v2.22.5 не змінено**, новий tag/asset 2.22.6 не публікували. Changelog має секцію Unreleased. Не перезаписуйте вже опублікований asset.
+- Resident запущено через Shell.Application. Native перевірка списку процесів eval-job показала, що resident **не входить у job цієї eval-сесії** й пережив завершення launcher. Сам `IsProcessInJob(..., NULL)` може бути true через інший Windows job; це не доказ прив'язки до агента. Run і Start Menu як раніше вказують на встановлений EXE.
+- Активна `left-dock-usage.json` і оригінал старого monitor лишилися byte-identical: SHA-256 `3109A1454243F3597068D11F4F73AD8E4E89E1B15336F2509F708B8F37076982`. Оригінальний дизайн бару не переписано.
+
+### Що й де змінено
+
+- `src/studio_app/warp.rs` — існуючий egui-directx11 painter тепер hardware-first; WARP є **CPU software fallback**, OpenGL/eframe — окремий initialization fallback process. Реально запущено D3D11 hardware на **AMD Radeon (TM) Graphics**, окремо примусово WARP на **Microsoft Basic Render Driver** з успішним кадром і перемиканням вкладки. Не заявляйте живу перевірку OpenGL failover чи Hyper-V: їх тут не запускали.
+- `studio_manage.rs`, `studio_settings.rs`, `ui/theme.rs` — компактні таблиці Період/Використано/Скидання, UTC у hover, технічні джерела й додаткові дії в деталях, явна дія очищення Default, читабельні вторинні заголовки. Backup, typed-id, preview binding, explicit no-backup та external-Default opt-in збережено.
+- `studio_theme_workspace.rs`, `studio_context_menus.rs`, `ui/components/layout.rs` — toolbar з перенесенням, окремий компактний Live apply рядок, bounded inspector rows із wrapping labels, горизонтальний scroll workspace. Дочірні panes **звужують успадкований clip**, а не замінюють його. Native smoke виявив і виправив два дефекти, які пропустив source review: full-height `with_layout` робив величезні проміжки, а nested horizontal усередині wrapped toolbar не переносив Live apply атомарно.
+- `studio_assets.rs`, `studio_core.rs`, `studio_context_menus.rs` — snapshot ресурсів з інвалідацією на змінах/вході, menu-library discovery лише на потрібній дії, менше повторної файлової роботи.
+- `window::query_theme_runtime_for_surface` використовує існуючий geometry snapshot з lazy refresh до разу/секунду в окремому Studio-процесі. `theme_engine/theme_rendering.rs::resolve_scene_preview_bounds` спільно вирішує thumbnail geometry одного surface; прибрано клони scene objects і зайвий clone hit-test theme без overrides. Свіжі usage/language/provider дані не заморожено в кеші whole runtime.
+- `manager/native.rs` — first-visible picker більше не вибирає topmost/tool companion замість звичайного, зокрема прихованого primary. Підтримано enabled owned modal chain з bounded traversal, повторну перевірку HWND/PID/birth; без AttachThreadInput, зміни чужих topmost/styles або закриття companion. Якщо primary немає, лишається нормальна official-app activation, а не нова заборона через саму наявність tray helper.
+- `window/taskbar_zorder.rs` та wiring — coalesced non-activating restack лише дочірніх поверхонь у shell host, legacy і custom embedding, Explorer hook lifecycle. Це не глобальний topmost і не заміна виправленню неправильного account-window selection.
+- Автоматичний `UH_PROFILE_PAGES` видалено. `UH_UI_FRAME_TIMINGS=1` із diagnostics обмежено логує фактичні event-driven кадри; він не перемикає сторінки й не запускає постійну анімацію. Деталі — `dashboard-rendering.md`.
+
+### Вимірювання
+
+CPU часу UI, мс; не загальна input latency і не Present/vsync. Одна машина/тема й hardware D3D11. Baseline — старий WIP з forced page-cycling, після — реальні native кліки й pointer events; перший кадр кожної сторінки виключено. Це локальні samples, не універсальна гарантія.
+
+| Сторінка | Baseline median | Після median | Після p95 |
+| --- | ---: | ---: | ---: |
+| Settings | 0.660 | 0.598 | 0.848 |
+| Theme Studio | 28.953 | 9.207 | 10.266 |
+| Context menus | 22.792 | 2.594 | 2.994 |
+| Assets | 0.887 | 0.199 | 0.339 |
+| Diagnostics | 0.265 | 0.228 | 3.180 |
+
+Холодні UI кадри відрізняються: Settings 85.223 мс, Diagnostics 44.616 мс; не обіцяйте таку саму швидкість першого відкриття, як warmed layout.
+
+| Процес/стан | Working set MiB | Private MiB | CPU секунд / вікно |
+| --- | ---: | ---: | ---: |
+| Resident bar після взаємодії | 52.56 | 13.88 | 0.15625 / 8 с |
+| Settings після обходу редакторів | 186.90 | 171.95 | 0 / 8 с |
+| Settings minimized | 186.90 | 171.95 | 0 / 8 с |
+
+Нуль — показання GetProcessTimes у короткому вікні з його квантуванням, не обіцянка нульового CPU. Закриття settings завершує його окремий процес і звільняє його ресурси; minimized зберігає пам'ять.
+
+### Перевірено та свідомо не виконано
+
+- Повний `cargo test --locked --quiet -- --test-threads=1`: **741 passed, 0 failed, 6 ignored**, 33.59 с виконання. Після останніх двох layout-only виправлень: **54 studio_app::tests passed**, 1.09 с; новий release build успішний. Не видавайте це за повторний повний suite після цих двох правок чи за зелений `clippy -D warnings`: warnings лишилися. Три incidental wording/default tests видалено; нові pure regressions захищають primary/tool/modal selection, geometry parity доповнено в існуючому тесті.
+- Реальні native вкладки й screenshots 1375×750 та 1006×673 client; horizontal scroll не малює поверх sidebar, label/control і Live apply не обрізаються. Перевірено collapse/expand scene root, Tab focus, minimize/restore. Доказові PNG: `D:/Temp/usagehub-ui-final-wide.png`, `D:/Temp/usagehub-ui-final-narrow.png`; це тимчасові локальні артефакти.
+- Default cleanup відкрито, Full reset без opt-in лишився заблокованим; закрито без Apply. Реальні акаунти не видаляли/не скидали, login/credentials не вводили, Claude/Codex не зупиняли.
+- Реальні ЛКМ Default, Second та **вже запущеного** Codex: окремі правильні Claude PID і звичайне Codex primary, по 40 samples із видимим баром, без повернення foreground до бару. Початковий Codex PID помер за час очікування користувача; під час першої cold-спроби 6-секундний foreground check не пройшов, а нове ordinary вікно з'явилося пізніше. **Повний cold-launch foreground/15-секундний шлях не заявляйте перевіреним**; vendor apps для такого повтору не закривали.
+- ПКМ реально відкрив `#32768` popup, закритий Escape; числову latency popup тут не вимірювали. У живому журналі GET Claude/Codex знову давав 200; метод точних квот/reset не змінювали.
+- Computer bridge був закритий; використано окремо схвалений користувачем Windows API fallback, із перевіркою exact EXE/PID/birth, foreground/occlusion, відсутності затиснутих кнопок та повторною валідацією перед кліком. При паралельному людському вводі guard перервав дії без кліку; для фінального проходу користувач окремо погодив коротку паузу вводу. Не трактуйте цей дозвіл як дозвіл на майбутні видалення чи нові desktop-сесії.
 
 ## v2.22.5: взаємодія, актуальні квоти й власні оновлення
+
+Історичний знімок до поточної 2.22.6; його старий installed hash і перевірки не описують сьогоднішній виконуваний файл.
 
 - Встановлено оптимізований `D:/Soft/UsageHub/usagehub.exe`, 8 539 648 байтів, SHA-256 `0E4338639002EB3C8D454472D7E1041E4ACD6A92D312C9839CFA27EFA6D46C43`. Репозиторій — `D:/Work/programming/node/usagehub`; збірка сама не замінює встановлений EXE.
 - ПКМ використовує найближчий авторський обробник предків, не губиться на згенерованому дочірньому акаунті. Чисте відкриття меню більше не перемальовує весь бар, вбудоване меню не сканує каталог, sizing використовує кеш геометрії. Нативні вимірювання optimized: 78/33/59 мс; це разові заміри, не гарантія.
@@ -113,4 +167,4 @@ try {
 
 На 2026-10-26 фінальний набір дав **744 passed, 0 failed, 7 ignored**. Раніше на оптимізованому коді виконано 32 фактичні lifecycle-перевірки; відповідне ядро після цього не змінювали. Завислий child завершився за 1158 мс при таймауті 1 с; для архіву 64 MiB виміряне приватне використання пам'яті — 3,3 MiB. Встановлений EXE мав SHA-256 `2CB463D3A5BE346362778B6D1854E5D975CACB8F815546B612925774703D2248`. Для реальних Default і Second встановлена версія повернула `error: null`; оригінальну тему скопійовано побайтово, SHA-256 `3109A1454243F3597068D11F4F73AD8E4E89E1B15336F2509F708B8F37076982`. Працюючий встановлений бар через 35 с: 39,64 MiB working set, 9,94 MiB private; CPU 0,188 с за 10,06 с спостереження. Це разові результати, не гарантії продуктивності чи поточного стану.
 
-Історичні сім ignored не означали проходження всіх live HTTPS-тестів. Є наявні warnings; не заявляйте, що `clippy -D warnings` зелений. На етапі 2026-10-26 foreground typing не вдалося перевірити через обмеження desktop-автоматизації; backend-створення, welcome офіційного GUI та native preview/backup були перевірені. Тоді публічного релізу ще не було. Актуальний стан взаємодії й каналу оновлень дивіться в секції v2.22.5 вище; локальна збірка не є доказом публікації чи hosted CI.
+Історичні сім ignored не означали проходження всіх live HTTPS-тестів. Є наявні warnings; не заявляйте, що `clippy -D warnings` зелений. На етапі 2026-10-26 foreground typing не вдалося перевірити через обмеження desktop-автоматизації; backend-створення, welcome офіційного GUI та native preview/backup були перевірені. Тоді публічного релізу ще не було. Актуальні встановлення й native докази дивіться в секції 2.22.6 вище; локальна збірка не є доказом публікації чи hosted CI.

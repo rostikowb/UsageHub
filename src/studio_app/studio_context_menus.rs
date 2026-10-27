@@ -3,7 +3,6 @@ use super::*;
 impl StudioApp {
     pub(super) fn context_menus_page(&mut self, ui: &mut egui::Ui) {
         let language = self.language();
-        let descriptors = context_menu::list_context_menus().unwrap_or_default();
         let read_only = self.context_menu.is_builtin();
         let mut requested_path = None;
         let mut create_new = false;
@@ -12,7 +11,7 @@ impl StudioApp {
         let mut discard = false;
         let mut delete = false;
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(language.text("Context menu")).color(muted()));
             Dropdown::from_id_salt("context-menu-library-v2")
                 .width(260.0)
@@ -22,6 +21,7 @@ impl StudioApp {
                     self.context_menu.name.clone()
                 })
                 .show_ui(ui, |ui| {
+                    let descriptors = context_menu::list_context_menus().unwrap_or_default();
                     for descriptor in &descriptors {
                         let selected =
                             self.context_menu_path.as_deref() == Some(descriptor.path.as_path());
@@ -73,35 +73,36 @@ impl StudioApp {
                 )
                 .on_hover_text(language.text("Delete..."))
                 .clicked();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        !read_only,
-                        singleline_text_edit(&mut self.context_menu.name).desired_width(170.0),
-                    )
-                    .changed()
-                {
-                    self.context_menu_dirty = true;
-                }
+            if self.context_menu_dirty {
+                ui.colored_label(
+                    egui::Color32::from_rgb(232, 188, 95),
+                    language.text("Unsaved changes"),
+                );
+            }
+        });
+        if read_only {
+            ui.label(
+                egui::RichText::new(language.text("Duplicate this built-in menu to edit it."))
+                    .color(muted()),
+            );
+        } else {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(language.text("Name"));
                 if ui
-                    .add_enabled(
-                        !read_only,
-                        singleline_text_edit(&mut self.context_menu.id).desired_width(145.0),
-                    )
+                    .add(singleline_text_edit(&mut self.context_menu.name).desired_width(170.0))
                     .changed()
                 {
                     self.context_menu_dirty = true;
                 }
                 ui.label("ID");
-                if self.context_menu_dirty {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(232, 188, 95),
-                        language.text("Unsaved changes"),
-                    );
+                if ui
+                    .add(singleline_text_edit(&mut self.context_menu.id).desired_width(145.0))
+                    .changed()
+                {
+                    self.context_menu_dirty = true;
                 }
             });
-        });
+        }
 
         if let Some(path) = requested_path {
             match context_menu::load_context_menu(&path) {
@@ -159,9 +160,14 @@ impl StudioApp {
         } else {
             let editor_identity = self.context_menu.id.clone();
             let read_only = self.context_menu.is_builtin();
-            ui.push_id(("context-menu-document", editor_identity), |ui| {
-                self.context_menu_workspace(ui, read_only);
-            });
+            egui::ScrollArea::horizontal()
+                .id_salt("context-menu-workspace-scroll")
+                .show(ui, |ui| {
+                    ui.set_min_width(746.0);
+                    ui.push_id(("context-menu-document", editor_identity), |ui| {
+                        self.context_menu_workspace(ui, read_only);
+                    });
+                });
         }
 
         // Persist only after all editor controls have processed this frame.
@@ -169,6 +175,7 @@ impl StudioApp {
         // the document dirty; saving earlier would immediately re-lock the menu
         // selector even though the user had just saved.
         if save {
+            let descriptors = context_menu::list_context_menus().unwrap_or_default();
             let duplicate_id = descriptors.iter().any(|descriptor| {
                 descriptor
                     .id
@@ -261,7 +268,7 @@ impl StudioApp {
                 .max_rect(layers_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        layers_ui.set_clip_rect(layers_rect);
+        layers_ui.shrink_clip_rect(layers_rect);
         studio_region(&mut layers_ui, layers_width, row_height, |ui| {
             self.context_menu_layers(ui, read_only)
         });
@@ -277,7 +284,7 @@ impl StudioApp {
                 .max_rect(preview_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        preview_ui.set_clip_rect(preview_rect);
+        preview_ui.shrink_clip_rect(preview_rect);
         studio_region(&mut preview_ui, preview_width, row_height, |ui| {
             self.context_menu_preview(ui)
         });
@@ -293,7 +300,7 @@ impl StudioApp {
                 .max_rect(inspector_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        inspector_ui.set_clip_rect(inspector_rect);
+        inspector_ui.shrink_clip_rect(inspector_rect);
         studio_region(
             &mut inspector_ui,
             inspector_rect.width(),
@@ -314,10 +321,7 @@ impl StudioApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(!read_only, |ui| {
                     ui.menu_button(
-                        (
-                            crate::ui::components::icon::icon_text(LucideIcon::Plus, 16.0),
-                            language.text("Add layer"),
-                        ),
+                        crate::ui::components::icon::icon_text(LucideIcon::Plus, 16.0),
                         |ui| {
                             for (kind, icon, label) in [
                                 ("action", LucideIcon::MousePointerClick, "Action"),
@@ -337,7 +341,9 @@ impl StudioApp {
                                 }
                             }
                         },
-                    );
+                    )
+                    .response
+                    .on_hover_text(language.text("Add layer"));
                 });
             });
         });
@@ -414,10 +420,11 @@ impl StudioApp {
                 .add_enabled_ui(!read_only && selected.is_some(), |ui| {
                     ui.add_sized(
                         [button_width, CONTROL_HEIGHT],
-                        lucide_labeled_button(LucideIcon::Copy, language.text("Duplicate")),
+                        lucide_icon_button(LucideIcon::Copy),
                     )
                 })
                 .inner
+                .on_hover_text(language.text("Duplicate"))
                 .clicked()
             {
                 if let Some(path) = selected.as_deref() {
@@ -433,10 +440,11 @@ impl StudioApp {
                 .add_enabled_ui(!read_only && selected.is_some(), |ui| {
                     ui.add_sized(
                         [button_width, CONTROL_HEIGHT],
-                        lucide_labeled_button(LucideIcon::Trash, language.text("Delete")),
+                        lucide_icon_button(LucideIcon::Trash),
                     )
                 })
                 .inner
+                .on_hover_text(language.text("Delete"))
                 .clicked()
             {
                 if let Some(path) = selected.as_deref() {

@@ -402,43 +402,33 @@ fn logical_host_dimension(physical: i32, scale: f64) -> u32 {
         .clamp(1.0, u32::MAX as f64) as u32
 }
 
-// The studio runs in a separate process without the monitor's layout cache.
+// Studio is a separate process and does not receive the bar's layout snapshots.
+// Bound shell enumeration even when an editor resolves many surfaces per frame.
+static STUDIO_HOST_NEXT_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+
 pub(crate) fn query_theme_runtime_for_surface(
     theme: &ThemeDocument,
     surface_index: usize,
     runtime: ThemeRuntime,
 ) -> ThemeRuntime {
-    let Some(surface) = theme.surfaces.get(surface_index) else {
-        return runtime;
+    let now = Instant::now();
+    let refresh = {
+        let mut next = STUDIO_HOST_NEXT_CHECK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if next.is_some_and(|deadline| now < deadline) {
+            false
+        } else {
+            // Set the deadline before native calls: shell queries can dispatch
+            // messages and reenter this function. Never hold the lock over them.
+            *next = Some(now + Duration::from_secs(1));
+            true
+        }
     };
-    let displays = native_interop::find_monitors();
-    let Some(display) = displays
-        .get(surface.placement.reference.display)
-        .copied()
-        .or_else(|| displays.first().copied())
-    else {
-        return runtime;
-    };
-    let nest = surface
-        .placement
-        .nest
-        .resolve(surface.placement.reference.region);
-    let host_rect = if matches!(nest, SurfaceNest::Taskbar | SurfaceNest::TrayIcon) {
-        native_interop::taskbar_for_monitor(
-            &native_interop::find_taskbars(),
-            &displays,
-            display.handle,
-        )
-        .map(|taskbar| taskbar.rect)
-        .unwrap_or(display.rect)
-    } else {
-        display.rect
-    };
-    let scale = monitor_scale(display);
-    runtime.with_host_dimensions(
-        logical_host_dimension(host_rect.right - host_rect.left, scale),
-        logical_host_dimension(host_rect.bottom - host_rect.top, scale),
-    )
+    if refresh {
+        host_geometry::refresh_theme_host_geometry();
+    }
+    host_geometry::theme_runtime_for_surface(theme, surface_index, runtime)
 }
 
 fn scaled_theme_dimension(logical: u32, scale: f64) -> i32 {
@@ -2323,6 +2313,10 @@ unsafe extern "system" fn mirror_wnd_proc(
     match msg {
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
         WM_SETCURSOR if set_surface_cursor(hwnd) => LRESULT(1),
+        taskbar_zorder::WM_APP_TASKBAR_ZORDER => {
+            taskbar_zorder::raise_if_covered(hwnd);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             update_mouse_hover(hwnd, lparam);
             LRESULT(0)
@@ -2377,6 +2371,7 @@ unsafe extern "system" fn mirror_wnd_proc(
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_DESTROY => {
+            taskbar_zorder::forget_surface(hwnd);
             lifecycle::surface_destroyed(hwnd);
             LRESULT(0)
         }
@@ -2818,6 +2813,7 @@ pub fn run() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        taskbar_zorder::remove_reorder_hook();
     }
 }
 
@@ -3685,6 +3681,7 @@ use host_geometry::*;
 use message_loop::wnd_proc;
 mod positioning;
 mod taskbar_collision;
+mod taskbar_zorder;
 use positioning::*;
 mod mouse;
 mod widget_tooltip;

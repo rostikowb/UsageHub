@@ -126,38 +126,42 @@ pub fn handle_cli_mode(args: &[String]) -> bool {
         .unwrap_or(DEFAULT_DASHBOARD_HEIGHT);
     let dashboard_icon = eframe::icon_data::from_png_bytes(include_bytes!("icons/16x16.png"))
         .expect("src/icons/16x16.png must be a valid PNG app icon");
-    let result = if args.iter().any(|arg| arg == "--dashboard-warp") {
-        warp::run(
+    let result = if args.iter().any(|arg| arg == "--dashboard-opengl") {
+        // Explicit diagnosis switch, or the relaunch after Direct3D failed.
+        run_dashboard(
             dashboard_width,
             dashboard_height,
             dashboard_icon,
             owner,
             initial_page,
         )
-        .map_err(|error| match std::env::var("UH_DASHBOARD_OPENGL_ERROR") {
-            Ok(gl_error) => format!("OpenGL: {gl_error}; WARP: {error}"),
-            Err(_) => format!("WARP: {error}"),
+        .map_err(|error| match std::env::var(D3D11_ERROR_ENV) {
+            Ok(d3d_error) => format!("Direct3D 11: {d3d_error}; OpenGL: {error}"),
+            Err(_) => format!("OpenGL: {error}"),
         })
     } else {
-        run_dashboard_with_fallback(|renderer, gl_error| match renderer {
-            DashboardRenderer::OpenGl => run_dashboard(
+        let force_warp = args.iter().any(|arg| arg == "--dashboard-warp");
+        run_dashboard_with_fallback(|renderer, d3d_error| match renderer {
+            DashboardRenderer::Direct3D => warp::run(
                 dashboard_width,
                 dashboard_height,
                 dashboard_icon.clone(),
                 owner,
                 initial_page,
+                force_warp,
             ),
-            DashboardRenderer::Warp => {
-                // winit cannot create another event loop after eframe has created one.
-                // Release our process slot before starting a fresh WARP dashboard. The
-                // child claims the same guard, so concurrent launch requests still coalesce.
+            DashboardRenderer::OpenGl => {
+                // winit permits one event loop per process and the Direct3D host
+                // already created it. Release our process slot before starting a
+                // fresh OpenGL dashboard. The child claims the same guard, so
+                // concurrent launch requests still coalesce.
                 if let Some(handle) = dashboard_instance.take() {
                     unsafe {
                         let _ = windows::Win32::Foundation::CloseHandle(handle);
                     }
                 }
-                launch_warp_dashboard(args, gl_error.unwrap_or_default())
-                    .map_err(|error| eframe::Error::AppCreation(error.into()))
+                launch_opengl_dashboard(args, d3d_error.unwrap_or_default())
+                    .map_err(warp::HostError::Init)
             }
         })
     };
@@ -187,15 +191,17 @@ pub fn handle_cli_mode(args: &[String]) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashboardRenderer {
+    Direct3D,
     OpenGl,
-    Warp,
 }
 
-fn launch_warp_dashboard(args: &[String], gl_error: &str) -> Result<(), String> {
+const D3D11_ERROR_ENV: &str = "UH_DASHBOARD_D3D11_ERROR";
+
+fn launch_opengl_dashboard(args: &[String], d3d_error: &str) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new(executable);
-    command.args(args.iter().skip(1)).arg("--dashboard-warp");
-    command.env("UH_DASHBOARD_OPENGL_ERROR", gl_error);
+    command.args(args.iter().skip(1)).arg("--dashboard-opengl");
+    command.env(D3D11_ERROR_ENV, d3d_error);
     if crate::diagnose::is_enabled() {
         command.arg("--diagnose-append");
     }
@@ -205,31 +211,26 @@ fn launch_warp_dashboard(args: &[String], gl_error: &str) -> Result<(), String> 
         .map_err(|error| error.to_string())
 }
 
+/// Direct3D 11 (hardware GPU, then WARP inside the host) is the default.
+/// Only a host that never presented a frame is retried with OpenGL; errors
+/// after the first frame are application or device failures.
 fn run_dashboard_with_fallback(
-    mut run: impl FnMut(DashboardRenderer, Option<&str>) -> eframe::Result,
+    mut run: impl FnMut(DashboardRenderer, Option<&str>) -> Result<(), warp::HostError>,
 ) -> Result<(), String> {
-    let glow_error = match run(DashboardRenderer::OpenGl, None) {
+    let d3d_error = match run(DashboardRenderer::Direct3D, None) {
         Ok(()) => return Ok(()),
-        Err(error) => error,
+        Err(warp::HostError::Runtime(error)) => return Err(format!("Direct3D 11: {error}")),
+        Err(warp::HostError::Init(error)) => error,
     };
     crate::diagnose::log(format!(
-        "dashboard OpenGL initialization failed: {glow_error}"
+        "dashboard Direct3D 11 initialization failed: {d3d_error}"
     ));
-
-    // Context/configuration failures can occur before the OpenGL painter exists.
-    if matches!(
-        &glow_error,
-        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
-    ) {
-        match run(DashboardRenderer::Warp, Some(&glow_error.to_string())) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                crate::diagnose::log(format!("dashboard WARP initialization failed: {error}"));
-                Err(format!("OpenGL: {glow_error}; WARP: {error}"))
-            }
+    match run(DashboardRenderer::OpenGl, Some(&d3d_error)) {
+        Ok(()) => Ok(()),
+        Err(warp::HostError::Init(error) | warp::HostError::Runtime(error)) => {
+            crate::diagnose::log(format!("dashboard OpenGL launch failed: {error}"));
+            Err(format!("Direct3D 11: {d3d_error}; OpenGL: {error}"))
         }
-    } else {
-        Err(format!("OpenGL: {glow_error}"))
     }
 }
 
@@ -263,6 +264,18 @@ enum Page {
     ContextMenus,
     Assets,
     Diagnostics,
+}
+
+impl Page {
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Page::Settings => "settings",
+            Page::Studio => "theme-studio",
+            Page::ContextMenus => "context-menus",
+            Page::Assets => "assets",
+            Page::Diagnostics => "diagnostics",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -606,6 +619,7 @@ struct StudioApp {
     preview_hover_target: Option<(usize, String)>,
     preview_pending_click: Option<(Instant, usize, String)>,
     asset_picker: Option<AssetPickerState>,
+    asset_cache: Option<Arc<Vec<theme_engine::ManagedAsset>>>,
     asset_thumbnails: HashMap<String, egui::TextureHandle>,
     asset_page_filter: String,
     asset_page_selected: Option<String>,
@@ -780,7 +794,7 @@ impl StudioApp {
             })
             .show(ui, |ui| self.shell(ui));
         self.unsaved_changes_dialog(ui.ctx());
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
     fn save_window_size(&self) {
@@ -981,7 +995,6 @@ use studio_context_menu_editor::*;
 mod studio_inspectors;
 use studio_inspectors::*;
 mod studio_settings;
-use studio_settings::*;
 mod studio_utilities;
 use studio_utilities::*;
 #[cfg(test)]

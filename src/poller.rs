@@ -82,14 +82,6 @@ pub struct PollFailure {
     pub error: PollError,
 }
 
-/// Polling and cache readers must agree on all files an account can read.
-pub fn account_source_signature(provider: ProviderId, path: &std::path::Path) -> String {
-    match provider {
-        ProviderId::Claude => claude::credential_file_signature(path, &[]),
-        _ => crate::accounts::file_signature(path),
-    }
-}
-
 /// Content signature for one account profile: desktop-directory profiles
 /// cover their `config.json` + `Local State`, credential-file profiles cover
 /// the file plus confirmed credential-manager targets, and legacy
@@ -128,41 +120,6 @@ pub fn explicit_source_path(
             .flatten()
             .map(|dir| dir.join("config.json")),
         _ => profile.credential_path(provider).ok().flatten(),
-    }
-}
-
-/// Human-readable source provenance for CLI/UI status, e.g.
-/// `desktop "C:\...\Claude"`, `credentials file "..."`, or
-/// `provider default`. Never exposes tokens or secrets.
-pub fn account_source_provenance(
-    provider: ProviderId,
-    profile: &crate::accounts::AccountProfile,
-) -> String {
-    if provider == ProviderId::Claude && !profile.desktop_dir.trim().is_empty() {
-        return match profile.desktop_dir_resolved() {
-            Ok(Some(dir)) => format!("desktop {}", dir.display()),
-            _ => format!("desktop {} (unresolved)", profile.desktop_dir.trim()),
-        };
-    }
-    match profile.credential_path(provider) {
-        Ok(Some(path)) => {
-            if provider == ProviderId::Claude && !profile.credential_targets.is_empty() {
-                format!(
-                    "credentials file {} (+{} credential target{})",
-                    path.display(),
-                    profile.credential_targets.len(),
-                    if profile.credential_targets.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                format!("credentials file {}", path.display())
-            }
-        }
-        Ok(None) => "provider default".to_string(),
-        Err(error) => format!("unresolved source ({error})"),
     }
 }
 

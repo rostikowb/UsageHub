@@ -650,7 +650,6 @@ impl StudioApp {
         self.poll_manage();
         let language = self.language();
         section(ui, language.text("Account manager"), |ui| {
-            ui.label(language.text("Managed accounts with live usage and safe cleanup."));
             ui.horizontal(|ui| {
                 ui.selectable_value(
                     &mut self.manage.provider_tab,
@@ -701,14 +700,8 @@ impl StudioApp {
         let now = SystemTime::now();
         let snapshot_unix = self.manage.last_snapshot_unix;
         ui.separator();
-        ui.weak(language.text(if provider == ProviderId::Claude {
-            "Enter a name, create the account, then sign in in the official Claude window. Do not paste credentials here."
-        } else {
-            "Additional Codex accounts are CLI-only. Desktop isolation is not supported."
-        }));
         // Add / import: ordinary operations, no confirmation.
         ui.horizontal_wrapped(|ui| {
-            ui.label(language.text("Account name"));
             ui.add(
                 crate::ui::components::text_field::singleline(&mut self.manage.new_name)
                     .desired_width(180.0)
@@ -743,11 +736,11 @@ impl StudioApp {
                 });
                 // Live usage from the monitor cache (server poller only).
                 self.account_usage_lines(ui, provider, profile, language, now, snapshot_unix);
+                let desktop_available = provider != ProviderId::Codex
+                    || (id.eq_ignore_ascii_case("default")
+                        && profile.ownership != crate::accounts::AccountOwnership::Managed);
                 // Ordinary operations: no confirmation.
                 ui.horizontal_wrapped(|ui| {
-                    let desktop_available = provider != ProviderId::Codex
-                        || (id.eq_ignore_ascii_case("default")
-                            && profile.ownership != crate::accounts::AccountOwnership::Managed);
                     if ui
                         .add_enabled(
                             desktop_available,
@@ -766,36 +759,12 @@ impl StudioApp {
                             ],
                         );
                     }
-                    if ui
-                        .add_enabled(
-                            desktop_available,
-                            egui::Button::new(language.text("Focus window")),
-                        )
-                        .clicked()
-                    {
-                        self.spawn_manage(
-                            OpKind::Status {
-                                key: Self::status_key(provider, &id),
-                            },
-                            vec![
-                                "focus".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                            ],
-                        );
-                    }
-                    let external_default = profile.ownership
-                        != crate::accounts::AccountOwnership::Managed
-                        && id.eq_ignore_ascii_case("default");
-                    let delete_label = if external_default {
-                        "Review Default account cleanup..."
-                    } else if profile.ownership != crate::accounts::AccountOwnership::Managed {
-                        "Review external account cleanup..."
-                    } else {
-                        "Delete account..."
-                    };
+                    let delete_label =
+                        if profile.ownership != crate::accounts::AccountOwnership::Managed {
+                            "Clean up..."
+                        } else {
+                            "Delete account..."
+                        };
                     if ui
                         .add_enabled(
                             !self.manage_busy(),
@@ -833,7 +802,6 @@ impl StudioApp {
                     language.text("Account details and advanced actions"),
                     |ui| {
                         ui.weak(format!("id: {id}"));
-                        self.account_source_lines(ui, provider, profile, language);
                         self.account_usage_details(
                             ui,
                             provider,
@@ -842,6 +810,26 @@ impl StudioApp {
                             snapshot_unix,
                             now,
                         );
+                        if ui
+                            .add_enabled(
+                                desktop_available,
+                                egui::Button::new(language.text("Focus window")),
+                            )
+                            .clicked()
+                        {
+                            self.spawn_manage(
+                                OpKind::Status {
+                                    key: Self::status_key(provider, &id),
+                                },
+                                vec![
+                                    "focus".to_string(),
+                                    "--provider".to_string(),
+                                    key.to_string(),
+                                    "--id".to_string(),
+                                    id.clone(),
+                                ],
+                            );
+                        }
                         ui.horizontal_wrapped(|ui| {
                             if ui.button(language.text("Stop account")).clicked() {
                                 self.spawn_manage(
@@ -925,7 +913,6 @@ impl StudioApp {
                         }
                         // Rename + pin/order/color: ordinary display edits, no confirmation.
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(language.text("Rename account"));
                             let buffer = self
                                 .manage
                                 .rename
@@ -1099,26 +1086,41 @@ impl StudioApp {
             if usage.stale {
                 ui.weak(language.text("Last known usage"));
             }
-            for (label, section) in [("Session", &usage.session), ("Weekly", &usage.weekly)] {
-                if let Some(line) = reset_display(
-                    language,
-                    &format!("{} ({})", language.text(label), language.text("Used")),
-                    section,
-                    now,
-                ) {
-                    ui.label(line);
-                }
-            }
-            if let Some(monthly) = &usage.monthly {
-                if let Some(line) = reset_display(
-                    language,
-                    &format!("{} ({})", language.text("Monthly"), language.text("Used")),
-                    monthly,
-                    now,
-                ) {
-                    ui.label(line);
-                }
-            }
+            egui::Grid::new("quota-grid")
+                .spacing(egui::vec2(16.0, 2.0))
+                .show(ui, |ui| {
+                    ui.colored_label(muted(), language.text("Period"));
+                    ui.colored_label(muted(), language.text("Used"));
+                    ui.colored_label(muted(), language.text("Reset"));
+                    ui.end_row();
+                    for (label, section) in [
+                        ("Session", Some(&usage.session)),
+                        ("Weekly", Some(&usage.weekly)),
+                        ("Monthly", usage.monthly.as_ref()),
+                    ] {
+                        let Some(section) = section.filter(|section| section.available) else {
+                            continue;
+                        };
+                        ui.label(language.text(label));
+                        ui.label(format!("{:.0}%", section.percentage));
+                        let reset = match section.resets_at {
+                            None => language.text("Unknown reset").to_string(),
+                            Some(reset) => match reset.duration_since(now) {
+                                Ok(left) => format_countdown(language, left),
+                                Err(_) => {
+                                    language.text("Expired; waiting for next poll").to_string()
+                                }
+                            },
+                        };
+                        let response = ui.label(reset);
+                        if let Some(details) =
+                            reset_display(language, language.text(label), section, now)
+                        {
+                            response.on_hover_text(details);
+                        }
+                        ui.end_row();
+                    }
+                });
         } else if account.error.is_none() {
             ui.weak(language.text("Waiting for usage"));
         }
@@ -1141,6 +1143,17 @@ impl StudioApp {
             return;
         };
         if let Some(usage) = &account.usage {
+            for (label, section) in [
+                ("Session", Some(&usage.session)),
+                ("Weekly", Some(&usage.weekly)),
+                ("Monthly", usage.monthly.as_ref()),
+            ] {
+                if let Some(line) = section
+                    .and_then(|section| reset_display(language, language.text(label), section, now))
+                {
+                    ui.weak(line);
+                }
+            }
             if let Some(credits) = &usage.credits {
                 ui.label(format!(
                     "{}: {:.0}%",
@@ -1155,44 +1168,24 @@ impl StudioApp {
                     }
                 }
             }
-            let mut provenance = format!(
-                "{}: {}",
-                language.text("Exact source"),
-                account
-                    .source_path
-                    .as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| account.source_signature.clone())
-            );
-            if let Some(updated) = snapshot_unix {
-                provenance.push_str(&format!(
-                    " · {}: {}",
-                    language.text("Last snapshot"),
-                    format_unix_utc(updated)
-                ));
-            }
-            ui.weak(provenance);
         }
-    }
-
-    fn account_source_lines(
-        &self,
-        ui: &mut egui::Ui,
-        provider: ProviderId,
-        profile: &crate::accounts::AccountProfile,
-        language: LanguageId,
-    ) {
-        // Primary label comes from the declared source kind via the poller's
-        // provenance: Desktop profiles never fall back to CLI discovery in
-        // this path, though a separately configured CLI path is still listed.
-        let provenance = crate::poller::account_source_provenance(provider, profile);
-        ui.weak(format!("{}: {provenance}", language.text("Exact source"),));
-        if provider == ProviderId::Claude
-            && !profile.desktop_dir.trim().is_empty()
-            && !profile.config_dir.trim().is_empty()
-        {
-            ui.weak(format!("CLI config: {}", profile.config_dir.trim(),));
+        let mut provenance = format!(
+            "{}: {}",
+            language.text("Exact source"),
+            account
+                .source_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| account.source_signature.clone())
+        );
+        if let Some(updated) = snapshot_unix {
+            provenance.push_str(&format!(
+                " · {}: {}",
+                language.text("Last snapshot"),
+                format_unix_utc(updated)
+            ));
         }
+        ui.weak(provenance);
     }
 
     fn cleanup_ui(&mut self, ui: &mut egui::Ui, provider: ProviderId, language: LanguageId) {
@@ -1207,6 +1200,7 @@ impl StudioApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
+            .max_width((ui.ctx().content_rect().width() - 40.0).max(240.0))
             .default_width(620.0)
             .max_height((ui.ctx().content_rect().height() - 40.0).max(240.0))
             .vscroll(true)
@@ -1301,7 +1295,7 @@ impl StudioApp {
             ui.horizontal_wrapped(|ui| {
                 let busy = self.manage_busy();
                 if ui
-                    .add_enabled(!busy && !blocked, egui::Button::new(language.text("Preview deletion")))
+                    .add_enabled(!busy && !blocked, egui::Button::new(language.text("Preview")))
                     .clicked()
                 {
                     let request = current_key.clone();

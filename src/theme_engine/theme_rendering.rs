@@ -481,6 +481,58 @@ pub fn resolve_object_bounds_with_runtime(
         geometry.height,
     ))
 }
+/// Resolve a surface's editor thumbnail bounds together, sharing the same
+/// data context and parent geometry for all rows in this frame.
+pub fn resolve_scene_preview_bounds(
+    theme: &ThemeDocument,
+    surface_index: usize,
+    data: Option<&AppUsageData>,
+    runtime: ThemeRuntime,
+) -> ((u32, u32), Vec<Option<(f64, f64, f64, f64)>>) {
+    let Some(surface) = theme.surfaces.get(surface_index) else {
+        return (
+            resolve_surface_size(theme, surface_index, data, runtime),
+            Vec::new(),
+        );
+    };
+    let mut warnings = Vec::new();
+    let (width, height) = resolve_object_size(surface, data, runtime, &mut warnings);
+    let padding = surface_horizontal_padding(theme, surface_index, runtime);
+    let canvas = Canvas {
+        width,
+        width_expression: Some(surface.width.clone()),
+        height,
+        height_expression: Some(surface.height.clone()),
+        background: surface.background.canvas_paint(),
+    };
+    let context = DataContext::from_usage_with_runtime(data, &canvas, runtime);
+    let mut cache = vec![None; surface.children.len()];
+    let mut stack = Vec::new();
+    let bounds = (0..surface.children.len())
+        .map(|index| {
+            stack.clear();
+            resolve_geometry(
+                index,
+                surface,
+                &canvas,
+                &surface.children,
+                &context,
+                &mut cache,
+                &mut stack,
+                &mut warnings,
+            )
+            .map(|geometry| {
+                (
+                    geometry.x + padding as f64,
+                    geometry.y,
+                    geometry.width,
+                    geometry.height,
+                )
+            })
+        })
+        .collect();
+    ((width + 2 * padding, height), bounds)
+}
 
 pub fn resolve_surface_size(
     theme: &ThemeDocument,

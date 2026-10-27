@@ -26,14 +26,16 @@ pub(crate) fn navigation_item(ui: &mut egui::Ui, selected: bool, title: &str) ->
             .with_clip_rect(marker_clip)
             .rect_filled(rect, 4.0, accent());
     }
-    ui.painter().text(
+    ui.painter().with_clip_rect(rect).text(
         egui::pos2(rect.left() + 18.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(16.0),
         menu_text(),
     );
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(title)
 }
 
 pub(crate) fn github_link(ui: &mut egui::Ui, url: &str) -> egui::Response {

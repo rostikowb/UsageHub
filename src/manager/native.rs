@@ -31,7 +31,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use windows::core::{Interface as _, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, PROPERTYKEY, WPARAM,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, PROPERTYKEY, RECT, WPARAM,
 };
 use windows::Win32::Storage::EnhancedStorage::{
     PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand,
@@ -67,8 +67,10 @@ use windows::Win32::UI::Shell::{
     AO_NONE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW,
-    SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
+    EnumWindows, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow,
+    ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE, WM_CLOSE, WS_CAPTION, WS_CHILD,
+    WS_DISABLED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 
 use crate::accounts::AccountProfile;
@@ -1237,6 +1239,93 @@ fn windows_for_pids(pids: &BTreeSet<u32>) -> Vec<LiveWindow> {
     state.windows
 }
 
+#[derive(Clone, Copy)]
+struct WindowCandidate {
+    hwnd: isize,
+    pid: u32,
+    owner: isize,
+    visible: bool,
+    style: u32,
+    ex_style: u32,
+    has_area: bool,
+}
+
+fn primary_window(windows: &[WindowCandidate]) -> Option<&WindowCandidate> {
+    let eligible = |w: &&WindowCandidate| {
+        w.has_area
+            && w.style & WS_CHILD.0 == 0
+            && w.ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) == 0
+    };
+    let primary = windows
+        .iter()
+        .filter(eligible)
+        .filter(|w| {
+            (w.owner == 0 || w.ex_style & WS_EX_APPWINDOW.0 != 0)
+                && (w.style & WS_CAPTION.0 == WS_CAPTION.0
+                    || w.style & WS_THICKFRAME.0 != 0
+                    || w.ex_style & WS_EX_APPWINDOW.0 != 0)
+        })
+        .min_by_key(|w| !w.visible)?;
+    // Every link in a modal chain must be an attributed, visible, eligible
+    // window. Bound traversal by the candidate count so stale/cyclic owner
+    // relationships cannot hang selection.
+    if primary.style & WS_DISABLED.0 != 0 {
+        return windows.iter().filter(eligible).find(|dialog| {
+            if !dialog.visible || dialog.style & WS_DISABLED.0 != 0 {
+                return false;
+            }
+            let mut owner = dialog.owner;
+            for _ in 0..windows.len() {
+                if owner == primary.hwnd {
+                    return true;
+                }
+                let Some(parent) = windows
+                    .iter()
+                    .filter(eligible)
+                    .find(|w| w.hwnd == owner && w.visible && w.style & WS_DISABLED.0 != 0)
+                else {
+                    return false;
+                };
+                owner = parent.owner;
+            }
+            false
+        });
+    }
+    Some(primary)
+}
+
+fn window_candidate(window: &LiveWindow) -> Option<WindowCandidate> {
+    unsafe {
+        let hwnd = HWND(window.hwnd as *mut _);
+        let mut pid = 0;
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return None;
+        }
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != window.pid {
+            return None;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+        Some(WindowCandidate {
+            hwnd: window.hwnd,
+            pid,
+            owner: GetWindow(hwnd, GW_OWNER).unwrap_or_default().0 as isize,
+            visible: IsWindowVisible(hwnd).as_bool(),
+            style: GetWindowLongW(hwnd, GWL_STYLE) as u32,
+            ex_style: GetWindowLongW(hwnd, GWL_EXSTYLE) as u32,
+            has_area: rect.right > rect.left && rect.bottom > rect.top,
+        })
+    }
+}
+
+fn account_primary_window(windows: &[LiveWindow]) -> Option<WindowCandidate> {
+    let candidates: Vec<_> = windows.iter().filter_map(window_candidate).collect();
+    primary_window(&candidates).copied()
+}
+
 // ---------------------------------------------------------------------------
 // Launch / focus / stop
 // ---------------------------------------------------------------------------
@@ -1339,17 +1428,35 @@ pub fn focus_account_window(ctx: &AccountContext) -> ManagerResult<bool> {
     let snapshot = live_process_snapshot();
     stamp_account_windows_in(ctx, &snapshot);
     let windows = account_live_windows_in(ctx, &snapshot);
-    let target = windows
-        .iter()
-        .find(|window| window.visible)
-        .or_else(|| windows.first());
-    let Some(target) = target else {
+    let Some(target) = account_primary_window(&windows) else {
+        // A tray/helper process is not an existing primary window. Let the
+        // normal official-app activation create or restore the primary.
         return Ok(false);
     };
+    // An HWND can be destroyed and recycled between enumeration and focus.
+    // Re-read its ownership and selection and, when available, process birth.
+    let birth = snapshot
+        .processes
+        .iter()
+        .find(|p| p.pid == target.pid)
+        .and_then(|p| p.created_unix);
+    if birth.is_some() && process_created_unix(target.pid) != birth {
+        return Err("Account window process changed before focus".into());
+    }
+    let current = account_live_windows_in(ctx, &snapshot);
+    if !account_primary_window(&current)
+        .is_some_and(|window| window.hwnd == target.hwnd && window.pid == target.pid)
+    {
+        return Err("Account window changed before focus".into());
+    }
     unsafe {
         let hwnd = HWND(target.hwnd as *mut _);
-        if !IsWindow(Some(hwnd)).as_bool() {
-            return Ok(false);
+        let mut pid = 0;
+        if !IsWindow(Some(hwnd)).as_bool()
+            || GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0
+            || pid != target.pid
+        {
+            return Err("Account window changed before focus".into());
         }
         // Never join the vendor's input queue: a stalled target can otherwise
         // block this worker while it owns the account-operation guard, starving
@@ -1975,23 +2082,18 @@ pub fn launch_and_stamp_account(ctx: &AccountContext, extra_args: &[String]) -> 
             }
             let snapshot = live_process_snapshot();
             let existing = account_live_windows_in(ctx, &snapshot);
-            if let Some(window) = existing
-                .iter()
-                .find(|window| window.visible || !window.title.is_empty())
-            {
+            if let Some(window) = account_primary_window(&existing) {
                 if focus_account_window(ctx)? {
                     return Ok(window.pid);
                 }
+                return Err("Account window changed before focus".into());
             }
             let pid = activate_packaged_default(ctx.provider)?;
             let start = std::time::Instant::now();
             loop {
                 let snapshot = live_process_snapshot();
                 let windows = account_live_windows_in(ctx, &snapshot);
-                if let Some(window) = windows
-                    .iter()
-                    .find(|window| window.visible || !window.title.is_empty())
-                {
+                if let Some(window) = account_primary_window(&windows) {
                     stamp_account_windows_in(ctx, &snapshot);
                     return Ok(window.pid);
                 }
@@ -2016,7 +2118,7 @@ pub fn launch_and_stamp_account(ctx: &AccountContext, extra_args: &[String]) -> 
     let start = std::time::Instant::now();
     loop {
         let snapshot = live_process_snapshot();
-        if !account_live_windows_in(ctx, &snapshot).is_empty() {
+        if account_primary_window(&account_live_windows_in(ctx, &snapshot)).is_some() {
             stamp_account_windows_in(ctx, &snapshot);
             break;
         }
@@ -2545,6 +2647,73 @@ pub fn refresh_taskbar_identities() -> ManagerResult<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(hwnd: isize, visible: bool, style: u32, ex_style: u32) -> WindowCandidate {
+        WindowCandidate {
+            hwnd,
+            pid: 1,
+            owner: 0,
+            visible,
+            style,
+            ex_style,
+            has_area: true,
+        }
+    }
+
+    #[test]
+    fn primary_selection_prefers_real_windows_over_visible_companions() {
+        let tool = candidate(1, true, 0x14000000, 0x200088);
+        let hidden_primary = candidate(2, false, 0x04c70000, 0x240100);
+        assert_eq!(primary_window(&[tool, hidden_primary]).unwrap().hwnd, 2);
+
+        // Claude's ordinary window has no APPWINDOW bit.
+        let visible_primary = candidate(3, true, 0x14c70000, 0x280100);
+        assert_eq!(
+            primary_window(&[tool, hidden_primary, visible_primary])
+                .unwrap()
+                .hwnd,
+            3
+        );
+        assert_eq!(
+            primary_window(&[visible_primary, hidden_primary])
+                .unwrap()
+                .hwnd,
+            3
+        );
+    }
+
+    #[test]
+    fn primary_selection_rejects_helpers_and_respects_modal_ownership() {
+        let mut primary = candidate(1, true, WS_CAPTION.0, 0);
+        let mut dialog = candidate(2, true, WS_CAPTION.0, 0);
+        dialog.owner = primary.hwnd;
+        let mut zero_area = candidate(3, true, WS_CAPTION.0, 0);
+        zero_area.has_area = false;
+        let helper = candidate(4, true, 0, 0);
+        let no_activate = candidate(5, true, WS_CAPTION.0, WS_EX_NOACTIVATE.0);
+        let child = candidate(6, true, WS_CAPTION.0 | WS_CHILD.0, 0);
+        assert!(primary_window(&[dialog, zero_area, helper, no_activate, child]).is_none());
+        assert_eq!(primary_window(&[dialog, primary]).unwrap().hwnd, 1);
+        primary.style |= WS_DISABLED.0;
+        assert_eq!(primary_window(&[dialog, primary]).unwrap().hwnd, 2);
+        let mut nested = candidate(7, true, WS_CAPTION.0, 0);
+        nested.owner = dialog.hwnd;
+        dialog.style |= WS_DISABLED.0;
+        assert_eq!(primary_window(&[dialog, primary, nested]).unwrap().hwnd, 7);
+        // A missing or ineligible intermediate cannot establish attribution.
+        assert!(primary_window(&[primary, nested]).is_none());
+        dialog.ex_style |= WS_EX_TOOLWINDOW.0;
+        assert!(primary_window(&[dialog, primary, nested]).is_none());
+        dialog.ex_style = 0;
+        dialog.visible = false;
+        assert!(primary_window(&[dialog, primary, nested]).is_none());
+        dialog.visible = true;
+        // A stale cyclic chain that does not reach the primary is rejected.
+        let mut cycle = candidate(8, true, WS_CAPTION.0 | WS_DISABLED.0, 0);
+        dialog.owner = cycle.hwnd;
+        cycle.owner = dialog.hwnd;
+        assert!(primary_window(&[dialog, primary, nested, cycle]).is_none());
+    }
 
     #[test]
     fn shortcut_fingerprint_tracks_identity_inputs() {
