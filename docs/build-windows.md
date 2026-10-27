@@ -114,7 +114,19 @@ in `.cargo/config.toml` and the env block above accordingly.
 
 ## Publishing
 
-This toolchain covers local builds only. The checked-in GitHub release workflow
-still publishes the upstream asset name (`claude-code-usage-monitor.exe`) and
-WinGet identifier and does not install this toolchain or the gnullvm target, so
-it is not a UsageHub publish path. No UsageHub release is produced from it.
+The fork's `.github/workflows/release.yml` handles `v*` tags in
+`rostikowb/UsageHub`. Hosted builds explicitly select
+`1.95.0-x86_64-pc-windows-msvc` and `--target x86_64-pc-windows-msvc` on
+`windows-latest`, overriding this checkout's local gnullvm defaults. Dependency
+security checks run separately on Linux with Linux host/target overrides.
+The workflow runs updater tests, builds, and uploads only
+`target/x86_64-pc-windows-msvc/release/usagehub.exe`; there is no upstream
+WinGet submission.
+
+A manual local release uses
+`target/x86_64-pc-windows-gnullvm/release/usagehub.exe`. Publish it as
+`usagehub.exe` at the matching version tag in the fork, then compare the API
+asset size and `sha256:` digest against the local file. Do not replace an
+already-published binary with a different toolchain build. See
+[updater verification](updater.md) for the trust boundary. Local gnullvm smoke
+does not constitute a hosted MSVC workflow run.

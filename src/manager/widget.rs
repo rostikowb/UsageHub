@@ -130,7 +130,7 @@ pub fn schedule_backup_purge() {
 /// exists, otherwise launch it. Runs the lifecycle call on the caller's
 /// thread; the window controller invokes this from a worker thread.
 pub fn open_account_card(provider: ProviderId, id: &str) -> ManagerResult<()> {
-    if crate::manager::lifecycle::focus_account_window(provider, id).unwrap_or(false) {
+    if crate::manager::lifecycle::focus_account_window(provider, id)? {
         return Ok(());
     }
     crate::manager::lifecycle::open_account(provider, id)

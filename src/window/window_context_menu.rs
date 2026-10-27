@@ -5,12 +5,30 @@ pub(super) fn show_context_menu_document(
     reference: Option<&str>,
     origin: Option<(usize, String)>,
 ) {
-    let document = match context_menu::resolve_context_menu(reference) {
-        Ok(document) => document,
-        Err(error) => {
-            diagnose::log(format!("context menu load failed: {error}"));
+    // Built-ins are authoritative in code; resolving them through the Studio
+    // directory would enumerate and parse every custom menu on every click.
+    let reference = reference.map(str::trim);
+    let document = match reference {
+        None | Some("") => context_menu::classic_context_menu(),
+        Some(id)
+            if id.eq_ignore_ascii_case(context_menu::CLASSIC_CONTEXT_MENU_ID)
+                || id.eq_ignore_ascii_case(context_menu::LEGACY_CLASSIC_CONTEXT_MENU_ID) =>
+        {
             context_menu::classic_context_menu()
         }
+        Some(id)
+            if id.eq_ignore_ascii_case(context_menu::DASHBOARD_V2_CONTEXT_MENU_ID)
+                || id.eq_ignore_ascii_case(context_menu::LEGACY_DASHBOARD_V2_CONTEXT_MENU_ID) =>
+        {
+            context_menu::dashboard_v2_context_menu()
+        }
+        _ => match context_menu::resolve_context_menu(reference) {
+            Ok(document) => document,
+            Err(error) => {
+                diagnose::log(format!("context menu load failed: {error}"));
+                context_menu::classic_context_menu()
+            }
+        },
     };
     let language = lock_state()
         .as_ref()
@@ -18,9 +36,14 @@ pub(super) fn show_context_menu_document(
         .unwrap_or_else(localization::detect_system_language);
     let data_context = context_menu_data_context(origin.as_ref());
     let mut actions = Vec::new();
+    let owner = controller_for(hwnd);
     unsafe {
-        let Ok(menu) = CreatePopupMenu() else {
-            return;
+        let menu = match CreatePopupMenu() {
+            Ok(menu) => menu,
+            Err(error) => {
+                diagnose::log(format!("context menu creation failed: {error}"));
+                return;
+            }
         };
         append_context_menu_items(
             menu,
@@ -35,19 +58,28 @@ pub(super) fn show_context_menu_document(
         // here (and on the bar) without any manual menu JSON.
         append_account_section(menu, language, &data_context, &mut actions);
         let mut point = POINT::default();
-        let _ = GetCursorPos(&mut point);
-        let _ = SetForegroundWindow(hwnd);
+        if let Err(error) = GetCursorPos(&mut point) {
+            diagnose::log(format!("context menu cursor position failed: {error}"));
+        }
+        if !SetForegroundWindow(owner).as_bool() {
+            diagnose::log("context menu could not foreground its controller");
+        }
         let selected = TrackPopupMenu(
             menu,
             TPM_RIGHTBUTTON | TPM_RETURNCMD,
             point.x,
             point.y,
             None,
-            hwnd,
+            owner,
             None,
         )
         .0 as usize;
         let _ = DestroyMenu(menu);
+        if let Err(error) = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0)) {
+            diagnose::log(format!(
+                "context menu dismissal notification failed: {error}"
+            ));
+        }
         if selected >= 1_000 {
             if let Some(action) = actions.get(selected - 1_000).cloned() {
                 execute_context_menu_action(hwnd, action, origin);

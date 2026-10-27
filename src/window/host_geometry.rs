@@ -89,6 +89,26 @@ pub(super) fn taskbar_is_horizontal(display_index: usize) -> bool {
         .is_none_or(native_interop::is_taskbar_horizontal)
 }
 
+/// Width available to account cards from the last shell layout snapshot.
+pub(super) fn account_bar_budget(display_index: usize) -> f64 {
+    let geometry = THEME_HOST_GEOMETRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(host) = geometry.get(display_index).or_else(|| geometry.first()) else {
+        return theme_engine::account_layout::ACCOUNT_MAX_WIDTH_FALLBACK;
+    };
+    let Some(rect) = host.taskbar else {
+        return theme_engine::account_layout::ACCOUNT_MAX_WIDTH_FALLBACK;
+    };
+    let length = if native_interop::is_taskbar_horizontal(rect) {
+        rect.right - rect.left
+    } else {
+        rect.bottom - rect.top
+    } as f64
+        / host.scale;
+    (length * 0.5).clamp(220.0, 560.0)
+}
+
 fn runtime_with_geometry(
     theme: &ThemeDocument,
     surface_index: usize,

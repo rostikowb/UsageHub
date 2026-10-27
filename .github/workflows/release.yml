@@ -9,14 +9,33 @@ permissions:
   contents: write
 
 env:
-  RELEASE_ASSET_NAME: claude-code-usage-monitor.exe
-  WINGET_PACKAGE_ID: CodeZeno.ClaudeCodeUsageMonitor
+  RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
 
 jobs:
   dependency-security:
-    uses: ./.github/workflows/dependency-security.yml
-    permissions:
-      contents: read
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable-x86_64-unknown-linux-gnu
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: cargo-audit
+            version: 0.22.2
+            command: cargo audit --file Cargo.lock
+          - tool: cargo-deny
+            version: 0.20.2
+            command: cargo deny --locked check
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install security tool
+        run: cargo install --locked ${{ matrix.tool }} --version ${{ matrix.version }}
+      - name: Check dependencies
+        run: ${{ matrix.command }}
 
   build:
     needs: dependency-security
@@ -26,62 +45,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Keep in sync with rust-toolchain.toml.
+      # Override the local gnullvm host and target with the hosted MSVC toolchain.
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Test updater safeguards
-        run: cargo test --locked updater
+        run: cargo test --locked --target x86_64-pc-windows-msvc updater
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: target/release/claude-code-usage-monitor.exe
+          files: target/x86_64-pc-windows-msvc/release/usagehub.exe
           generate_release_notes: true
-
-  winget:
-    needs: build
-    runs-on: windows-latest
-    env:
-      WINGETCREATE_GITHUB_TOKEN: ${{ secrets.WINGETCREATE_GITHUB_TOKEN }}
-    steps:
-      - name: Prepare release metadata
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag.TrimStart('v')
-          $packageUrl = "https://github.com/${{ github.repository }}/releases/download/$tag/${{ env.RELEASE_ASSET_NAME }}"
-
-          "PACKAGE_VERSION=$version" >> $env:GITHUB_ENV
-          "PACKAGE_URL=$packageUrl" >> $env:GITHUB_ENV
-
-      - name: Skip when winget token is not configured
-        if: env.WINGETCREATE_GITHUB_TOKEN == ''
-        shell: pwsh
-        run: |
-          Write-Warning "Skipping WinGet submission because WINGETCREATE_GITHUB_TOKEN is not configured."
-
-      - name: Install .NET 6 runtime
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: "6.0.x"
-
-      - name: Download wingetcreate
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-
-      - name: Submit WinGet manifest update
-        if: env.WINGETCREATE_GITHUB_TOKEN != ''
-        shell: pwsh
-        run: |
-          .\wingetcreate.exe update `
-            --submit `
-            --token $env:WINGETCREATE_GITHUB_TOKEN `
-            --urls $env:PACKAGE_URL `
-            --version $env:PACKAGE_VERSION `
-            $env:WINGET_PACKAGE_ID

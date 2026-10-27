@@ -56,6 +56,61 @@ pub(super) fn mouse_handler_exists(
         })
     })
 }
+// A hit target may only handle another mouse event. Walk its authored parent
+// chain rather than letting that unrelated handler hide the surface handler.
+fn right_click_handler<'a>(
+    theme: &'a theme_engine::ThemeDocument,
+    surface_index: usize,
+    object_id: &str,
+) -> Option<(&'a str, &'a str)> {
+    let surface = theme.surfaces.get(surface_index)?;
+    let mut id = object_id;
+    for _ in 0..=surface.children.len() {
+        let object = std::iter::once(surface)
+            .chain(surface.children.iter())
+            .find(|object| object.id.eq_ignore_ascii_case(id))?;
+        if let Some(source) = theme_engine::mouse_event_script(
+            theme,
+            surface_index,
+            &object.id,
+            MouseEventKind::RightClick,
+        ) {
+            return Some((&object.id, source));
+        }
+        if object.id.eq_ignore_ascii_case(&surface.id) {
+            return None;
+        }
+        id = object.parent.as_deref().unwrap_or(&surface.id);
+    }
+    None
+}
+
+pub(super) fn dispatch_surface_context_menu(hwnd: HWND, target: Option<(usize, String)>) {
+    let handler = target.as_ref().and_then(|(surface_index, object_id)| {
+        let state = lock_state();
+        let theme = effective_theme_from_state(state.as_ref()?)?;
+        right_click_handler(&theme, *surface_index, object_id)
+            .map(|(id, source)| (*surface_index, id.to_owned(), source.to_owned()))
+    });
+    if let Some((surface_index, object_id, source)) = handler {
+        // An explicit handler owns the event even if its script fails.
+        let _ = execute_mouse_action_source(surface_index, &object_id, &source);
+    } else {
+        show_context_menu_document(hwnd, None, target);
+    }
+}
+
+pub(super) fn dispatch_keyboard_context_menu(hwnd: HWND) {
+    let target = {
+        let state = lock_state();
+        state.as_ref().and_then(|state| {
+            let index = surface_index_for_window(state, hwnd)?;
+            let theme = effective_theme_from_state(state)?;
+            Some((index, theme.surfaces.get(index)?.id.clone()))
+        })
+    };
+    dispatch_surface_context_menu(hwnd, target);
+}
 
 pub(super) fn dispatch_mouse_event(
     surface_index: usize,
@@ -99,7 +154,8 @@ pub(super) fn execute_mouse_action_source(
         let data = state.data.clone();
         let runtime =
             theme_runtime_for_surface(&theme, surface_index, theme_runtime_from_state(state));
-        theme_engine::execute_mouse_actions(
+        let previous_overrides = state.mouse_action_overrides.clone();
+        let result = theme_engine::execute_mouse_actions(
             &theme,
             surface_index,
             object_id,
@@ -107,16 +163,23 @@ pub(super) fn execute_mouse_action_source(
             data.as_ref(),
             runtime,
             &mut state.mouse_action_overrides,
-        )
+        );
+        (result, previous_overrides != state.mouse_action_overrides)
     };
     match result {
-        Ok(effects) => {
-            render_layered();
+        (Ok(effects), changed) => {
+            // Opening a menu or dashboard does not alter the theme. Avoid a
+            // synchronous full render and shell sync before presenting it.
+            if changed {
+                render_layered();
+            }
             let owner = lock_state()
                 .as_ref()
                 .map(|state| state.hwnd.to_hwnd())
                 .unwrap_or_default();
-            sync_tray_icon(owner);
+            if changed {
+                sync_tray_icon(owner);
+            }
             for effect in effects {
                 match effect {
                     MouseActionEffect::ShowDashboard => {
@@ -146,7 +209,7 @@ pub(super) fn execute_mouse_action_source(
             }
             true
         }
-        Err(error) => {
+        (Err(error), _) => {
             diagnose::log(format!(
                 "mouse action failed surface={surface_index} layer={object_id}: {error}"
             ));
@@ -426,6 +489,58 @@ pub(super) unsafe fn set_surface_cursor(hwnd: HWND) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_click_bubbles_from_click_only_account_to_nearest_handler() {
+        let mut theme = theme_engine::ThemeDocument::starter();
+        let surface = &mut theme.surfaces[0];
+        surface.width = 100.0.into();
+        surface.height = 100.0.into();
+        surface.children.clear();
+        surface.mouse_events = Some(theme_engine::MouseEvents {
+            right_click: "show_context_menu(\"classic-v1\")".into(),
+            ..Default::default()
+        });
+        let mut account = theme_engine::SceneObject::object("account", "account");
+        account.parent = Some(surface.id.clone());
+        account.width = 50.0.into();
+        account.height = 50.0.into();
+        account.mouse_events = Some(theme_engine::MouseEvents {
+            click: "show_dashboard()".into(),
+            ..Default::default()
+        });
+        surface.children.push(account);
+        let target = theme_engine::hit_test_mouse_event(
+            &theme,
+            0,
+            25.0,
+            25.0,
+            None,
+            theme_engine::ThemeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(target, "account");
+        assert_eq!(
+            right_click_handler(&theme, 0, &target),
+            Some((
+                theme.surfaces[0].id.as_str(),
+                "show_context_menu(\"classic-v1\")"
+            ))
+        );
+        theme.surfaces[0].children[0]
+            .mouse_events
+            .as_mut()
+            .unwrap()
+            .right_click = "show_dashboard()".into();
+        assert_eq!(
+            right_click_handler(&theme, 0, &target),
+            Some(("account", "show_dashboard()"))
+        );
+        assert_eq!(
+            theme_engine::mouse_event_script(&theme, 0, &target, MouseEventKind::Click),
+            Some("show_dashboard()")
+        );
+    }
 
     #[test]
     fn repeated_mouse_moves_preserve_the_pending_hover_deadline() {

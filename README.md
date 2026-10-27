@@ -11,7 +11,7 @@ Fork differences at a glance:
 
 - Own identity: `%APPDATA%\UsageHub` settings, `Local\UsageHub*` mutexes and events, the `UsageHub` window class, the `UsageHub` Run key, `%TEMP%\usagehub.log` diagnostics, and the `usagehub.exe` binary. Nothing is shared with an upstream install.
 - Local-first account manager: one executable runs the taskbar bar and opens its dashboard or Theme Studio on demand. A new Claude account is a Desktop user-data directory with its own nested `claude-config`; separate Claude windows launch from the installed app and open only when requested. Credentials, config, and history stay isolated per account — the deliberate shared state is the skills library.
-- Fork-safe updater: automatic update checks and self-update are disabled. UsageHub never downloads or installs an upstream build over itself, and no fork release channel is published yet, so builds come from this source tree.
+- Fork-owned updater: portable builds check [UsageHub releases](https://github.com/rostikowb/UsageHub/releases), accept only `usagehub.exe` from this fork, and verify its size and SHA-256 before replacement. They never install an upstream monitor build.
 - Exact usage data only: the limits and reset times shown always come from each provider's own service (for Claude, the original usageBar server poller). Automatic monitoring never runs `claude -p` or another model/CLI probe, and there are no switcher estimates, plan-usage-history inference, or manual reset overrides.
 
 See the [user guide](USER_GUIDE.md) for theme customisation and everyday settings,
@@ -53,7 +53,7 @@ Claude Code credentials are read from stored logins: the credentials file writte
 
 ## Installation
 
-No prebuilt UsageHub releases are published yet. Build from source (see below) and run `usagehub.exe` from a user-writable folder. An upstream `ClaudeCodeUsageMonitor` install may stay alongside it: the two apps use separate settings, mutexes, startup entries, and logs, so neither disturbs the other. Do not expect UsageHub to update itself or to be updated by the upstream installer.
+Download `usagehub.exe` from [the latest UsageHub release](https://github.com/rostikowb/UsageHub/releases/latest) and run it from a user-writable folder, or build from source below. An upstream `ClaudeCodeUsageMonitor` install may stay alongside it: settings, mutexes, startup entries, and logs are separate. The upstream installer is not a UsageHub update channel.
 
 ## Usage
 
@@ -110,7 +110,7 @@ GitHub Copilot usage comes from `api.github.com/copilot_internal/user`, the endp
 
 ## Updates
 
-Automatic update checks, background downloads, and self-update are disabled in UsageHub builds. The in-app "Check for updates" entry reports that updates are disabled instead of contacting the upstream project, so an unknown upstream release can never replace this install. The dormant updater machinery (integrity checks and trust boundary) is documented in [docs/updater.md](docs/updater.md); it stays dormant until the fork publishes its own release channel.
+The in-app **Check for updates** control checks this fork's latest stable GitHub release. Installing a newer version requires confirmation; the download and replacement helper both verify the GitHub asset's size and SHA-256. Network, metadata, and integrity failures remain errors, never an upstream fallback. There is no UsageHub WinGet listing; recognized WinGet installation paths report that unsupported channel instead of querying the upstream package. See [docs/updater.md](docs/updater.md) for the trust boundary and verification procedure.
 
 ## Data and privacy
 
@@ -131,6 +131,8 @@ status under **Settings > Providers > Accounts**. Missing credentials, expired
 or rejected logins, network failures, HTTP errors, and unexpected usage responses
 have distinct messages. Sign in again using the Claude desktop app or the CLI
 that owns the affected account, then refresh the monitor.
+
+Standard bar summaries show `!` after a failed refresh or for stale cached data rather than presenting the last percentage as current. Cached authoritative figures remain available for diagnosis; a successful refresh clears the error state. A provider window that was not reported shows `--`, not an invented unused allowance.
 
 Open **Diagnostics** in the dashboard and enable recording to inspect or copy
 polling errors. Logging is optional; enable it before reproducing the problem.
@@ -156,9 +158,11 @@ Account management, encrypted undo snapshots, scoped deletion, shared skills, an
 
 ### Accounts
 
+Right-click the bar and choose **Open dashboard**, or open **UsageHub** from Start. Under **Settings → Accounts**, choose Claude Code or Codex. The account-name field and **Add account** button are above the account list. Claude opens its isolated official app for sign-in; additional Codex accounts are CLI profiles, not isolated copies of the Codex desktop app. Each compact account card has a deletion/cleanup review action; paths and advanced controls are under **Details**.
+
 - **Add** creates a managed profile under `%LOCALAPPDATA%\UsageHub\profiles\<provider>\<id>`. A default Claude create is a Desktop account: the owned directory is the Desktop user-data dir with its own nested `claude-config`, matching the isolated layout the old Second account already used. Credentials, config, and history belong to that account only.
 - **Import** adopts an existing directory in place after an absolute-path and ownership check; rename is display-only and never moves the directory.
-- **Open/focus/stop** work with the officially installed app, including registered MSIX Claude packages rather than a similarly named CLI on PATH. Windows open on demand — startup runs the bar only. Managed/custom profiles use their exact command-line marker; the canonical External Default also recognizes the vendor's marker-less launch, excluding sibling profiles and their children. There is no global kill.
+- **Open/focus/stop** use the officially registered apps, not a similarly named CLI on PATH. Canonical Default Claude/Codex use native Windows package activation and keep the vendor icon/identity; additional Claude profiles launch in isolated directories. Additional Codex profiles are CLI-only because the desktop app does not offer the required per-profile isolation. Windows open on demand — startup runs the bar only. Custom profiles use their exact marker; canonical External Default excludes sibling profiles and their children. There is no global kill.
 - **Per-account CLI** runs the provider CLI with that account's environment (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`-style roots, no token export). The bounded console runner accepts an explicit `--timeout-seconds` (1–3600, default 120) before the CLI `--` separator.
 - **Shared skills only**: each account's `skills` entry is wired as a native junction into `%APPDATA%\UsageHub\skills-library` (native mount-point call, never `mklink`). That library is the sole shared state; links are backed up as metadata and removed by inode, never traversing the library.
 - **Widget accounts** update automatically in the built-in classic themes and the imported `left-dock-usage` classic layout. Enabled, pinned profiles occupy provider columns; additional profiles use the overflow chooser when space is limited. Other custom themes remain unchanged unless they opt in with an account row.
@@ -166,6 +170,7 @@ Account management, encrypted undo snapshots, scoped deletion, shared skills, an
 ### Deletion and backups
 
 - Destructive work starts from the read-only `cleanup preview` (every target with ownership, size, and backup coverage) and requires `cleanup apply --confirm <account-id>` in the CLI or a typed confirmation in the dashboard.
+- In the dashboard, deletion opens a separate review with the selected account, read-only preview, and typed stable-id confirmation. Cancel changes nothing. The default is an encrypted seven-day undo snapshot; deleting without a backup is a separate explicit irreversible choice. Canonical External Default is presented as cleanup, not as an ordinary removable managed profile.
 - `cache`, `logout`, `delete`, and `reset` scopes stay distinct. Cache covers only proven regenerable browser caches. Logout removes auth material (credential file, confirmed owned Credential Manager targets, session state). Delete adds account config and history. Reset covers every known user-owned source for the selected account; external Default canonical data requires explicitly selecting that account (a dashboard opt-in, or its id plus matching `--confirm` in the CLI).
 - Logout, account deletion, and full reset verify the default encrypted snapshot before removal (see [Data and privacy](#data-and-privacy)); pure cache cleanup needs none. `--no-backup` is the explicit irreversible path.
 - Standalone `backup create` captures profile metadata, confirmed owned credentials, Desktop `config.json`/`Local State`, the separate CLI home, and launcher metadata. Automatic destructive-cleanup snapshots additionally cover every deletion target, including the complete owned Desktop directory.
@@ -190,15 +195,15 @@ target, so the pinned host toolchain and the target are identical. When upgradin
 Rust, update `rust-toolchain.toml`, `.github/workflows/release.yml`, and the
 `rust-version` in `Cargo.toml` together.
 
-The executable will be created at `target\release\usagehub.exe`, linked with the
+The executable will be created at `target\x86_64-pc-windows-gnullvm\release\usagehub.exe`, linked with the
 self-contained llvm-mingw toolchain documented in
 [docs/build-windows.md](docs/build-windows.md) (toolchain, linker, and `PATH`
 setup, including the `llvm-windres` requirement). The build links the C runtime
 statically, so the executable does not require a separate Microsoft Visual C++
 Redistributable installation; it still uses built-in Windows system libraries.
-This repository does not publish UsageHub releases: the checked-in GitHub release
-workflow still uses upstream asset names and WinGet identifiers and is not
-configured for this toolchain.
+The fork's tag-triggered GitHub release workflow uses an explicit Rust 1.95.0
+MSVC host/target on `windows-latest` and publishes `usagehub.exe`. Local gnullvm
+builds use the separate setup above; no upstream WinGet package is published.
 
 See [dependency security](docs/dependency-security.md) for automated dependency
 updates, CI security checks, and the commands to run those checks locally.

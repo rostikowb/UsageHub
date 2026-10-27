@@ -701,21 +701,60 @@ impl StudioApp {
         let now = SystemTime::now();
         let snapshot_unix = self.manage.last_snapshot_unix;
         ui.separator();
+        ui.weak(language.text(if provider == ProviderId::Claude {
+            "Enter a name, create the account, then sign in in the official Claude window. Do not paste credentials here."
+        } else {
+            "Additional Codex accounts are CLI-only. Desktop isolation is not supported."
+        }));
+        // Add / import: ordinary operations, no confirmation.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(language.text("Account name"));
+            ui.add(
+                crate::ui::components::text_field::singleline(&mut self.manage.new_name)
+                    .desired_width(180.0)
+                    .hint_text(language.text("Account name")),
+            );
+            if ui
+                .add_enabled(
+                    !self.manage_busy() && !self.manage.new_name.trim().is_empty(),
+                    egui::Button::new(language.text("Add account")),
+                )
+                .clicked()
+            {
+                let mut argv = vec![
+                    "create".to_string(),
+                    "--provider".to_string(),
+                    key.to_string(),
+                    "--name".to_string(),
+                    std::mem::take(&mut self.manage.new_name),
+                ];
+                if provider == ProviderId::Codex {
+                    argv.push("--no-open".to_string());
+                }
+                self.spawn_manage(OpKind::Simple, argv);
+            }
+        });
         for profile in &profiles {
             let id = profile.id.clone();
             ui.push_id(format!("manage-card-{key}-{id}"), |ui| {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&profile.name).strong());
-                    ui.weak(format!("id: {id}"));
                 });
                 // Live usage from the monitor cache (server poller only).
                 self.account_usage_lines(ui, provider, profile, language, now, snapshot_unix);
-                // Exact source, never guessed discovery.
-                self.account_source_lines(ui, provider, profile, language);
                 // Ordinary operations: no confirmation.
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button(language.text("Open account")).clicked() {
+                    let desktop_available = provider != ProviderId::Codex
+                        || (id.eq_ignore_ascii_case("default")
+                            && profile.ownership != crate::accounts::AccountOwnership::Managed);
+                    if ui
+                        .add_enabled(
+                            desktop_available,
+                            egui::Button::new(language.text("Open account")),
+                        )
+                        .clicked()
+                    {
                         self.spawn_manage(
                             OpKind::Simple,
                             vec![
@@ -727,7 +766,13 @@ impl StudioApp {
                             ],
                         );
                     }
-                    if ui.button(language.text("Focus window")).clicked() {
+                    if ui
+                        .add_enabled(
+                            desktop_available,
+                            egui::Button::new(language.text("Focus window")),
+                        )
+                        .clicked()
+                    {
                         self.spawn_manage(
                             OpKind::Status {
                                 key: Self::status_key(provider, &id),
@@ -741,259 +786,288 @@ impl StudioApp {
                             ],
                         );
                     }
-                    if ui.button(language.text("Stop account")).clicked() {
-                        self.spawn_manage(
-                            OpKind::Status {
-                                key: Self::status_key(provider, &id),
-                            },
-                            vec![
-                                "stop".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                            ],
-                        );
-                    }
-                    let stop_key = Self::status_key(provider, &id);
-                    if self.manage.confirm_force_stop.as_deref() == Some(&stop_key) {
-                        if ui
-                            .button(language.text("Force stop"))
-                            .on_hover_text(language.text("Force stop"))
-                            .clicked()
-                        {
-                            self.manage.confirm_force_stop = None;
-                            self.spawn_manage(
-                                OpKind::Status { key: stop_key },
-                                vec![
-                                    "stop".to_string(),
-                                    "--provider".to_string(),
-                                    key.to_string(),
-                                    "--id".to_string(),
-                                    id.clone(),
-                                    "--force".to_string(),
-                                ],
-                            );
-                        }
-                        if ui.button(language.text("Cancel")).clicked() {
-                            self.manage.confirm_force_stop = None;
-                        }
-                    } else if ui
-                        .button(format!("{}…", language.text("Force stop")))
+                    let external_default = profile.ownership
+                        != crate::accounts::AccountOwnership::Managed
+                        && id.eq_ignore_ascii_case("default");
+                    let delete_label = if external_default {
+                        "Review Default account cleanup..."
+                    } else if profile.ownership != crate::accounts::AccountOwnership::Managed {
+                        "Review external account cleanup..."
+                    } else {
+                        "Delete account..."
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.manage_busy(),
+                            egui::Button::new(language.text(delete_label)),
+                        )
                         .clicked()
                     {
-                        self.manage.confirm_force_stop = Some(stop_key);
-                    }
-                    if ui.button(language.text("Refresh")).clicked() {
+                        self.manage.cleanup_account = id.clone();
+                        self.manage.cleanup_scope = CleanupScopeSel::LocalData;
+                        self.manage.navigate_cleanup = true;
+                        self.manage.cleanup_preview = None;
+                        self.manage.cleanup_preview_key = None;
+                        self.manage.include_external_default = false;
+                        self.manage.no_backup_ack = false;
+                        self.manage.cleanup_confirm.clear();
+                        let request = current_cleanup_key(&self.manage, key);
                         self.spawn_manage(
-                            OpKind::Status {
-                                key: Self::status_key(provider, &id),
+                            OpKind::CleanupPreview {
+                                key: request.clone(),
                             },
                             vec![
-                                "status".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                            ],
-                        );
-                    }
-                    if ui.button(language.text("Refresh now")).clicked() {
-                        self.spawn_manage(
-                            OpKind::Poll {
-                                key: Self::status_key(provider, &id),
-                            },
-                            vec![
-                                "poll".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--account".to_string(),
-                                id.clone(),
+                                "cleanup".into(),
+                                "preview".into(),
+                                "--provider".into(),
+                                request.provider.clone(),
+                                "--id".into(),
+                                request.account.clone(),
+                                "--scope".into(),
+                                request.scope.cli_name().into(),
                             ],
                         );
                     }
                 });
-                if let Some(line) = self
-                    .manage
-                    .status
-                    .get(&Self::status_key(provider, &id))
-                    .cloned()
-                {
-                    ui.weak(line);
-                }
-                // Rename + pin/order/color: ordinary display edits, no confirmation.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(language.text("Rename account"));
-                    let buffer = self
-                        .manage
-                        .rename
-                        .entry(id.clone())
-                        .or_insert_with(|| profile.name.clone());
-                    ui.add(
-                        crate::ui::components::text_field::singleline(buffer).desired_width(180.0),
-                    );
-                    if ui.button(language.text("Rename account")).clicked() {
-                        let name = self.manage.rename.get(&id).cloned().unwrap_or_default();
-                        self.spawn_manage(
-                            OpKind::Simple,
-                            vec![
-                                "rename".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                                "--name".to_string(),
-                                name,
-                            ],
+                ui.collapsing(
+                    language.text("Account details and advanced actions"),
+                    |ui| {
+                        ui.weak(format!("id: {id}"));
+                        self.account_source_lines(ui, provider, profile, language);
+                        self.account_usage_details(
+                            ui,
+                            provider,
+                            profile,
+                            language,
+                            snapshot_unix,
+                            now,
                         );
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let pinned_label = if profile.pinned {
-                        language.text("Unpin from widget")
-                    } else {
-                        language.text("Pin to widget")
-                    };
-                    if ui.button(pinned_label).clicked() {
-                        self.spawn_manage(
-                            OpKind::Simple,
-                            vec![
-                                "pin".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                                "--value".to_string(),
-                                (!profile.pinned).to_string(),
-                                "--order".to_string(),
-                                profile.sort_order.to_string(),
-                            ],
-                        );
-                    }
-                    ui.label(language.text("Display order"));
-                    let mut order = profile.sort_order;
-                    if crate::ui::components::number_field::NumberField::new(&mut order)
-                        .range(-999..=999)
-                        .speed(1.0)
-                        .show(ui, 90.0)
-                        .changed()
-                    {
-                        self.spawn_manage(
-                            OpKind::Simple,
-                            vec![
-                                "pin".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                                "--value".to_string(),
-                                profile.pinned.to_string(),
-                                "--order".to_string(),
-                                order.to_string(),
-                            ],
-                        );
-                    }
-                    ui.label(language.text("Colour"));
-                    let commit = {
-                        let draft = self
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(language.text("Stop account")).clicked() {
+                                self.spawn_manage(
+                                    OpKind::Status {
+                                        key: Self::status_key(provider, &id),
+                                    },
+                                    vec![
+                                        "stop".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                    ],
+                                );
+                            }
+                            let stop_key = Self::status_key(provider, &id);
+                            if self.manage.confirm_force_stop.as_deref() == Some(&stop_key) {
+                                if ui
+                                    .button(language.text("Force stop"))
+                                    .on_hover_text(language.text("Force stop"))
+                                    .clicked()
+                                {
+                                    self.manage.confirm_force_stop = None;
+                                    self.spawn_manage(
+                                        OpKind::Status { key: stop_key },
+                                        vec![
+                                            "stop".to_string(),
+                                            "--provider".to_string(),
+                                            key.to_string(),
+                                            "--id".to_string(),
+                                            id.clone(),
+                                            "--force".to_string(),
+                                        ],
+                                    );
+                                }
+                                if ui.button(language.text("Cancel")).clicked() {
+                                    self.manage.confirm_force_stop = None;
+                                }
+                            } else if ui
+                                .button(format!("{}…", language.text("Force stop")))
+                                .clicked()
+                            {
+                                self.manage.confirm_force_stop = Some(stop_key);
+                            }
+                            if ui.button(language.text("Check account status")).clicked() {
+                                self.spawn_manage(
+                                    OpKind::Status {
+                                        key: Self::status_key(provider, &id),
+                                    },
+                                    vec![
+                                        "status".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                    ],
+                                );
+                            }
+                            if ui.button(language.text("Refresh usage now")).clicked() {
+                                self.spawn_manage(
+                                    OpKind::Poll {
+                                        key: Self::status_key(provider, &id),
+                                    },
+                                    vec![
+                                        "poll".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--account".to_string(),
+                                        id.clone(),
+                                    ],
+                                );
+                            }
+                        });
+                        if let Some(line) = self
                             .manage
-                            .color_drafts
-                            .entry(id.clone())
-                            .or_insert_with(|| profile.color.clone());
-                        ui.add(
-                            crate::ui::components::text_field::singleline(draft)
-                                .desired_width(90.0),
-                        )
-                        .lost_focus()
-                            && *draft != profile.color
-                    };
-                    if commit {
-                        let color = self
-                            .manage
-                            .color_drafts
-                            .get(&id)
+                            .status
+                            .get(&Self::status_key(provider, &id))
                             .cloned()
-                            .unwrap_or_default();
-                        self.spawn_manage(
-                            OpKind::Simple,
-                            vec![
-                                "pin".to_string(),
-                                "--provider".to_string(),
-                                key.to_string(),
-                                "--id".to_string(),
-                                id.clone(),
-                                "--value".to_string(),
-                                profile.pinned.to_string(),
-                                "--order".to_string(),
-                                profile.sort_order.to_string(),
-                                "--color".to_string(),
-                                color,
-                            ],
-                        );
-                    }
-                });
-                if ui.button(language.text("Delete account...")).clicked() {
-                    self.manage.cleanup_account = id.clone();
-                    self.manage.cleanup_scope = CleanupScopeSel::LocalData;
-                    self.manage.navigate_cleanup = true;
-                    self.manage.cleanup_preview = None;
-                    self.manage.cleanup_preview_key = None;
-                    self.manage.include_external_default = false;
-                    self.manage.no_backup_ack = false;
-                    self.manage.cleanup_confirm.clear();
-                }
+                        {
+                            ui.weak(line);
+                        }
+                        // Rename + pin/order/color: ordinary display edits, no confirmation.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(language.text("Rename account"));
+                            let buffer = self
+                                .manage
+                                .rename
+                                .entry(id.clone())
+                                .or_insert_with(|| profile.name.clone());
+                            ui.add(
+                                crate::ui::components::text_field::singleline(buffer)
+                                    .desired_width(180.0),
+                            );
+                            if ui.button(language.text("Rename account")).clicked() {
+                                let name = self.manage.rename.get(&id).cloned().unwrap_or_default();
+                                self.spawn_manage(
+                                    OpKind::Simple,
+                                    vec![
+                                        "rename".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                        "--name".to_string(),
+                                        name,
+                                    ],
+                                );
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let pinned_label = if profile.pinned {
+                                language.text("Unpin from widget")
+                            } else {
+                                language.text("Pin to widget")
+                            };
+                            if ui.button(pinned_label).clicked() {
+                                self.spawn_manage(
+                                    OpKind::Simple,
+                                    vec![
+                                        "pin".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                        "--value".to_string(),
+                                        (!profile.pinned).to_string(),
+                                        "--order".to_string(),
+                                        profile.sort_order.to_string(),
+                                    ],
+                                );
+                            }
+                            ui.label(language.text("Display order"));
+                            let mut order = profile.sort_order;
+                            if crate::ui::components::number_field::NumberField::new(&mut order)
+                                .range(-999..=999)
+                                .speed(1.0)
+                                .show(ui, 90.0)
+                                .changed()
+                            {
+                                self.spawn_manage(
+                                    OpKind::Simple,
+                                    vec![
+                                        "pin".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                        "--value".to_string(),
+                                        profile.pinned.to_string(),
+                                        "--order".to_string(),
+                                        order.to_string(),
+                                    ],
+                                );
+                            }
+                            ui.label(language.text("Colour"));
+                            let commit = {
+                                let draft = self
+                                    .manage
+                                    .color_drafts
+                                    .entry(id.clone())
+                                    .or_insert_with(|| profile.color.clone());
+                                ui.add(
+                                    crate::ui::components::text_field::singleline(draft)
+                                        .desired_width(90.0),
+                                )
+                                .lost_focus()
+                                    && *draft != profile.color
+                            };
+                            if commit {
+                                let color = self
+                                    .manage
+                                    .color_drafts
+                                    .get(&id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                self.spawn_manage(
+                                    OpKind::Simple,
+                                    vec![
+                                        "pin".to_string(),
+                                        "--provider".to_string(),
+                                        key.to_string(),
+                                        "--id".to_string(),
+                                        id.clone(),
+                                        "--value".to_string(),
+                                        profile.pinned.to_string(),
+                                        "--order".to_string(),
+                                        profile.sort_order.to_string(),
+                                        "--color".to_string(),
+                                        color,
+                                    ],
+                                );
+                            }
+                        });
+                    },
+                );
             });
         }
         ui.separator();
-        // Add / import: ordinary operations, no confirmation.
-        ui.horizontal_wrapped(|ui| {
-            ui.label(language.text("Account name"));
-            ui.add(
-                crate::ui::components::text_field::singleline(&mut self.manage.new_name)
-                    .desired_width(180.0)
-                    .hint_text(language.text("Account name")),
-            );
-            if ui.button(language.text("Add account")).clicked() {
-                let mut argv = vec![
-                    "create".to_string(),
-                    "--provider".to_string(),
-                    key.to_string(),
-                    "--name".to_string(),
-                    std::mem::take(&mut self.manage.new_name),
-                ];
-                if argv[5].trim().is_empty() {
-                    argv.pop();
-                    argv.pop();
+        ui.collapsing(language.text("Import an existing account"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    crate::ui::components::text_field::singleline(&mut self.manage.import_path)
+                        .desired_width(260.0)
+                        .hint_text(language.text("Exact source")),
+                );
+                ui.add(
+                    crate::ui::components::text_field::singleline(&mut self.manage.import_name)
+                        .desired_width(140.0)
+                        .hint_text(language.text("Account name")),
+                );
+                if ui.button(language.text("Import account")).clicked() {
+                    let mut argv = vec![
+                        "import".to_string(),
+                        "--provider".to_string(),
+                        key.to_string(),
+                        "--path".to_string(),
+                        std::mem::take(&mut self.manage.import_path),
+                    ];
+                    let name = std::mem::take(&mut self.manage.import_name);
+                    if !name.trim().is_empty() {
+                        argv.push("--name".to_string());
+                        argv.push(name);
+                    }
+                    self.spawn_manage(OpKind::Simple, argv);
                 }
-                self.spawn_manage(OpKind::Simple, argv);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                crate::ui::components::text_field::singleline(&mut self.manage.import_path)
-                    .desired_width(260.0)
-                    .hint_text(language.text("Exact source")),
-            );
-            ui.add(
-                crate::ui::components::text_field::singleline(&mut self.manage.import_name)
-                    .desired_width(140.0)
-                    .hint_text(language.text("Account name")),
-            );
-            if ui.button(language.text("Import account")).clicked() {
-                let mut argv = vec![
-                    "import".to_string(),
-                    "--provider".to_string(),
-                    key.to_string(),
-                    "--path".to_string(),
-                    std::mem::take(&mut self.manage.import_path),
-                ];
-                let name = std::mem::take(&mut self.manage.import_name);
-                if !name.trim().is_empty() {
-                    argv.push("--name".to_string());
-                    argv.push(name);
-                }
-                self.spawn_manage(OpKind::Simple, argv);
-            }
+            });
         });
     }
 
@@ -1004,7 +1078,7 @@ impl StudioApp {
         profile: &crate::accounts::AccountProfile,
         language: LanguageId,
         now: SystemTime,
-        snapshot_unix: Option<u64>,
+        _snapshot_unix: Option<u64>,
     ) {
         let account = self.usage.as_ref().and_then(|usage| {
             usage.accounts.iter().find(|candidate| {
@@ -1026,16 +1100,47 @@ impl StudioApp {
                 ui.weak(language.text("Last known usage"));
             }
             for (label, section) in [("Session", &usage.session), ("Weekly", &usage.weekly)] {
-                if let Some(line) = reset_display(language, language.text(label), section, now) {
+                if let Some(line) = reset_display(
+                    language,
+                    &format!("{} ({})", language.text(label), language.text("Used")),
+                    section,
+                    now,
+                ) {
                     ui.label(line);
                 }
             }
             if let Some(monthly) = &usage.monthly {
-                if let Some(line) = reset_display(language, language.text("Monthly"), monthly, now)
-                {
+                if let Some(line) = reset_display(
+                    language,
+                    &format!("{} ({})", language.text("Monthly"), language.text("Used")),
+                    monthly,
+                    now,
+                ) {
                     ui.label(line);
                 }
             }
+        } else if account.error.is_none() {
+            ui.weak(language.text("Waiting for usage"));
+        }
+    }
+
+    fn account_usage_details(
+        &self,
+        ui: &mut egui::Ui,
+        provider: ProviderId,
+        profile: &crate::accounts::AccountProfile,
+        language: LanguageId,
+        snapshot_unix: Option<u64>,
+        now: SystemTime,
+    ) {
+        let Some(account) = self.usage.as_ref().and_then(|usage| {
+            usage.accounts.iter().find(|candidate| {
+                candidate.provider == provider && candidate.profile.same_source(profile)
+            })
+        }) else {
+            return;
+        };
+        if let Some(usage) = &account.usage {
             if let Some(credits) = &usage.credits {
                 ui.label(format!(
                     "{}: {:.0}%",
@@ -1067,8 +1172,6 @@ impl StudioApp {
                 ));
             }
             ui.weak(provenance);
-        } else if account.error.is_none() {
-            ui.weak(language.text("Waiting for usage"));
         }
     }
 
@@ -1094,11 +1197,27 @@ impl StudioApp {
 
     fn cleanup_ui(&mut self, ui: &mut egui::Ui, provider: ProviderId, language: LanguageId) {
         let key = Self::provider_key(provider);
-        let navigate = std::mem::take(&mut self.manage.navigate_cleanup);
-        let panel = egui::CollapsingHeader::new(language.text("Deletion preview"))
-            .id_salt(("cleanup-preview", key))
-            .open(navigate.then_some(true))
-            .show(ui, |ui| {
+        if !self.manage.navigate_cleanup {
+            return;
+        }
+        let mut open = true;
+        let mut cancel = false;
+        egui::Window::new(language.text("Deletion preview"))
+            .id(egui::Id::new(("cleanup-preview", key)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .max_height((ui.ctx().content_rect().height() - 40.0).max(240.0))
+            .vscroll(true)
+            .show(ui.ctx(), |ui| {
+            ui.weak(language.text("Review the selected account and scope. Nothing is deleted until you confirm."));
+            if let Some(error) = &self.manage.error {
+                ui.colored_label(egui::Color32::from_rgb(196, 64, 64), error);
+            }
+            if self.manage_busy() {
+                ui.weak(language.text("Operation running..."));
+            }
             let ids: Vec<String> = self
                 .settings
                 .accounts
@@ -1163,6 +1282,9 @@ impl StudioApp {
                     profile.ownership != crate::accounts::AccountOwnership::Managed
                         && profile.id.eq_ignore_ascii_case("default")
                 });
+            if is_external_default {
+                ui.weak(language.text("Default uses external canonical data. It is not a removable managed account; full reset requires explicit opt-in."));
+            }
             // The CLI takes no safety flag for canonical data, so the UI
             // blocks an unchecked external-Default full reset outright.
             let blocked = external_default_reset_blocked(
@@ -1204,7 +1326,7 @@ impl StudioApp {
                 // account; the GUI never pre-creates a backup before stop.
                 // Only an explicit irreversible delete skips the snapshot.
                 // Manual backups remain an inventory action.
-                if scope != CleanupScopeSel::Cache && !no_backup {
+                if scope != CleanupScopeSel::Cache {
                     ui.checkbox(
                         &mut self.manage.no_backup_ack,
                         language.text(
@@ -1212,6 +1334,7 @@ impl StudioApp {
                         ),
                     );
                 }
+                let no_backup = self.manage.no_backup_ack;
                 ui.horizontal_wrapped(|ui| {
                     ui.label(language.text("Type the account id to confirm"));
                     ui.add(
@@ -1232,7 +1355,7 @@ impl StudioApp {
                             &bound.as_ref().map(|bound| bound.account.clone()).unwrap_or_default(),
                         );
                     if ui
-                        .add_enabled(ready && !self.manage_busy(), egui::Button::new(language.text("Delete...")))
+                        .add_enabled(ready && !self.manage_busy(), egui::Button::new(language.text("Apply reviewed cleanup")))
                         .clicked()
                     {
                         let Some(bound) = bound.filter(|bound| *bound == current_key) else {
@@ -1254,12 +1377,21 @@ impl StudioApp {
                             argv.push("--no-backup".to_string());
                         }
                         self.spawn_manage(OpKind::CleanupApply, argv);
+                        self.manage.navigate_cleanup = false;
                     }
                 });
             }
+            if ui.button(language.text("Cancel")).clicked() {
+                cancel = true;
+            }
         });
-        if navigate {
-            panel.header_response.scroll_to_me(Some(egui::Align::Min));
+        if !open || cancel || !self.manage.navigate_cleanup {
+            self.manage.navigate_cleanup = false;
+            self.manage.cleanup_account.clear();
+            self.manage.cleanup_preview = None;
+            self.manage.cleanup_preview_key = None;
+            self.manage.cleanup_confirm.clear();
+            self.manage.no_backup_ack = false;
         }
     }
 
@@ -1321,32 +1453,36 @@ impl StudioApp {
             .iter()
             .filter_map(|t| t.get("size_bytes").and_then(|s| s.as_u64()))
             .sum();
-        ui.label(format!(
-            "{} ({} · {})",
-            language.text("Deletion preview"),
-            targets.len(),
-            human_bytes(bytes)
-        ));
-        for target in targets.iter().take(64) {
-            let owned = target
-                .get("owned")
-                .and_then(|o| o.as_bool())
-                .unwrap_or(false);
-            let mark = if owned { "[x]" } else { "[ ]" };
-            ui.weak(format!(
-                "{mark} {} · {} · {}",
-                str_field(target, "path"),
-                str_field(target, "kind"),
-                target
-                    .get("size_bytes")
-                    .and_then(|s| s.as_u64())
-                    .map(human_bytes)
-                    .unwrap_or_default(),
-            ));
-        }
-        if targets.len() > 64 {
-            ui.weak(format!("… +{}", targets.len() - 64));
-        }
+        ui.collapsing(
+            format!(
+                "{} ({} · {})",
+                language.text("Files in deletion preview"),
+                targets.len(),
+                human_bytes(bytes)
+            ),
+            |ui| {
+                for target in targets.iter().take(64) {
+                    let owned = target
+                        .get("owned")
+                        .and_then(|o| o.as_bool())
+                        .unwrap_or(false);
+                    let mark = if owned { "[x]" } else { "[ ]" };
+                    ui.weak(format!(
+                        "{mark} {} · {} · {}",
+                        str_field(target, "path"),
+                        str_field(target, "kind"),
+                        target
+                            .get("size_bytes")
+                            .and_then(|s| s.as_u64())
+                            .map(human_bytes)
+                            .unwrap_or_default(),
+                    ));
+                }
+                if targets.len() > 64 {
+                    ui.weak(format!("… +{}", targets.len() - 64));
+                }
+            },
+        );
     }
 
     fn backups_ui(&mut self, ui: &mut egui::Ui, provider: ProviderId, language: LanguageId) {

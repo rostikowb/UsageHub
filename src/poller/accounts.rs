@@ -491,12 +491,21 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         settings.claude.profiles.truncate(1);
-        settings.claude.selected = "personal".into();
+        // Named guards are shared with the running application and keyed by
+        // provider and stable id, not by the configured source path.
+        settings.claude.profiles[0].id = format!("poll_progress_{}_claude", std::process::id());
+        settings.claude.selected = settings.claude.profiles[0].id.clone();
+        settings.codex.profiles[0].id = format!("poll_progress_{}_codex", std::process::id());
+        settings.codex.selected = settings.codex.profiles[0].id.clone();
         settings.codex.profiles[0].config_dir = "C:\\account-tests\\codex".into();
+        let (started, started_wait) = std::sync::mpsc::channel();
+        let started_wait = std::sync::Mutex::new(started_wait);
         let (release, wait) = std::sync::mpsc::channel();
         let wait = std::sync::Mutex::new(wait);
         let mut visible = AppUsageData::default();
         let mut order = Vec::new();
+        let mut errors = Vec::new();
+        let mut fast_snapshot = None;
         let final_data = poll_accounts_with_progress(
             ProviderSet::from_enabled([ProviderId::Claude, ProviderId::Codex]),
             &settings,
@@ -504,25 +513,45 @@ mod tests {
             false,
             |target| {
                 if target.provider == ProviderId::Claude {
+                    started.send(()).unwrap();
                     wait.lock()
                         .unwrap()
                         .recv_timeout(Duration::from_secs(5))
-                        .unwrap();
+                        .expect("Claude was not released by the progress callback");
+                } else {
+                    started_wait
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("Claude did not start");
                 }
                 Ok(usage(42.0))
             },
             |update| {
-                let provider = update.accounts[0].provider;
+                let account = &update.accounts[0];
+                let provider = account.provider;
+                if let Some(error) = account.error {
+                    errors.push((provider, error));
+                    // A skipped Claude job cannot signal that it started.
+                    // Unblock the other worker so the error is reported below.
+                    let _ = started.send(());
+                }
                 order.push(provider);
                 visible = merge_poll_progress(update, &visible, &settings);
                 if provider == ProviderId::Codex {
-                    assert!(visible.get(ProviderId::Codex).is_some());
-                    assert!(visible.get(ProviderId::Claude).is_none());
-                    release.send(()).unwrap();
+                    fast_snapshot = Some((
+                        visible.get(ProviderId::Codex).is_some(),
+                        visible.get(ProviderId::Claude).is_some(),
+                    ));
                 }
+                // Release before asserting, including on a busy/error update,
+                // so a failed assertion never strands the scoped worker.
+                let _ = release.send(());
             },
         )
         .unwrap();
+        assert!(errors.is_empty(), "account polls failed: {errors:?}");
+        assert_eq!(fast_snapshot, Some((true, false)));
         assert_eq!(order, [ProviderId::Codex, ProviderId::Claude]);
         for provider in [ProviderId::Claude, ProviderId::Codex] {
             assert_eq!(visible.get(provider), final_data.get(provider));

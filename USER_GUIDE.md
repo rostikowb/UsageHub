@@ -1,6 +1,6 @@
 # User guide
 
-Start here to customise Claude Code Usage Monitor and adjust its everyday settings.
+Start here to customise UsageHub and adjust its everyday settings.
 For installation and provider sign-in requirements, see the [README](README.md).
 The instructions below use the app's English labels.
 
@@ -21,11 +21,16 @@ menu beside the clock.
 You can also open the dashboard from PowerShell:
 
 ```powershell
-claude-code-usage-monitor --dashboard
+usagehub --dashboard
 ```
 
-For a portable download, run `.\claude-code-usage-monitor.exe --dashboard` from
+For a portable download, run `.\usagehub.exe --dashboard` from
 the folder containing the executable.
+
+The Start menu shortcut uses `--dashboard` to connect settings to the resident
+bar, including its update control. `--studio` is the standalone editor entry.
+For adding accounts and reviewing deletion with encrypted seven-day undo, see
+[Accounts and data safety](README.md#accounts-and-data-safety).
 
 ## Duplicate and customise a built-in theme
 
@@ -163,6 +168,14 @@ Cached limits follow the existing stale-data behaviour; check `claude.stale`
 (or the account's `.stale`) when freshness matters.
 
 ## Windows VM testing for developers
+
+The VM recipes below are inherited **upstream lab documentation**, including
+its original executable and WinGet package identifiers. They are not a
+UsageHub release channel or evidence of this fork's VM coverage. For this
+fork's supported build and updater verification, use
+[Windows build setup](docs/build-windows.md) and
+[Updater verification](docs/updater.md). UsageHub has no WinGet listing.
+
 
 Run this harness locally on a developer machine with Hyper-V. The scripts live in
 `tests/windows-vm/`. The harness provisions two disposable guests and runs desktop

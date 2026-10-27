@@ -1,17 +1,20 @@
 # Updater verification
 
-Update checks use the running executable's installation channel. Standalone
-executables query GitHub only; executables in the recognized WinGet package
-directories query only the `winget` source with `winget show --versions`.
-WinGet checks offer the newest published stable version newer than the running
-version, even when GitHub has a later release. An equal or older source version
-means the installation is up to date. Source failures remain errors and never
-trigger a fallback to the other channel. WinGet upgrades use that same source.
+Portable UsageHub builds query only
+`https://api.github.com/repos/rostikowb/UsageHub/releases/latest`, using the
+repository compiled into `Cargo.toml`. The in-app check offers newer stable
+versions; an equal or older release is up to date. Installing an available
+release requires confirmation. GitHub/network/metadata errors remain errors;
+there is no fallback to CodeZeno's repository or binary.
 
-The portable updater accepts only the exact `claude-code-usage-monitor.exe`
-asset from the configured repository's latest stable GitHub release. It rejects
-duplicate assets, unexpected download URLs, invalid semantic versions, drafts,
-and prereleases (including prerelease tags incorrectly marked as stable).
+There is no UsageHub WinGet listing. Executables in recognized WinGet package
+directories report that unsupported channel instead of querying or upgrading
+the upstream package.
+
+The portable updater accepts only the exact `usagehub.exe` asset from this
+fork's latest stable release. It rejects duplicate assets, foreign or upstream
+download URLs, invalid semantic versions, drafts, and prereleases (including
+prerelease tags incorrectly marked as stable).
 Version precedence follows SemVer: `2.14.0-beta1` is below `2.14.0`, and build
 metadata does not affect ordering.
 
@@ -39,8 +42,7 @@ Code already running as the same Windows user is outside this trust boundary.
 GitHub computes asset digests for uploaded release assets; see the
 [GitHub release asset API](https://docs.github.com/en/rest/releases/assets).
 Releases without a digest cannot be installed through the portable updater.
-The release workflow does not need a separate checksum upload. WinGet continues
-to perform installation through its own upgrade command.
+The fork's release workflow does not need a separate checksum upload.
 
 ## Tests
 
@@ -49,6 +51,23 @@ SemVer precedence, streamed size limits, known SHA-256 vectors, corrupt and
 truncated bodies, interrupted and failed I/O, partial-file cleanup, helper
 arguments, and Windows file locking. Tests do not download or execute updates.
 The release workflow runs these tests before building a release.
-Channel tests also cover source isolation, WinGet version parsing, and source
-errors. To verify the live WinGet listing without installing an update, run
-`cargo test --locked winget_lists_published_versions_from_the_live_source -- --ignored`.
+Channel tests cover own-fork source isolation and source errors, including the
+unsupported WinGet path. A live check requires a published stable UsageHub
+release with its executable asset; the old fork build with updates disabled
+must be replaced manually once.
+
+## Release and live smoke
+
+Publish only `usagehub.exe` at a matching stable version tag in
+`rostikowb/UsageHub`, never profiles, tokens, settings, logs, or backups. The
+tag workflow uses explicit MSVC host/target settings on `windows-latest`; a
+manual local release uses the documented gnullvm build. Do not silently
+replace an already-published asset with a different build.
+
+After publishing, compare the API asset's nonzero `size` and `sha256:` `digest`
+with the built executable. Run the installed same-version app and use **Check
+for updates**: it should report up to date, not disabled or a missing release.
+This proves the live metadata/check path, not a full version-to-version
+replacement; exercise the latter on a disposable owned installation before
+claiming it. Normal shutdown requests close the existing dashboard before the
+helper replaces the mapped executable.

@@ -753,16 +753,6 @@ fn manage_accounts_chip(row_id: &str) -> SceneObject {
 /// column widths so nothing is clipped.
 fn expand_builtin_theme(theme: &ThemeDocument, layout: &AccountLayout) -> ThemeDocument {
     let by_provider = grouped_cards(layout);
-    let needs_work = !layout.overflow.is_empty()
-        || ACCOUNT_CARD_PROVIDERS
-            .iter()
-            .any(|provider| !by_provider.contains_key(provider))
-        || by_provider
-            .values()
-            .any(|cards| cards.len() >= 2 || (cards.len() == 1 && !cards[0].selected));
-    if !needs_work {
-        return theme.clone();
-    }
     let mut expanded = theme.clone();
     for surface in &mut expanded.surfaces {
         // Row containers whose children gate on `providers.<key>.enabled`.
@@ -812,9 +802,14 @@ fn expand_builtin_theme(theme: &ThemeDocument, layout: &AccountLayout) -> ThemeD
                 if cards.is_empty() {
                     continue;
                 }
-                // Single pinned + selected: the legacy provider slot already
-                // shows exactly this card, so leave it pixel-identical.
+                // Keep the selected account's original bindings and geometry.
+                // An authored click remains authoritative for this lone slot.
                 if cards.len() == 1 && cards[0].selected {
+                    let first = &mut surface.children[group_index];
+                    let events = first.mouse_events.get_or_insert_with(MouseEvents::default);
+                    if events.click.trim().is_empty() {
+                        events.click = format!("open_account(\"{key}\", \"{}\")", cards[0].id);
+                    }
                     continue;
                 }
                 let template = surface.children[group_index].clone();
@@ -1241,6 +1236,54 @@ mod tests {
     }
 
     #[test]
+    fn selected_slot_click_opens_its_account_without_changing_bindings() {
+        let settings = pinned_settings(&["default"]);
+        let data = data_with_selection(&[("default", true)]);
+        let layout = layout_accounts(&visible_account_cards(&settings, Some(&data)), 2000.0);
+        let original = builtin_like_theme();
+        let expanded = expand_theme_for_accounts(&original, &layout);
+        let runtime = ThemeRuntime::new(true, false, false);
+        let target = hit_test_mouse_event(&expanded, 0, 10.0, 10.0, Some(&data), runtime).unwrap();
+        let source = mouse_event_script(&expanded, 0, &target, MouseEventKind::Click).unwrap();
+        let effects = execute_mouse_actions(
+            &expanded,
+            0,
+            &target,
+            source,
+            Some(&data),
+            runtime,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            effects,
+            vec![MouseActionEffect::OpenAccount {
+                provider: "claude".into(),
+                id: "default".into(),
+            }]
+        );
+        assert_eq!(
+            session_values(&expanded.surfaces[0]),
+            session_values(&original.surfaces[0])
+        );
+        assert_eq!(expanded.surfaces[0].width, original.surfaces[0].width);
+
+        let mut authored = original;
+        authored.surfaces[0].children[1].mouse_events = Some(MouseEvents {
+            click: "show_dashboard()".into(),
+            right_click: "show_dashboard()".into(),
+            ..Default::default()
+        });
+        let expanded = expand_theme_for_accounts(&authored, &layout);
+        let events = expanded.surfaces[0].children[1]
+            .mouse_events
+            .as_ref()
+            .unwrap();
+        assert_eq!(events.click, "show_dashboard()");
+        assert_eq!(events.right_click, "show_dashboard()");
+    }
+
+    #[test]
     fn single_pinned_non_selected_shows_own_limits() {
         let settings = pinned_settings(&["second"]);
         // Registry selection still points at Default; the lone pin must show
@@ -1360,6 +1403,71 @@ mod tests {
             ]
         );
         assert_eq!(columns[0].width.0, theme.surfaces[0].children[1].width.0);
+    }
+
+    #[test]
+    fn imported_classic_codex_descendant_hit_opens_codex_not_surface() {
+        let mut theme = builtin_like_theme();
+        theme.id = "left-dock-usage".into();
+        let surface = &mut theme.surfaces[0];
+        surface.mouse_events = Some(MouseEvents {
+            right_click: "show_context_menu(\"classic-v1\")".into(),
+            ..Default::default()
+        });
+        let mut second = surface.children[1].clone();
+        second.id = "second-provider".into();
+        let mut codex = surface.children[1].clone();
+        codex.id = "codex-provider".into();
+        codex.render = Expression("providers.codex.enabled".into());
+        let mut codex_child = surface.children[2].clone();
+        codex_child.id = "codex-segments".into();
+        codex_child.parent = Some(codex.id.clone());
+        surface.children.extend([second, codex, codex_child]);
+        let mut settings = pinned_settings(&["first", "second"]);
+        settings.codex = pinned_settings(&["codex-slot"]).claude;
+        let layout = layout_accounts(&visible_account_cards(&settings, None), 2000.0);
+        let expanded = expand_theme_for_accounts(&theme, &layout);
+        let runtime = ThemeRuntime::new(true, true, false);
+        let surface = &expanded.surfaces[0];
+        let index = surface
+            .children
+            .iter()
+            .position(|child| child.id.starts_with("usagehub-classic-codex-codex-slot--"))
+            .unwrap();
+        let (x, y, width, height) =
+            resolve_object_bounds_with_runtime(&expanded, 0, index, None, runtime).unwrap();
+        let target = hit_test_mouse_event(
+            &expanded,
+            0,
+            x + width / 2.0,
+            y + height / 2.0,
+            None,
+            runtime,
+        )
+        .unwrap();
+        assert_eq!(target, "usagehub-classic-codex-codex-slot");
+        let source = mouse_event_script(&expanded, 0, &target, MouseEventKind::Click).unwrap();
+        let effects = execute_mouse_actions(
+            &expanded,
+            0,
+            &target,
+            source,
+            None,
+            runtime,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            effects,
+            vec![MouseActionEffect::OpenAccount {
+                provider: "codex".into(),
+                id: "codex-slot".into(),
+            }]
+        );
+        assert_eq!(
+            surface.mouse_events.as_ref().unwrap().right_click,
+            "show_context_menu(\"classic-v1\")"
+        );
     }
 
     #[test]

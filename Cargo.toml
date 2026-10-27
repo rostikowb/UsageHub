@@ -1,14 +1,11 @@
 [package]
 name = "usagehub"
-version = "2.22.4"
+version = "2.22.5"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
 description = "UsageHub"
-# Fork: no published fork remote yet. `repository` still points at the
-# upstream source for provenance; automatic updates are disabled (see
-# src/updater.rs) so the updater can never pull an upstream build.
-repository = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor"
+repository = "https://github.com/rostikowb/UsageHub"
 
 [package.metadata.winresource]
 CompanyName = "UsageHub"

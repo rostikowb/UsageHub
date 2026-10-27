@@ -669,6 +669,24 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_limit_reached_does_not_invent_a_spent_window() {
+        // The flag says some window is exhausted, not which one. Preserve
+        // each actual window instead of manufacturing 100% from the flag.
+        let data = usage_from_json(
+            r#"{
+                "rate_limit": {
+                    "limit_reached": true,
+                    "primary_window": {"used_percent": 73, "limit_window_seconds": 18000, "reset_at": 1787100000},
+                    "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1787198224}
+                }
+            }"#,
+        );
+        assert_eq!(data.session.percentage, 73.0);
+        assert_eq!(data.weekly.percentage, 100.0);
+        assert!(data.session.available && data.weekly.available);
+    }
+
+    #[test]
     fn windows_are_assigned_by_length_regardless_of_slot_order() {
         let data = usage_from_json(
             r#"{

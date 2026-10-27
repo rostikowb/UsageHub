@@ -405,9 +405,12 @@ pub(super) unsafe extern "system" fn wnd_proc(
         }
         WM_RBUTTONUP => {
             widget_tooltip::hide();
-            if let Some((surface, object)) = mouse_target_at(hwnd, lparam) {
-                let _ = dispatch_mouse_event(surface, &object, MouseEventKind::RightClick);
-            }
+            dispatch_surface_context_menu(hwnd, mouse_target_at(hwnd, lparam));
+            LRESULT(0)
+        }
+        WM_CONTEXTMENU if lparam.0 == -1 => {
+            widget_tooltip::hide();
+            dispatch_keyboard_context_menu(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {

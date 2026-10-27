@@ -195,6 +195,66 @@ fn named_account_bindings_show_independent_usage_and_errors() {
 }
 
 #[test]
+fn codex_summary_marks_carried_usage_unavailable_and_recovers() {
+    use crate::accounts::{AccountProfile, AccountSettings};
+    use crate::models::{AccountUsage, UsageData, UsageSection};
+    let profile = AccountProfile {
+        id: "default".into(),
+        ..Default::default()
+    };
+    let mut settings = AccountSettings::default();
+    settings.codex.profiles = vec![profile.clone()];
+    settings.codex.selected = profile.id.clone();
+    let mut data = AppUsageData::default();
+    data.accounts.push(AccountUsage {
+        provider: ProviderId::Codex,
+        profile,
+        source_signature: "fixture".into(),
+        source_path: None,
+        selected: false,
+        usage: Some(UsageData {
+            weekly: UsageSection {
+                available: true,
+                percentage: 73.0,
+                resets_at: None,
+            },
+            ..Default::default()
+        }),
+        error: None,
+    });
+    data.select_accounts(&settings);
+    let render = |data: &AppUsageData| {
+        let context = DataContext::from_usage_with_runtime(
+            Some(data),
+            &Canvas::default(),
+            ThemeRuntime::default().with_countdown(true),
+        );
+        (
+            format_template("{codex.weekly.display:usage_line}", &context),
+            format_template(
+                "{accounts.codex.default.weekly.display:usage_badge}",
+                &context,
+            ),
+            format_template("{codex.five_hour.display:usage_line}", &context),
+        )
+    };
+    assert_eq!(render(&data), ("27%".into(), "27%".into(), "--".into()));
+    data.accounts[0].usage.as_mut().unwrap().stale = true;
+    data.accounts[0].error = Some(crate::poller::PollError::RequestFailed);
+    data.select_accounts(&settings);
+    assert_eq!(render(&data), ("!".into(), "!".into(), "!".into()));
+    assert_eq!(
+        data.accounts[0].usage.as_ref().unwrap().weekly.percentage,
+        73.0
+    );
+    data.accounts[0].usage.as_mut().unwrap().stale = false;
+    data.accounts[0].usage.as_mut().unwrap().weekly.percentage = 100.0;
+    data.accounts[0].error = None;
+    data.select_accounts(&settings);
+    assert_eq!(render(&data), ("0%".into(), "0%".into(), "--".into()));
+}
+
+#[test]
 fn managed_asset_paths_stay_inside_the_asset_directory() {
     assert_eq!(managed_asset_file_name("assets/logo.png"), Some("logo.png"));
     assert_eq!(managed_asset_file_name("logo.png"), None);

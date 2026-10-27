@@ -1,21 +1,25 @@
 //! Launches and focuses the single GPU-rendered dashboard process.
 
+use std::os::windows::ffi::OsStrExt;
 use std::time::Duration;
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
-    INFINITE,
+    CreateEventW, CreateMutexW, OpenEventW, OpenProcess, QueryFullProcessImageNameW, SetEvent,
+    WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetClassNameW, GetWindowThreadProcessId, IsWindow, MessageBoxW, PostMessageW,
     SetForegroundWindow, ShowWindowAsync, MB_ICONERROR, MB_OK, SW_RESTORE, WM_CLOSE,
 };
 
-const DASHBOARD_TITLE: &str = "UsageHub Dashboard";
+const DASHBOARD_TITLE: &str = "UsageHub";
+const DASHBOARD_CLASS: &str = "Window Class";
 const DASHBOARD_MUTEX: &str = "Local\\UsageHubDashboard";
 const DASHBOARD_REQUEST_EVENT: &str = "Local\\UsageHubOpenDashboard";
 
@@ -164,6 +168,7 @@ pub fn claim_instance() -> Result<Option<HANDLE>, String> {
                 )
             })?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
             focus_existing();
             Ok(None)
         } else {
@@ -246,12 +251,43 @@ pub fn report_launch_failure(owner: HWND, detail: &str) {
     }
 }
 
-pub fn focus_existing() -> bool {
+/// Match the real winit dashboard, not the same-titled hidden bar controller.
+/// Checking the image also prevents focusing/closing another app's window.
+fn existing_dashboard_window() -> Option<HWND> {
+    let class = crate::native_interop::wide_str(DASHBOARD_CLASS);
     let title = crate::native_interop::wide_str(DASHBOARD_TITLE);
+    let expected: Vec<u16> = std::env::current_exe()
+        .ok()?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let mut image = vec![0u16; expected.len() + 1];
     unsafe {
-        let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR::from_raw(title.as_ptr())) else {
-            return false;
-        };
+        let hwnd = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr())).ok()?;
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut length = image.len() as u32;
+        let queried = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(image.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(process);
+        if queried.is_err() {
+            return None;
+        }
+        (CompareStringOrdinal(&expected, &image[..length as usize], true) == CSTR_EQUAL)
+            .then_some(hwnd)
+    }
+}
+
+pub fn focus_existing() -> bool {
+    let Some(hwnd) = existing_dashboard_window() else {
+        return false;
+    };
+    unsafe {
         // The dashboard runs on another UI thread/process. Do not block the
         // monitor (and its taskbar host) if that thread is busy or unresponsive.
         let _ = ShowWindowAsync(hwnd, SW_RESTORE);
@@ -261,13 +297,10 @@ pub fn focus_existing() -> bool {
 }
 
 pub fn close_existing() -> bool {
-    let title = crate::native_interop::wide_str(DASHBOARD_TITLE);
-    unsafe {
-        let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR::from_raw(title.as_ptr())) else {
-            return false;
-        };
-        PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok()
-    }
+    let Some(hwnd) = existing_dashboard_window() else {
+        return false;
+    };
+    unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 pub fn toggle(owner: HWND) {

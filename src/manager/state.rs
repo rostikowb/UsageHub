@@ -108,8 +108,14 @@ impl AccountOperationGuard {
                 }
             })
             .collect();
+        // Test fixtures use their own roots and must not block a real bar's
+        // Default account. Keep contention between test threads intact.
+        #[cfg(test)]
+        let namespace = format!("Local\\UsageHubTest{}_Account", std::process::id());
+        #[cfg(not(test))]
+        let namespace = "Local\\UsageHubAccount";
         let name = format!(
-            "Local\\UsageHubAccount_{}_{}",
+            "{namespace}_{}_{}",
             provider.descriptor().key,
             safe
         );

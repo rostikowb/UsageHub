@@ -237,21 +237,7 @@ const TASKBAR_IDENTITIES_INTERVAL_MS: u32 = 20_000;
 /// flows to the overflow account chooser — the bar can never cover Start or
 /// pinned icons because of one more account.
 fn account_bar_budget(state: &AppState) -> f64 {
-    let fallback = theme_engine::account_layout::ACCOUNT_MAX_WIDTH_FALLBACK;
-    let taskbars = native_interop::find_taskbars();
-    let taskbar = taskbars
-        .get(state.taskbar_index)
-        .or_else(|| taskbars.first());
-    let Some(rect) = taskbar.map(|taskbar| taskbar.rect) else {
-        return fallback;
-    };
-    let length = if native_interop::is_taskbar_horizontal(rect) {
-        rect.right - rect.left
-    } else {
-        rect.bottom - rect.top
-    } as f64
-        / display_scale(state.taskbar_index.max(0));
-    (length * 0.5).clamp(220.0, 560.0)
+    host_geometry::account_bar_budget(state.taskbar_index)
 }
 
 fn language_menu_command_id(language: LanguageId) -> u16 {
@@ -2375,9 +2361,12 @@ unsafe extern "system" fn mirror_wnd_proc(
         }
         WM_RBUTTONUP => {
             widget_tooltip::hide();
-            if let Some((surface, object)) = mouse_target_at(hwnd, lparam) {
-                let _ = dispatch_mouse_event(surface, &object, MouseEventKind::RightClick);
-            }
+            dispatch_surface_context_menu(hwnd, mouse_target_at(hwnd, lparam));
+            LRESULT(0)
+        }
+        WM_CONTEXTMENU if lparam.0 == -1 => {
+            widget_tooltip::hide();
+            dispatch_keyboard_context_menu(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {

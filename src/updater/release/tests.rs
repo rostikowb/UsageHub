@@ -1,6 +1,11 @@
 use super::*;
 use serde_json::{json, Value};
 
+#[test]
+fn update_repository_is_the_usagehub_fork() {
+    assert_eq!(github_repo().unwrap(), ("rostikowb", "UsageHub"));
+}
+
 fn fixture(tag: &str) -> Value {
     let (owner, repo) = github_repo().unwrap();
     json!({
@@ -212,7 +217,7 @@ fn malformed_versions_are_errors() {
 fn fork_never_accepts_the_upstream_executable() {
     // The upstream project ships `claude-code-usage-monitor.exe`; this fork
     // only installs `usagehub.exe`, so an upstream asset can never pass the
-    // exact-name gate even if update checks are re-enabled for the fork.
+    // exact-name gate.
     let mut value = fixture("v2.14.0");
     value["assets"][0]["name"] = json!("claude-code-usage-monitor.exe");
     value["assets"][0]["browser_download_url"] = json!(

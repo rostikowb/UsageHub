@@ -8,8 +8,8 @@
 //! - Child processes get an explicit environment (`CLAUDE_CONFIG_DIR` /
 //!   `CODEX_HOME`, `TEMP`/`TMP`, nonessential-traffic opt-outs). The parent
 //!   process environment is never mutated.
-//! - Stop/focus/status only ever touch processes whose command line carries
-//!   this account's user-data marker. There is no global process kill.
+//! - Stop/focus/status attribute managed processes by account marker and
+//!   canonical defaults by installed image and default data roots; never kill globally.
 //! - A hidden window (tray-minimized, `X`-to-tray) is reported as hidden, not
 //!   as stopped. `running` is derived from live PIDs, never from visibility.
 //! - Process attribution runs through [`live_process_snapshot`]: ONE native
@@ -23,15 +23,15 @@
 //!   attribution set, never to guessing another account's processes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::{Interface as _, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    HWND, LPARAM, PROPERTYKEY, WPARAM, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, PROPERTYKEY, WPARAM,
 };
 use windows::Win32::Storage::EnhancedStorage::{
     PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand,
@@ -44,7 +44,7 @@ use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -55,17 +55,20 @@ use windows::Win32::System::Registry::{
     KEY_READ,
 };
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, TerminateProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::{
     IPropertyStore, SHGetPropertyStoreForWindow, SHGetPropertyStoreFromParsingName, GPS_READWRITE,
 };
-use windows::Win32::UI::Shell::{IShellLinkW, SHStrDupW, ShellLink};
+use windows::Win32::UI::Shell::{
+    ApplicationActivationManager, IApplicationActivationManager, IShellLinkW, SHStrDupW, ShellLink,
+    AO_NONE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, SW_RESTORE, WM_CLOSE,
+    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, ShowWindowAsync, SW_RESTORE, WM_CLOSE,
 };
 
 use crate::accounts::AccountProfile;
@@ -95,13 +98,13 @@ pub const COMMAND_LINE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 fn wanted_image_names(provider: ProviderId) -> &'static [&'static str] {
     match provider {
         ProviderId::Claude => &["claude.exe"],
-        ProviderId::Codex => &["codex.exe"],
+        ProviderId::Codex => &["codex.exe", "chatgpt.exe"],
         _ => &[],
     }
 }
 
 fn all_wanted_image_names() -> &'static [&'static str] {
-    &["claude.exe", "codex.exe"]
+    &["claude.exe", "codex.exe", "chatgpt.exe"]
 }
 
 /// Map a process image name to its provider. Unknown images yield `None`
@@ -122,13 +125,9 @@ fn provider_for_image(image: &str) -> Option<ProviderId> {
 // Official app discovery
 // ---------------------------------------------------------------------------
 
-/// Locate the officially installed app for `provider`.
-///
-/// Claude lookup order: registered MSIX package, well-known desktop install
-/// directories, WindowsApps alias, and App Paths. Codex lookup: PATH then
-/// App Paths. Claude Code on PATH is not the official Claude desktop app.
-/// Returns the first candidate that exists on disk. This runs on explicit
-/// launch/import/status only — never on a periodic timer.
+/// Locate the installed desktop app, independently of CLI PATH resolution.
+/// The Codex package registers ChatGPT.exe as its entry point; its window
+/// may instead be hosted by Codex.exe from that same installed package.
 pub fn discover_official_exe(provider: ProviderId) -> ManagerResult<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     match provider {
@@ -149,14 +148,11 @@ pub fn discover_official_exe(provider: ProviderId) -> ManagerResult<PathBuf> {
             }
             candidates.push(PathBuf::from("C:\\Program Files\\Claude\\Claude.exe"));
         }
-        ProviderId::Codex => {
-            if let Some(path) = search_path("codex.exe") {
-                candidates.push(path);
-            }
-            if let Ok(path) = app_paths_lookup("codex.exe") {
-                candidates.push(path);
-            }
-        }
+        ProviderId::Codex => candidates.extend(
+            registered_package_roots("OpenAI.Codex_2p2nqsd0c76g0")
+                .into_iter()
+                .map(|root| root.join("app").join("ChatGPT.exe")),
+        ),
         _ => return Err("This provider does not support account profiles".into()),
     }
     candidates
@@ -167,7 +163,7 @@ pub fn discover_official_exe(provider: ProviderId) -> ManagerResult<PathBuf> {
                 "Official Claude desktop app not found (registered MSIX package, WindowsApps alias, App Paths, or desktop install directory)"
                     .into()
             }
-            _ => "Official Codex CLI not found on PATH or App Paths".into(),
+            _ => "Official Codex desktop package not found".into(),
         })
 }
 
@@ -238,15 +234,6 @@ fn app_paths_in_hive(hive: HKEY, subkey: &str) -> Option<PathBuf> {
     }
 }
 
-/// `PATH` lookup without Win32: split the caller's `PATH` and take the first
-/// matching executable file. No process is spawned.
-fn search_path(exe: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(exe))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Resolve the installed MSIX binary through the current user's package
 /// registrations. LocalAppData\Packages contains data, not installed binaries.
 fn msix_claude_exes() -> Vec<PathBuf> {
@@ -285,7 +272,11 @@ fn registered_package_roots(family: &str) -> Vec<PathBuf> {
     let mut buffer_len = 0;
     unsafe {
         if GetPackagesByPackageFamily(
-            PCWSTR(family.as_ptr()), &mut count, None, &mut buffer_len, None,
+            PCWSTR(family.as_ptr()),
+            &mut count,
+            None,
+            &mut buffer_len,
+            None,
         ) != ERROR_INSUFFICIENT_BUFFER
             || !(1..=64).contains(&count)
             || !(1..=65_536).contains(&buffer_len)
@@ -295,8 +286,11 @@ fn registered_package_roots(family: &str) -> Vec<PathBuf> {
         let mut names = vec![PWSTR::null(); count as usize];
         let mut buffer = vec![0u16; buffer_len as usize];
         if GetPackagesByPackageFamily(
-            PCWSTR(family.as_ptr()), &mut count, Some(names.as_mut_ptr()),
-            &mut buffer_len, Some(PWSTR(buffer.as_mut_ptr())),
+            PCWSTR(family.as_ptr()),
+            &mut count,
+            Some(names.as_mut_ptr()),
+            &mut buffer_len,
+            Some(PWSTR(buffer.as_mut_ptr())),
         ) != ERROR_SUCCESS
         {
             return Vec::new();
@@ -311,16 +305,94 @@ fn registered_package_roots(family: &str) -> Vec<PathBuf> {
                 continue;
             }
             let mut path = vec![0u16; length as usize];
-            if GetPackagePathByFullName(
-                PCWSTR(name.0), &mut length, Some(PWSTR(path.as_mut_ptr())),
-            ) == ERROR_SUCCESS
+            if GetPackagePathByFullName(PCWSTR(name.0), &mut length, Some(PWSTR(path.as_mut_ptr())))
+                == ERROR_SUCCESS
             {
-                let end = path.iter().position(|unit| *unit == 0).unwrap_or(path.len());
+                let end = path
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(path.len());
                 roots.push(PathBuf::from(String::from_utf16_lossy(&path[..end])));
             }
         }
         roots
     }
+}
+
+fn is_packaged_codex_image(path: &Path, roots: &[PathBuf]) -> bool {
+    let image = canonical_spelling(path);
+    roots.iter().any(|root| {
+        ["ChatGPT.exe", "Codex.exe"]
+            .iter()
+            .any(|name| image == canonical_spelling(&root.join("app").join(name)))
+    })
+}
+
+/// Only an external Default bound to a real provider-default root can use
+/// native vendor activation and identity. Custom mappings remain isolated.
+fn is_canonical_default(ctx: &AccountContext) -> bool {
+    if ctx.is_managed() || !ctx.profile.id.eq_ignore_ascii_case("default") {
+        return false;
+    }
+    if ctx.source == crate::accounts::SourceKind::ProviderDefault {
+        return ctx.desktop_dir.is_none()
+            && ctx.config_dir.is_none()
+            && ctx.credential_file.is_none();
+    }
+    let defaults = canonical_default_dirs(ctx.provider);
+    let is_default = |path: &PathBuf| defaults.contains(&canonical_spelling(path));
+    ctx.source == crate::accounts::SourceKind::DesktopDir
+        && ctx.desktop_dir.as_ref().is_some_and(is_default)
+        && ctx.config_dir.as_ref().is_none_or(is_default)
+}
+
+fn packaged_app_id(provider: ProviderId) -> Option<&'static str> {
+    match provider {
+        ProviderId::Claude => Some("Claude_pzs8sxrjxfjjc!Claude"),
+        ProviderId::Codex => Some("OpenAI.Codex_2p2nqsd0c76g0!App"),
+        _ => None,
+    }
+}
+
+fn activate_packaged_default(provider: ProviderId) -> ManagerResult<u32> {
+    let app_id = packaged_app_id(provider)
+        .ok_or_else(|| "Provider has no packaged desktop app".to_string())?;
+    // A fresh thread gives activation its own known COM apartment, regardless
+    // of the caller's existing apartment model.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("usagehub-package-activation".into())
+        .spawn(move || {
+            let result = (|| unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                    .ok()
+                    .map_err(|error| format!("Unable to initialize COM for {app_id}: {error}"))?;
+                let result = (|| {
+                    let manager: IApplicationActivationManager =
+                        CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
+                            .map_err(|error| {
+                                format!("Unable to create activation manager for {app_id}: {error}")
+                            })?;
+                    let id = wide_str(app_id);
+                    let pid = manager
+                        .ActivateApplication(PCWSTR(id.as_ptr()), PCWSTR::null(), AO_NONE)
+                        .map_err(|error| format!("Unable to activate {app_id}: {error}"))?;
+                    if pid == 0 {
+                        return Err(format!("Activation of {app_id} returned no process ID"));
+                    }
+                    Ok(pid)
+                })();
+                CoUninitialize();
+                result
+            })();
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("Unable to start activation for {app_id}: {error}"))?;
+    // A stalled shell broker must not hold the caller's account guard forever
+    // and starve quota polling. The COM apartment owns no account/auth locks.
+    receiver
+        .recv_timeout(Duration::from_secs(15))
+        .map_err(|error| format!("Activation of {app_id} did not complete: {error}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -405,16 +477,9 @@ pub fn command_line_owns(command_line: &str, marker: &str) -> bool {
 /// Explicit child environment for an account launch or CLI run.
 ///
 /// Dir roots only — never tokens, credential paths, or auth material.
-/// External default profiles inherit provider-default discovery (no dir
-/// overrides) and only receive the nonessential-traffic opt-out.
-///
-/// Desktop accounts always point CLI roots at the canonical nested
-/// `<desktop>/claude-config` dir (the real Second layout), whether or not
-/// the registry's `config_dir` already records it: an empty `config_dir`
-/// does NOT fall back to provider-default discovery here, because the
-/// desktop base is always set. This keeps CLI history/config isolated per
-/// account on every path (create, import, migration adopt) with zero
-/// registry dependence.
+/// A canonical Default honors its explicit CLI config directory, if present;
+/// otherwise it inherits provider discovery. Isolated Desktop accounts use
+/// their explicit config dir or `<desktop>/claude-config`.
 pub fn account_child_env(ctx: &AccountContext) -> ManagerResult<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = DISABLE_NONESSENTIAL_ENV
         .iter()
@@ -423,6 +488,8 @@ pub fn account_child_env(ctx: &AccountContext) -> ManagerResult<Vec<(String, Str
     let base = account_base_dir(ctx)?;
     let cli_root = if let Some(dir) = &ctx.config_dir {
         Some(paths::require_absolute(dir)?)
+    } else if is_canonical_default(ctx) {
+        None
     } else if let Some(desktop) = &ctx.desktop_dir {
         Some(paths::require_absolute(desktop)?.join("claude-config"))
     } else {
@@ -458,6 +525,8 @@ pub struct LiveProcess {
     pub pid: u32,
     pub provider: ProviderId,
     pub image: String,
+    /// Codex image belongs to the registered official package, not a CLI.
+    pub packaged_codex: bool,
     pub command_line: Option<String>,
     /// Creation time as Unix seconds, when readable.
     pub created_unix: Option<u64>,
@@ -566,14 +635,14 @@ pub fn live_process_snapshot() -> Snapshot {
 
 #[cfg(not(test))]
 fn live_process_snapshot_inner() -> Snapshot {
-    let mut processes = snapshot_processes(all_wanted_image_names());
+    let (mut processes, images_complete) = snapshot_processes(all_wanted_image_names());
     if processes.is_empty() {
         if let Ok(mut cache) = CMDLINE_CACHE.lock() {
             cache.clear();
         }
         return Snapshot {
             processes,
-            attribution_complete: true,
+            attribution_complete: images_complete,
         };
     }
     // Collect the miss set under the lock, then release before spawning.
@@ -595,10 +664,10 @@ fn live_process_snapshot_inner() -> Snapshot {
             .map(|process| process.pid)
             .collect()
     };
-    let mut complete = true;
+    let mut complete = images_complete;
     if !misses.is_empty() {
         let (fresh, probe_ok) = query_command_lines_once();
-        complete = probe_ok;
+        complete &= probe_ok;
         if let Ok(mut cache) = CMDLINE_CACHE.lock() {
             let live: BTreeSet<u32> = processes.iter().map(|p| p.pid).collect();
             cache.retain(|pid, _| live.contains(pid));
@@ -729,10 +798,7 @@ pub fn attribute_account_in(ctx: &AccountContext, snapshot: &Snapshot) -> Vec<Li
     // A migrated canonical Desktop Default must still recognize the vendor's
     // already-running, marker-less launch. Custom mapped External profiles
     // retain strict marker-only attribution.
-    let is_default_root = |path: &PathBuf| defaults.contains(&canonical_spelling(path));
-    let canonical_mapping = ctx.source == crate::accounts::SourceKind::DesktopDir
-        && ctx.desktop_dir.as_ref().is_some_and(is_default_root)
-        && ctx.config_dir.as_ref().is_none_or(is_default_root);
+    let canonical_mapping = is_canonical_default(ctx);
     if marker.is_some() && !canonical_mapping {
         return attribute_snapshot(ctx, &snapshot.processes);
     }
@@ -743,6 +809,7 @@ pub fn attribute_account_in(ctx: &AccountContext, snapshot: &Snapshot) -> Vec<Li
         .iter()
         .filter(|process| {
             process.provider == ctx.provider
+                && (ctx.provider != ProviderId::Codex || process.packaged_codex)
                 && !managed.contains(&process.pid)
                 && process.command_line.as_deref().is_some_and(|line| {
                     let lower = line.to_lowercase();
@@ -936,14 +1003,17 @@ pub fn account_live_windows_in(ctx: &AccountContext, snapshot: &Snapshot) -> Vec
     windows_for_pids(&pids)
 }
 
-fn snapshot_processes(image_names: &[&str]) -> Vec<LiveProcess> {
+fn snapshot_processes(image_names: &[&str]) -> (Vec<LiveProcess>, bool) {
     let mut out = Vec::new();
+    let mut complete = true;
+    let mut desktop_paths: BTreeMap<ProviderId, Option<PathBuf>> = BTreeMap::new();
+    let codex_roots = registered_package_roots("OpenAI.Codex_2p2nqsd0c76g0");
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return out;
+            return (out, false);
         };
         if snapshot.is_invalid() {
-            return out;
+            return (out, false);
         }
         let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -961,10 +1031,41 @@ fn snapshot_processes(image_names: &[&str]) -> Vec<LiveProcess> {
                     .iter()
                     .any(|wanted| image.eq_ignore_ascii_case(wanted))
                 {
+                    let mut packaged_codex = false;
+                    if provider == ProviderId::Codex {
+                        let image_path = process_image_path(entry.th32ProcessID);
+                        if image_path.is_none() {
+                            complete = false;
+                        }
+                        packaged_codex = image_path
+                            .as_ref()
+                            .is_some_and(|path| is_packaged_codex_image(path, &codex_roots));
+                        if !packaged_codex {
+                            more = Process32NextW(snapshot, &mut entry).is_ok();
+                            continue;
+                        }
+                    } else if image.eq_ignore_ascii_case("claude.exe") {
+                        let official = desktop_paths
+                            .entry(provider)
+                            .or_insert_with(|| discover_official_exe(provider).ok());
+                        let image_path = process_image_path(entry.th32ProcessID);
+                        if official.is_none() || image_path.is_none() {
+                            complete = false;
+                        }
+                        if !official
+                            .as_ref()
+                            .zip(image_path.as_ref())
+                            .is_some_and(|(a, b)| canonical_spelling(a) == canonical_spelling(b))
+                        {
+                            more = Process32NextW(snapshot, &mut entry).is_ok();
+                            continue;
+                        }
+                    }
                     out.push(LiveProcess {
                         pid: entry.th32ProcessID,
                         provider,
                         image,
+                        packaged_codex,
                         command_line: None,
                         created_unix: process_created_unix(entry.th32ProcessID),
                         parent_pid: entry.th32ParentProcessID,
@@ -975,7 +1076,7 @@ fn snapshot_processes(image_names: &[&str]) -> Vec<LiveProcess> {
         }
         let _ = windows::Win32::Foundation::CloseHandle(snapshot);
     }
-    out
+    (out, complete)
 }
 
 fn process_created_unix(pid: u32) -> Option<u64> {
@@ -1149,7 +1250,11 @@ fn prepare_launch_command(
     extra_args: &[String],
 ) -> ManagerResult<(String, std::process::Command)> {
     let exe = discover_official_exe(ctx.provider)?;
-    let base = account_base_dir(ctx)?;
+    let base = if is_canonical_default(ctx) {
+        None
+    } else {
+        account_base_dir(ctx)?
+    };
     if ctx.is_managed() {
         if let Some(base) = &base {
             paths::ensure_dir(base)?;
@@ -1167,14 +1272,9 @@ fn prepare_launch_command(
                 command.arg(format!("--user-data-dir={}", base.display()));
             }
         }
-        ProviderId::Codex => {
-            // The Codex CLI runs in its own console window per account.
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE
-            }
-        }
+        ProviderId::Codex => return Err(
+            "Codex desktop does not support isolated account launches; use the provider CLI for this profile".into()
+        ),
         _ => return Err("This provider does not support account profiles".into()),
     }
     for arg in extra_args {
@@ -1188,19 +1288,8 @@ fn prepare_launch_command(
     }
     #[cfg(windows)]
     {
-        // No console window for GUI launches; Codex already asked for its own
-        // console above. `Command` exposes no getter for previously set
-        // flags, so the effective value is recomputed from the provider arm
-        // instead of read back: identical outcome (GUI detaches, Codex gets
-        // its own console).
         use std::os::windows::process::CommandExt;
-        const DETACHED: u32 = 0x0000_0008;
-        const NEW_CONSOLE: u32 = 0x0000_0010;
-        if ctx.provider != ProviderId::Codex {
-            command.creation_flags(DETACHED);
-        } else {
-            command.creation_flags(NEW_CONSOLE);
-        }
+        command.creation_flags(0x0000_0008); // DETACHED_PROCESS
     }
     // Long-lived official GUI spawn: never routed through the bounded console
     // runner. Null stdio so GUI descendants cannot inherit the manager's
@@ -1262,17 +1351,11 @@ pub fn focus_account_window(ctx: &AccountContext) -> ManagerResult<bool> {
         if !IsWindow(Some(hwnd)).as_bool() {
             return Ok(false);
         }
-        // Attach input so the foreground grant succeeds from a worker
-        // thread; a denied grant still counts: the window was restored.
-        let current = GetCurrentThreadId();
-        let target_tid = GetWindowThreadProcessId(hwnd, None);
-        let attached = target_tid != 0 && AttachThreadInput(current, target_tid, true).as_bool();
-        let _ = ShowWindow(hwnd, SW_RESTORE);
+        // Never join the vendor's input queue: a stalled target can otherwise
+        // block this worker while it owns the account-operation guard, starving
+        // quota polls. Restore asynchronously and respect foreground-lock rules.
+        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
-        let _ = BringWindowToTop(hwnd);
-        if attached {
-            let _ = AttachThreadInput(current, target_tid, false);
-        }
         Ok(true)
     }
 }
@@ -1620,7 +1703,6 @@ impl Drop for ComGuard {
     }
 }
 
-
 /// Build a `PROPVARIANT` string by hand: `SHStrDupW` allocates the
 /// `VT_LPWSTR` buffer. The SDK `PROPVARIANT` implements `Drop`
 /// (`PropVariantClear`), which frees that buffer exactly once when the
@@ -1655,7 +1737,13 @@ fn stamp_shortcut_app_id(link: &Path, aumid: &str) -> ManagerResult<()> {
         let path_w: Vec<u16> = link
             .as_os_str()
             .encode_wide()
-            .map(|unit| if unit == b'/' as u16 { b'\\' as u16 } else { unit })
+            .map(|unit| {
+                if unit == b'/' as u16 {
+                    b'\\' as u16
+                } else {
+                    unit
+                }
+            })
             .chain(std::iter::once(0))
             .collect();
         let pbc: Option<&IBindCtx> = None;
@@ -1695,13 +1783,72 @@ pub fn stamp_window_identity(
         let result = (|| {
             set_store_string(&store, &PKEY_AppUserModel_ID, aumid)?;
             set_store_string(&store, &PKEY_AppUserModel_RelaunchCommand, relaunch_command)?;
-            set_store_string(&store, &PKEY_AppUserModel_RelaunchIconResource, relaunch_icon)?;
-            set_store_string(&store, &PKEY_AppUserModel_RelaunchDisplayNameResource, display_name)?;
+            set_store_string(
+                &store,
+                &PKEY_AppUserModel_RelaunchIconResource,
+                relaunch_icon,
+            )?;
+            set_store_string(
+                &store,
+                &PKEY_AppUserModel_RelaunchDisplayNameResource,
+                display_name,
+            )?;
             // No Commit: window stores apply immediately.
             Ok(())
         })();
         // `store` is ref-counted: dropping it releases, no manual Release.
         result
+    }
+}
+/// Undo only the identity previously stamped by UsageHub on this Default.
+/// An unrelated/vendor-owned window property is never changed.
+fn restore_default_window_identity(hwnd: isize, ctx: &AccountContext) -> ManagerResult<bool> {
+    let _com = ComGuard::acquire()?;
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as *mut _))
+            .map_err(|error| format!("Unable to open the Default window store: {error}"))?;
+        let value = store
+            .GetValue(&PKEY_AppUserModel_ID)
+            .map_err(|error| format!("Unable to read the Default window identity: {error}"))?;
+        let inner = &*value.Anonymous.Anonymous;
+        if inner.vt != VT_LPWSTR || inner.Anonymous.pwszVal.is_null() {
+            return Ok(false);
+        }
+        let current = inner
+            .Anonymous
+            .pwszVal
+            .to_string()
+            .map_err(|error| format!("Invalid Default window identity: {error}"))?;
+        if current != account_app_user_model_id(ctx.provider, &ctx.profile.id) {
+            return Ok(false);
+        }
+        let empty: PROPVARIANT = std::mem::zeroed();
+        for key in [
+            &PKEY_AppUserModel_RelaunchCommand,
+            &PKEY_AppUserModel_RelaunchIconResource,
+            &PKEY_AppUserModel_RelaunchDisplayNameResource,
+        ] {
+            store
+                .SetValue(key, &empty)
+                .map_err(|error| format!("Unable to clear Default relaunch metadata: {error}"))?;
+        }
+        let family = match ctx.provider {
+            ProviderId::Claude => "Claude_pzs8sxrjxfjjc",
+            ProviderId::Codex => "OpenAI.Codex_2p2nqsd0c76g0",
+            _ => "",
+        };
+        if !registered_package_roots(family).is_empty() {
+            set_store_string(
+                &store,
+                &PKEY_AppUserModel_ID,
+                packaged_app_id(ctx.provider).unwrap(),
+            )?;
+        } else {
+            store
+                .SetValue(&PKEY_AppUserModel_ID, &empty)
+                .map_err(|error| format!("Unable to restore Default window identity: {error}"))?;
+        }
+        Ok(true)
     }
 }
 
@@ -1729,6 +1876,19 @@ pub fn relaunch_identity(ctx: &AccountContext) -> ManagerResult<(String, String,
 /// windows whose identity changed, e.g. after a rename). Dead handles are
 /// pruned on the way.
 pub fn stamp_account_windows_in(ctx: &AccountContext, snapshot: &Snapshot) -> usize {
+    if is_canonical_default(ctx) {
+        let mut restored = 0;
+        for window in account_live_windows_in(ctx, snapshot) {
+            match restore_default_window_identity(window.hwnd, ctx) {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    crate::diagnose::log(format!("Default window identity repair failed: {error}"))
+                }
+            }
+        }
+        return restored;
+    }
     let aumid = account_app_user_model_id(ctx.provider, &ctx.profile.id);
     let Ok((command, icon, name)) = relaunch_identity(ctx) else {
         return 0;
@@ -1754,9 +1914,12 @@ pub fn stamp_account_windows_in(ctx: &AccountContext, snapshot: &Snapshot) -> us
     let mut stamped = 0usize;
     let mut done: Vec<(isize, u32)> = Vec::new();
     for window in &todo {
-        if stamp_window_identity(window.hwnd, &aumid, &command, &icon, &name).is_ok() {
-            done.push((window.hwnd, window.pid));
-            stamped += 1;
+        match stamp_window_identity(window.hwnd, &aumid, &command, &icon, &name) {
+            Ok(()) => {
+                done.push((window.hwnd, window.pid));
+                stamped += 1;
+            }
+            Err(error) => crate::diagnose::log(format!("Account window identity failed: {error}")),
         }
     }
     if let Ok(mut cache) = STAMP_CACHE.lock() {
@@ -1797,6 +1960,57 @@ pub const OPEN_WINDOW_WAIT: Duration = Duration::from_secs(15);
 /// aborts early with an error instead of burning the whole budget.
 /// Stamping is best-effort and never turns a good launch into an error.
 pub fn launch_and_stamp_account(ctx: &AccountContext, extra_args: &[String]) -> ManagerResult<u32> {
+    if is_canonical_default(ctx) {
+        let family = match ctx.provider {
+            ProviderId::Claude => "Claude_pzs8sxrjxfjjc",
+            ProviderId::Codex => "OpenAI.Codex_2p2nqsd0c76g0",
+            _ => return Err("This provider does not support account profiles".into()),
+        };
+        let roots = registered_package_roots(family);
+        if !roots.is_empty() {
+            if !extra_args.is_empty() {
+                return Err(
+                    "Extra arguments are not supported for packaged Default activation".into(),
+                );
+            }
+            let snapshot = live_process_snapshot();
+            let existing = account_live_windows_in(ctx, &snapshot);
+            if let Some(window) = existing
+                .iter()
+                .find(|window| window.visible || !window.title.is_empty())
+            {
+                if focus_account_window(ctx)? {
+                    return Ok(window.pid);
+                }
+            }
+            let pid = activate_packaged_default(ctx.provider)?;
+            let start = std::time::Instant::now();
+            loop {
+                let snapshot = live_process_snapshot();
+                let windows = account_live_windows_in(ctx, &snapshot);
+                if let Some(window) = windows
+                    .iter()
+                    .find(|window| window.visible || !window.title.is_empty())
+                {
+                    stamp_account_windows_in(ctx, &snapshot);
+                    return Ok(window.pid);
+                }
+                if start.elapsed() >= OPEN_WINDOW_WAIT {
+                    return Err(format!(
+                        "Activation of {} returned process {pid}, but no attributed Default window appeared within {} seconds",
+                        packaged_app_id(ctx.provider).unwrap_or(family),
+                        OPEN_WINDOW_WAIT.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if ctx.provider == ProviderId::Codex {
+            return Err(format!(
+                "Official Codex package {family} is not registered for the current user"
+            ));
+        }
+    }
     let (exe_display, command) = prepare_launch_command(ctx, extra_args)?;
     let (pid, mut child) = spawn_detached(command, &exe_display)?;
     let start = std::time::Instant::now();
@@ -2114,11 +2328,9 @@ pub struct ShortcutInfo {
 /// (see [`manager_launch_command`]) — never the official exe directly —
 /// so taskbar/Start Menu launches run under `lifecycle` with the explicit
 /// child environment instead of losing it and reusing global CLI
-/// history/auth. It carries a stable id-keyed icon plus a real
-/// `System.AppUserModel.ID` stamp, so Windows groups the account's
-/// windows under one taskbar identity. The display name lives in the
-/// description only; the file name is the immutable id, so pins survive
-/// renames.
+/// history/auth. Isolated accounts carry an id-keyed icon and AppUserModelID;
+/// canonical Default uses the official executable icon and package identity.
+/// The file name is the immutable id, so pins survive renames.
 ///
 /// Cheap when unchanged: a per-process fingerprint of the profile metadata
 /// (name, color, dirs, wrapper exe, arguments) plus shortcut/icon presence
@@ -2126,14 +2338,28 @@ pub struct ShortcutInfo {
 /// rewrite and no COM commit — only existence checks. Any metadata change
 /// (rename, color, new exe path after an update) re-writes and re-stamps.
 pub fn ensure_account_shortcut(ctx: &AccountContext) -> ManagerResult<ShortcutInfo> {
-    let aumid = account_app_user_model_id(ctx.provider, &ctx.profile.id);
-    let icon = stable_account_icon(ctx.provider, &ctx.profile.id, &ctx.profile.color)?;
+    let canonical = is_canonical_default(ctx);
+    let aumid = if canonical {
+        packaged_app_id(ctx.provider).unwrap_or("").to_string()
+    } else {
+        account_app_user_model_id(ctx.provider, &ctx.profile.id)
+    };
+    let icon = if canonical {
+        discover_official_exe(ctx.provider)?
+    } else {
+        stable_account_icon(ctx.provider, &ctx.profile.id, &ctx.profile.color)?
+    };
     let (exe, arguments) = manager_launch_command(ctx)?;
     let dir = shortcuts_root()?;
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("Unable to create the shortcuts folder: {error}"))?;
     let path = dir.join(shortcut_file_name(ctx.provider, &ctx.profile));
-    let fingerprint = shortcut_fingerprint(ctx, &exe, &arguments);
+    let fingerprint = format!(
+        "{}|{}|{}",
+        shortcut_fingerprint(ctx, &exe, &arguments),
+        aumid,
+        icon.display()
+    );
     let cache_key = (ctx.provider, ctx.profile.id.clone());
     let unchanged = path.is_file()
         && icon.is_file()
@@ -2269,8 +2495,10 @@ pub fn refresh_taskbar_identities() -> ManagerResult<(usize, usize)> {
             if let Ok(dir) = shortcuts_root() {
                 expected_lnk.insert(dir.join(shortcut_file_name(provider, profile)));
             }
-            if let Ok(icon) = stable_account_icon(provider, &profile.id, &profile.color) {
-                expected_icons.insert(icon);
+            if !is_canonical_default(&ctx) {
+                if let Ok(icon) = stable_account_icon(provider, &profile.id, &profile.color) {
+                    expected_icons.insert(icon);
+                }
             }
         }
     }
@@ -2425,6 +2653,7 @@ mod tests {
             pid: 1234,
             provider: ProviderId::Claude,
             image: "Claude.exe".into(),
+            packaged_codex: false,
             command_line: Some("claude.exe --user-data-dir=\"C:\\x\\account_1\"".into()),
             created_unix: None,
             parent_pid: 0,
@@ -2451,6 +2680,7 @@ mod tests {
             pid,
             provider: ProviderId::Claude,
             image: "Claude.exe".into(),
+            packaged_codex: false,
             command_line: command_line.map(str::to_string),
             created_unix: Some(1_700_000_000 + pid as u64),
             parent_pid,
@@ -2517,14 +2747,19 @@ mod tests {
         }
         let desktop = PathBuf::from("C:\\UsageHub-native-test\\default");
         let cli = PathBuf::from("C:\\UsageHub-native-test\\cli");
-        let previous = TEST_DEFAULT_ROOTS.with(|slot| {
-            slot.replace(Some(vec![desktop.clone(), cli.clone()]))
-        });
+        let previous =
+            TEST_DEFAULT_ROOTS.with(|slot| slot.replace(Some(vec![desktop.clone(), cli.clone()])));
         let _restore = RestoreRoots(previous);
         let mut profile = ctx.profile.clone();
         profile.desktop_dir = desktop.display().to_string();
         profile.config_dir = cli.display().to_string();
         let mapped = AccountContext::from_profile(ProviderId::Claude, &profile).unwrap();
+        assert!(is_canonical_default(&mapped));
+        assert!(account_child_env(&mapped)
+            .unwrap()
+            .iter()
+            .any(|(key, value)| key == "CLAUDE_CONFIG_DIR"
+                && value.as_str() == cli.to_string_lossy().as_ref()));
         assert_eq!(
             attribute_account_in(&mapped, &plain)
                 .iter()
@@ -2534,7 +2769,73 @@ mod tests {
         );
         profile.desktop_dir = "C:\\UsageHub-native-test\\custom".into();
         let custom = AccountContext::from_profile(ProviderId::Claude, &profile).unwrap();
+        assert!(!is_canonical_default(&custom));
+        assert!(account_child_env(&custom)
+            .unwrap()
+            .iter()
+            .any(|(key, _)| key == "CLAUDE_CONFIG_DIR"));
+        let mut inconsistent = ctx.clone();
+        inconsistent.config_dir = Some(PathBuf::from("C:\\UsageHub-native-test\\custom"));
+        assert!(!is_canonical_default(&inconsistent));
+        let mut config_only = ctx.profile.clone();
+        config_only.config_dir = "C:\\UsageHub-native-test\\custom".into();
+        let config_only = AccountContext::from_profile(ProviderId::Claude, &config_only).unwrap();
+        assert!(!is_canonical_default(&config_only));
         assert!(attribute_account_in(&custom, &plain).is_empty());
+    }
+
+    #[test]
+    fn codex_default_does_not_claim_cli_processes() {
+        let profile = AccountProfile {
+            id: "default".into(),
+            ..AccountProfile::default()
+        };
+        let ctx = AccountContext::from_profile(ProviderId::Codex, &profile).unwrap();
+        let mut cli = live_process(1, Some("codex.exe"), 0);
+        cli.provider = ProviderId::Codex;
+        cli.image = "codex.exe".into();
+        let mut desktop = live_process(2, Some("ChatGPT.exe"), 0);
+        desktop.provider = ProviderId::Codex;
+        desktop.image = "ChatGPT.exe".into();
+        desktop.packaged_codex = true;
+        let mut package_window = live_process(3, Some("Codex.exe"), 0);
+        package_window.provider = ProviderId::Codex;
+        package_window.image = "Codex.exe".into();
+        package_window.packaged_codex = true;
+        let snapshot = Snapshot {
+            processes: vec![cli, desktop, package_window],
+            attribution_complete: true,
+        };
+        assert_eq!(
+            attribute_account_in(&ctx, &snapshot)
+                .iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn codex_package_image_requires_exact_registered_path() {
+        let roots = vec![PathBuf::from(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1",
+        )];
+        assert!(is_packaged_codex_image(
+            Path::new(r"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\Codex.exe"),
+            &roots,
+        ));
+        assert!(is_packaged_codex_image(
+            Path::new(r"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\ChatGPT.exe"),
+            &roots,
+        ));
+        assert!(!is_packaged_codex_image(
+            Path::new(r"C:\tools\codex.exe"),
+            &roots,
+        ));
+        assert!(!is_packaged_codex_image(
+            Path::new(r"C:\Program Files\WindowsApps\OpenAI.Codex_1_other\app\Codex.exe"),
+            &roots,
+        ));
     }
 
     #[test]

@@ -15,33 +15,13 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-// Fork identifier reserved for a future UsageHub listing. It intentionally
-// differs from the upstream package so a WinGet-based install can never be
-// upgraded to an upstream build.
-const WINGET_PACKAGE_ID: &str = "UsageHub.UsageHub";
-// `winget show` exit code when the package is not in the source.
-const WINGET_NO_APPLICATIONS_FOUND: u32 = 0x8A15_0014;
-const WINGET_SHOW_TIMEOUT: Duration = Duration::from_secs(60);
-const WINGET_SHOW_VERSIONS_ARGS: [&str; 9] = [
-    "show",
-    "--id",
-    WINGET_PACKAGE_ID,
-    "--exact",
-    "--versions",
-    "--source",
-    "winget",
-    "--accept-source-agreements",
-    "--disable-interactivity",
-];
 
 mod download;
 mod release;
 
 use download::{download_release_asset, open_verified_source, AssetIntegrity};
 pub use release::ReleaseDescriptor;
-use release::{parse_version, release_descriptor, GitHubRelease};
-use semver::Version;
+use release::{release_descriptor, GitHubRelease};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
@@ -124,92 +104,33 @@ pub fn current_install_channel() -> InstallChannel {
     }
 }
 
-/// Fork update policy: UsageHub publishes no release channel yet, so every
-/// update check and install is refused before touching the network. An
-/// upstream release must never replace this side-by-side fork install. To
-/// enable the fork's own channel later: point `repository` in Cargo.toml at
-/// the fork, publish a `usagehub.exe` asset per release, set
-/// `WINGET_PACKAGE_ID` to the fork listing, then make
-/// `own_update_channel_configured` return true.
-fn own_update_channel_configured() -> bool {
-    false
-}
-
-fn update_channel_disabled() -> String {
-    "Automatic updates are disabled in this UsageHub build. Install new UsageHub releases manually; it never updates itself from the upstream project.".into()
-}
-
 pub fn check_for_updates(channel: InstallChannel) -> Result<UpdateCheckResult, String> {
-    if !own_update_channel_configured() {
-        return Err(update_channel_disabled());
-    }
-    check_channel_updates(channel, fetch_latest_release, winget_listed_versions)
+    check_channel_updates(channel, fetch_latest_release)
 }
 
 fn check_channel_updates(
     channel: InstallChannel,
     github: impl FnOnce() -> Result<Option<ReleaseDescriptor>, String>,
-    winget: impl FnOnce() -> Result<Vec<Version>, String>,
 ) -> Result<UpdateCheckResult, String> {
-    // Query only the installation's source. WinGet publication can lag GitHub,
-    // and neither source's availability should depend on the other one.
     match channel {
         InstallChannel::Portable => Ok(match github()? {
             Some(release) => UpdateCheckResult::Available(AvailableUpdate::Release(release)),
             None => UpdateCheckResult::UpToDate,
         }),
-        InstallChannel::Winget => Ok(winget_update_result(
-            &parse_version(env!("CARGO_PKG_VERSION"))?,
-            &winget()?,
-        )),
+        InstallChannel::Winget => Err(winget_unavailable()),
     }
 }
 
-fn winget_update_result(current: &Version, listed: &[Version]) -> UpdateCheckResult {
-    let newest_listed = listed
-        .iter()
-        .filter(|version| version.pre.is_empty())
-        .max_by(|a, b| a.cmp_precedence(b));
-    match newest_listed {
-        Some(listed) if listed.cmp_precedence(current).is_gt() => {
-            UpdateCheckResult::Available(AvailableUpdate::Winget {
-                version: listed.to_string(),
-            })
-        }
-        _ => UpdateCheckResult::UpToDate,
-    }
+fn winget_unavailable() -> String {
+    "UsageHub does not have a WinGet update channel. Use a portable UsageHub release instead."
+        .into()
 }
 
 pub fn begin_winget_update() -> Result<(), String> {
-    if !own_update_channel_configured() {
-        return Err(update_channel_disabled());
-    }
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Unable to determine the app directory for restart.".to_string())?;
-    let command = winget_upgrade_command(
-        std::process::id(),
-        &current_exe.to_string_lossy(),
-        &current_dir.to_string_lossy(),
-    );
-
-    Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-Command")
-        .arg(&command)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
-
-    Ok(())
+    Err(winget_unavailable())
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
-    if !own_update_channel_configured() {
-        return Err(update_channel_disabled());
-    }
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
     ensure_target_location_writable(&current_exe)?;
@@ -402,96 +323,6 @@ fn updates_dir() -> Result<PathBuf, String> {
         .map(|dir| dir.join("UsageHub").join("updates"))
         .or_else(|| Some(std::env::temp_dir().join("UsageHub").join("updates")))
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
-}
-
-fn winget_listed_versions() -> Result<Vec<Version>, String> {
-    const WINGET_SHOW_CAPTURE_CAP: usize = 1024 * 1024;
-    // Shared bounded runner owns the deadline, the concurrent pipe drain and
-    // the kill-on-timeout job tree; the original 60s budget is unchanged.
-    // Long-lived update handoffs (begin_winget_update/begin_self_update and
-    // relaunch_target) are detached spawns, not console queries, and stay out.
-    let mut command = Command::new("winget.exe");
-    command.args(WINGET_SHOW_VERSIONS_ARGS);
-    let output = crate::manager::process::run_bounded(
-        &mut command,
-        WINGET_SHOW_TIMEOUT,
-        WINGET_SHOW_CAPTURE_CAP,
-        "winget show",
-    )
-    .map_err(|error| match error {
-        crate::manager::process::ConsoleError::TimedOut { .. } => {
-            "Timed out waiting for WinGet to list available versions.".to_string()
-        }
-        crate::manager::process::ConsoleError::Failed { detail, .. } => {
-            format!("Unable to run WinGet: {detail}")
-        }
-    })?;
-    // The runner truncates at the cap, so a full buffer means the listing was
-    // cut off: never parse a partial version list.
-    if output.stdout.len() >= WINGET_SHOW_CAPTURE_CAP {
-        return Err("WinGet version output exceeded the size limit.".into());
-    }
-    winget_versions_outcome(
-        output.status.code(),
-        &String::from_utf8_lossy(&output.stdout),
-    )
-}
-
-fn winget_versions_outcome(exit_code: Option<i32>, stdout: &str) -> Result<Vec<Version>, String> {
-    // Windows exit codes are HRESULTs; Rust reports them as signed values.
-    match exit_code.map(|code| code as u32) {
-        // Headers are localized, so keep only the lines that are versions.
-        Some(0) => {
-            let versions: Vec<_> = stdout
-                .lines()
-                .filter_map(|line| Version::parse(line.trim()).ok())
-                .collect();
-            if versions.is_empty() {
-                return Err("WinGet returned no recognizable package versions.".into());
-            }
-            Ok(versions)
-        }
-        Some(WINGET_NO_APPLICATIONS_FOUND) => Ok(Vec::new()),
-        Some(code) => Err(format!(
-            "WinGet could not list available versions (exit code 0x{code:08X})."
-        )),
-        None => Err("WinGet exited without a status code.".into()),
-    }
-}
-
-fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
-    let target = powershell_single_quoted(target);
-    let working_dir = powershell_single_quoted(working_dir);
-    let package_id = WINGET_PACKAGE_ID;
-
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'; ",
-            "$pidToWait = {pid}; ",
-            "$target = '{target}'; ",
-            "$workingDir = '{working_dir}'; ",
-            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} catch {{ }}; ",
-            "winget upgrade --id {package_id} --exact --source winget; ",
-            "$exitCode = $LASTEXITCODE; ",
-            "if ($exitCode -eq 0) {{ ",
-            "Start-Sleep -Seconds 2; ",
-            "Start-Process -FilePath $target -WorkingDirectory $workingDir; ",
-            "exit 0 ",
-            "}}; ",
-            "Write-Host ''; ",
-            "Write-Host 'WinGet update failed with exit code' $exitCode; ",
-            "Read-Host 'Press Enter to close'; ",
-            "exit $exitCode"
-        ),
-        pid = pid,
-        target = target,
-        working_dir = working_dir,
-        package_id = package_id,
-    )
-}
-
-fn powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn backup_path_for(target: &Path) -> PathBuf {

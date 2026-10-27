@@ -539,6 +539,13 @@ pub(super) fn format_usage_line(base: &str, context: &DataContext) -> Option<Str
             None
         }
     });
+    // Retain last-known figures in the model, but never present them as a
+    // current quota in the standard bar summaries.
+    if scoped_error.is_some_and(|error| error != 0.0)
+        || context.get(&format!("{provider}.stale")).unwrap_or(0.0) != 0.0
+    {
+        return Some("!".into());
+    }
     if scoped_error.is_none() && context.get("data.loading").unwrap_or(0.0) != 0.0 {
         return Some("--".into());
     }
@@ -563,6 +570,12 @@ pub(super) fn format_usage_line(base: &str, context: &DataContext) -> Option<Str
         return Some("!".into());
     }
     if dynamic.is_some() && context.get(&format!("{base}.available")) == Some(0.0) {
+        return Some("--".into());
+    }
+    // A disabled Codex window is not an unused allowance.
+    if (provider == "codex" || provider.starts_with("accounts.codex."))
+        && context.get(&format!("{provider}.{window}.available")) == Some(0.0)
+    {
         return Some("--".into());
     }
     // An Antigravity pool may report one window but not the other; an absent

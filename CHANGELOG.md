@@ -4,7 +4,7 @@ Notable changes to UsageHub (fork of Claude Code Usage Monitor) are documented h
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
-## [Unreleased]
+## [2.22.5] - 2026-10-27
 
 ### Added
 
@@ -19,7 +19,7 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 - Bounded console execution for OS queries, provider CLI runs, and UI backend calls: hidden console, concurrent stream drain, captured-byte caps, monotonic deadlines, and a kill-on-close job object with disarm on successful long-lived GUI launches. Budgets are 15 s for OS queries, 10 s for ACL/link helpers, 120 s for the provider CLI (overridable with `--timeout-seconds` 1–3600 before `--`), 60 s for ordinary dashboard backend calls, and 900 s for backup/cleanup/migration/skills operations, with the elapsed/deadline counter shown while a data operation is pending.
 - [docs/build-windows.md](docs/build-windows.md) documents the self-contained `D:/Tools/usagehub-toolchain` layout, the `1.95.0-x86_64-pc-windows-gnullvm` host/target pin, the llvm-mingw linker and `llvm-windres` setup, and the repository-local `.cargo/config.toml`/`rust-toolchain.toml` values.
 - New dependencies for the hash/encryption/vault work: `sha2`, `aes-gcm`, `zeroize`, `getrandom`, plus Windows Credential, Authorization, ProcessStatus/ToolHelp, IO, and security crate features.
-- Fork refusal tests proving update checks/installs never contact the network and the updater never accepts the upstream `claude-code-usage-monitor.exe` asset.
+- Fork-owned GitHub updates from `rostikowb/UsageHub`, accepting only `usagehub.exe` with matching size and SHA-256; the tag workflow uses an explicit hosted MSVC toolchain and no upstream WinGet submission.
 
 ### Changed
 
@@ -38,15 +38,21 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 - Fixed native taskbar identity heap corruption: the owning Windows `PROPVARIANT` now clears its string exactly once, rather than manually freeing it before the SDK destructor.
 - Discover the officially registered Claude MSIX executable with native package APIs; keep unquoted App Paths containing spaces intact and never mistake the Claude CLI on PATH for the desktop app.
 - Bind the canonical migrated Default to its Desktop cache rather than an unrelated CLI login, while preserving marker-less vendor windows and strict attribution for custom External mappings.
-- Refresh committed account changes even when a later open stage fails. “Delete account…” now opens and scrolls to the selected account's local-data preview, clearing prior confirmations without applying deletion.
+- Refresh committed account changes even when a later open stage fails. Account creation is above the compact account list; deletion opens a separate, viewport-bounded scrollable review with a matching preview, typed id, seven-day undo default, and cancellation without applying changes.
 - Use the SDK's actual `System.AppUserModel` property keys for taskbar identities and relaunch metadata, replacing hand-copied identifiers that Windows did not recognize.
 - Read current Desktop `acct:<account>|<organization>:<client>:…` cache identities without confusing organization/client identifiers with the bound account, retaining legacy cache support and refusing another account's token.
 - Normalize Windows Shell parsing paths without losing UTF-16 filenames, and keep scheduled taskbar identity refreshes from retagging disabled profiles.
 - Migration rollback accepts quoted Windows startup commands and writes lossless UTF-16LE registry data. Recovery uses the installed executable without relying on PATH, checks data/skills restoration before restoring legacy launchers, and propagates native registry import failures.
+- Restore the nearest authored right-click handler when generated account children only handle left-click. Menu-only scripts avoid a full render and tray sync, built-in menus avoid directory scans, and account sizing reuses cached host geometry before showing the popup.
+- Activate canonical Default Claude/Codex through the registered Windows package and require an attributed real window instead of treating an AppsFolder shell return as proof of launch. Keep vendor icons/identities on Default; additional Codex profiles remain CLI-only.
+- Restore windows asynchronously without joining the vendor input queue. Package activation has a 15-second caller deadline so a stalled shell broker cannot hold the account guard forever.
+- Show the existing error marker for stale/failed cached usage instead of a still-positive current percentage; missing Codex windows show unavailable, while actual per-window percentages and server resets remain authoritative.
+- Find and close the dashboard using its actual title/class and verified executable, not the obsolete `UsageHub Dashboard` title or the same-titled hidden bar controller. Close a redundant dashboard mutex handle.
+- Isolate test account-operation mutexes from real running accounts while preserving contention between fixture threads.
 
 ### Removed
 
-- Automatic update checks, background downloads, WinGet upgrades, and self-update are disabled in UsageHub builds: the updater refuses before any network or binary change and reports that updates are disabled, so an unknown upstream release can never replace this install. The dormant channel machinery stays in-tree for a future fork-owned channel.
+- Upstream update and WinGet upgrade channels: this fork never substitutes a CodeZeno build for UsageHub. Portable updates use the fork-owned release channel; recognized WinGet paths report that no UsageHub listing exists.
 - Automatic `claude -p` token refresh probes: Claude usage is read from stored login files, the desktop app's token cache, WSL, or confirmed owned Credential Manager targets, and fetching stays a read-only server GET.
 
 ## [2.22.4] - 2026-10-25
@@ -1583,3 +1589,4 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.2]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.1...v2.22.2
 [2.22.3]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.2...v2.22.3
 [2.22.4]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.3...v2.22.4
+[2.22.5]: https://github.com/rostikowb/UsageHub/releases/tag/v2.22.5
