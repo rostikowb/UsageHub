@@ -12,6 +12,7 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 - Prefer the existing native Direct3D 11 hardware dashboard host, retaining WARP software rendering and an eframe/OpenGL initialization fallback. Keep the original taskbar theme and renderer rather than adding another GUI toolkit.
 - Simplify account cards into aligned Period/Used/Reset rows, move source paths and secondary actions into details, expose a short Default cleanup action, and improve enabled secondary-text contrast without removing cleanup confirmations.
+- Show canonical session/weekly quotas only once; retain distinct model/scoped limits, place source provenance behind a technical disclosure, and replace raw backend JSON with human-readable status.
 - Wrap editor actions, keep Live apply on a separate row, bound inspector rows and labels, and horizontally scroll narrow workspaces without painting over the sidebar.
 - Cache resource lists and reuse host geometry; discover menu libraries on demand and share per-surface thumbnail geometry instead of cloning and resolving each scene object independently.
 
@@ -20,6 +21,7 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 - Prefer attributed ordinary account windows over tool/notification windows, including a hidden primary behind a visible Codex companion. Follow enabled owned modal chains and revalidate HWND/PID/process identity before asynchronous focus; do not alter vendor topmost styles or block normal activation just because a tray helper exists.
 - Coalesce non-activating restacks of embedded bar children when overlapping shell siblings are raised; cover both authored themes and the legacy embedding path.
 - Stop minimized dashboard repaint polling and retain redraw on restore/resize.
+- Route dashboard usage refresh through the resident monitor instead of a separate read-only CLI poll, so Settings and the taskbar consume the same timestamped cache, including authoritative Default weekly resets.
 
 ### Removed
 

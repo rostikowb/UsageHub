@@ -896,8 +896,24 @@ fn unchanged_usage_cache_does_not_invalidate_the_preview() {
     };
     assert!(app.update_usage_cache(cache.clone()));
     app.preview_dirty = false;
-    assert!(!app.update_usage_cache(cache));
+    assert!(!app.update_usage_cache(cache.clone()));
     assert!(!app.preview_dirty);
+
+    // A newer persisted monitor result replaces the prior reading, including
+    // the distinction between a valid idle window and a missing window.
+    let mut fresh = cache;
+    fresh.updated_unix = 2;
+    let usage = fresh.data.accounts[0].usage.as_mut().unwrap();
+    usage.session.percentage = 0.0;
+    usage.session.resets_at = None;
+    usage.weekly.available = false;
+    assert!(app.update_usage_cache(fresh));
+    let usage = app.usage.as_ref().unwrap().get(ProviderId::Claude).unwrap();
+    assert!(usage.session.available);
+    assert_eq!(usage.session.percentage, 0.0);
+    assert!(usage.session.resets_at.is_none());
+    assert!(!usage.weekly.available);
+    assert_eq!(app.manage.last_snapshot_unix, Some(2));
 }
 
 #[test]

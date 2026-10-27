@@ -85,10 +85,6 @@ pub(super) enum OpKind {
     Status {
         key: String,
     },
-    /// `poll`/`snapshot` output rendered into the card status line.
-    Poll {
-        key: String,
-    },
     CleanupPreview {
         key: CleanupPreviewKey,
     },
@@ -449,6 +445,65 @@ fn summarize_data(data: &ManageValue) -> String {
     }
 }
 
+fn additional_limit(
+    provider: ProviderId,
+    usage: &crate::models::UsageData,
+    limit: &crate::models::UsageLimit,
+) -> bool {
+    if !limit.is_active {
+        return false;
+    }
+    // Only unscoped Claude aggregate buckets duplicate the main rows.
+    // Model/scoped quotas remain visible even when their values match.
+    if provider == ProviderId::Claude
+        && limit.scope.is_none()
+        && limit.model.is_none()
+        && limit.model_id.is_none()
+    {
+        match limit.kind.as_str() {
+            "session" if usage.session.available => return false,
+            "weekly_all" if usage.weekly.available => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn account_status_summary(data: &ManageValue, language: LanguageId) -> String {
+    if let Some(error) = data
+        .get("error")
+        .and_then(ManageValue::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return error.to_string();
+    }
+    if let Some(status) = data.get("status") {
+        let state = match (
+            status.get("running").and_then(ManageValue::as_bool),
+            status.get("running_unknown").and_then(ManageValue::as_bool),
+        ) {
+            (_, Some(true)) | (None, _) => "Account status unknown",
+            (Some(true), _) => "Account running",
+            (Some(false), Some(false)) => "Account not running",
+            _ => "Account status unknown",
+        };
+        return language.text(state).to_string();
+    }
+    if let Some(focused) = data.get("focused").and_then(ManageValue::as_bool) {
+        return language
+            .text(if focused {
+                "Window focused"
+            } else {
+                "Window not found"
+            })
+            .to_string();
+    }
+    if data.get("report").is_some() {
+        return language.text("Account stopped").to_string();
+    }
+    language.text("Operation completed").to_string()
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -529,8 +584,9 @@ impl StudioApp {
             OpKind::Simple => {
                 self.manage.notice = Some(summarize_data(&data));
             }
-            OpKind::Status { key } | OpKind::Poll { key } => {
-                self.manage.status.insert(key, summarize_data(&data));
+            OpKind::Status { key } => {
+                let summary = account_status_summary(&data, self.language());
+                self.manage.status.insert(key, summary);
             }
             OpKind::CleanupPreview { key } => {
                 // Discard late results for a superseded selection: only the
@@ -889,18 +945,14 @@ impl StudioApp {
                                 );
                             }
                             if ui.button(language.text("Refresh usage now")).clicked() {
-                                self.spawn_manage(
-                                    OpKind::Poll {
-                                        key: Self::status_key(provider, &id),
-                                    },
-                                    vec![
-                                        "poll".to_string(),
-                                        "--provider".to_string(),
-                                        key.to_string(),
-                                        "--account".to_string(),
-                                        id.clone(),
-                                    ],
-                                );
+                                let result = self.request_live_usage_refresh();
+                                let line = match result {
+                                    Ok(()) => language.text("Usage refresh requested").to_string(),
+                                    Err(error) => error,
+                                };
+                                self.manage
+                                    .status
+                                    .insert(Self::status_key(provider, &id), line);
                             }
                         });
                         if let Some(line) = self
@@ -1090,8 +1142,10 @@ impl StudioApp {
                 .spacing(egui::vec2(16.0, 2.0))
                 .show(ui, |ui| {
                     ui.colored_label(muted(), language.text("Period"));
-                    ui.colored_label(muted(), language.text("Used"));
-                    ui.colored_label(muted(), language.text("Reset"));
+                    ui.colored_label(muted(), language.text("Used"))
+                        .on_hover_text(language.text("This table shows used quota; the main bar may show remaining quota. An unknown reset means the provider did not report one, not that refresh failed."));
+                    ui.colored_label(muted(), language.text("Reset"))
+                        .on_hover_text(language.text("This table shows used quota; the main bar may show remaining quota. An unknown reset means the provider did not report one, not that refresh failed."));
                     ui.end_row();
                     for (label, section) in [
                         ("Session", Some(&usage.session)),
@@ -1143,17 +1197,6 @@ impl StudioApp {
             return;
         };
         if let Some(usage) = &account.usage {
-            for (label, section) in [
-                ("Session", Some(&usage.session)),
-                ("Weekly", Some(&usage.weekly)),
-                ("Monthly", usage.monthly.as_ref()),
-            ] {
-                if let Some(line) = section
-                    .and_then(|section| reset_display(language, language.text(label), section, now))
-                {
-                    ui.weak(line);
-                }
-            }
             if let Some(credits) = &usage.credits {
                 ui.label(format!(
                     "{}: {:.0}%",
@@ -1162,7 +1205,7 @@ impl StudioApp {
                 ));
             }
             for limit in &usage.limits {
-                if limit.is_active {
+                if additional_limit(provider, usage, limit) {
                     if let Some(line) = reset_display(language, &limit.label, &limit.usage, now) {
                         ui.weak(line);
                     }
@@ -1185,7 +1228,9 @@ impl StudioApp {
                 format_unix_utc(updated)
             ));
         }
-        ui.weak(provenance);
+        ui.collapsing(language.text("Technical details"), |ui| {
+            ui.weak(provenance);
+        });
     }
 
     fn cleanup_ui(&mut self, ui: &mut egui::Ui, provider: ProviderId, language: LanguageId) {
@@ -1843,6 +1888,28 @@ fn render_json_value(ui: &mut egui::Ui, value: &ManageValue, depth: usize) {
 #[cfg(test)]
 mod manage_tests {
     use super::*;
+
+    #[test]
+    fn additional_limits_keep_scoped_quotas_even_when_values_match() {
+        let mut usage = crate::models::UsageData::default();
+        usage.weekly.available = true;
+        usage.weekly.percentage = 100.0;
+        let mut limit = crate::models::UsageLimit {
+            kind: "weekly_all".into(),
+            is_active: true,
+            usage: usage.weekly.clone(),
+            ..Default::default()
+        };
+        assert!(!additional_limit(ProviderId::Claude, &usage, &limit));
+        limit.model = Some("model".into());
+        assert!(additional_limit(ProviderId::Claude, &usage, &limit));
+        limit.model = None;
+        limit.scope = Some(serde_json::json!({"model": {"id": "x"}}));
+        assert!(additional_limit(ProviderId::Claude, &usage, &limit));
+        limit.scope = None;
+        usage.weekly.available = false;
+        assert!(additional_limit(ProviderId::Claude, &usage, &limit));
+    }
 
     #[test]
     fn envelope_parses_ok_and_error_shapes() {

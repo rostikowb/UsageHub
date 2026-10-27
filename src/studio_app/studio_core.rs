@@ -181,9 +181,15 @@ impl StudioApp {
         let _ = studio_diagnostics::send_owner_message(self.owner, WM_APP_SETTINGS_UPDATED);
     }
 
+    /// Queue a monitor poll. The persisted cache is refreshed asynchronously;
+    /// successful delivery does not mean the poll has completed.
+    pub(super) fn request_live_usage_refresh(&mut self) -> Result<(), String> {
+        studio_diagnostics::send_owner_message(self.owner, WM_APP_REFRESH_NOW)
+    }
+
     pub(super) fn request_refresh(&mut self) {
         crate::diagnose::log("Refresh now clicked in dashboard");
-        match studio_diagnostics::send_owner_message(self.owner, WM_APP_REFRESH_NOW) {
+        match self.request_live_usage_refresh() {
             Ok(()) => {
                 crate::diagnose::log("refresh request delivered to monitor message queue");
                 self.settings_error = None;
