@@ -6,6 +6,8 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.22.6] - 2026-10-27
+
 ### Changed
 
 - Prefer the existing native Direct3D 11 hardware dashboard host, retaining WARP software rendering and an eframe/OpenGL initialization fallback. Keep the original taskbar theme and renderer rather than adding another GUI toolkit.
@@ -1610,4 +1612,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.3]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.2...v2.22.3
 [2.22.4]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.3...v2.22.4
 [2.22.5]: https://github.com/rostikowb/UsageHub/releases/tag/v2.22.5
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...usagehub
+[2.22.6]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...v2.22.6
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.6...usagehub
