@@ -58,7 +58,7 @@ use windows::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE,
 };
-use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::System::Variant::{VT_EMPTY, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::{
     IPropertyStore, SHGetPropertyStoreForWindow, SHGetPropertyStoreFromParsingName, GPS_READWRITE,
 };
@@ -168,6 +168,24 @@ pub fn discover_official_exe(provider: ProviderId) -> ManagerResult<PathBuf> {
             _ => "Official Codex desktop package not found".into(),
         })
 }
+
+/// Use the vendor's real icon at every DPI, not a hand-encoded account ICO.
+/// Cache only icon discovery; normal launch discovery remains fresh. A removed
+/// package path is rediscovered without holding the cache lock during discovery.
+fn official_app_icon(provider: ProviderId) -> ManagerResult<PathBuf> {
+    if let Ok(cache) = OFFICIAL_ICON_CACHE.lock() {
+        if let Some(path) = cache.get(&provider).filter(|path| path.is_file()) {
+            return Ok(path.clone());
+        }
+    }
+    let path = discover_official_exe(provider)?;
+    if let Ok(mut cache) = OFFICIAL_ICON_CACHE.lock() {
+        cache.insert(provider, path.clone());
+    }
+    Ok(path)
+}
+
+static OFFICIAL_ICON_CACHE: Mutex<BTreeMap<ProviderId, PathBuf>> = Mutex::new(BTreeMap::new());
 
 /// Read `...\\App Paths\\<exe>` default value from HKCU, then HKLM.
 fn app_paths_lookup(exe: &str) -> ManagerResult<PathBuf> {
@@ -1871,40 +1889,65 @@ fn stamp_shortcut_app_id(link: &Path, aumid: &str) -> ManagerResult<()> {
     }
 }
 
-/// Stamp one live top-level window with the account identity plus relaunch
-/// metadata (command, icon resource, display name). Best-effort by design:
-/// a foreign-process window may refuse the store, which must never fail an
-/// open/focus/status operation.
-pub fn stamp_window_identity(
-    hwnd: isize,
-    aumid: &str,
-    relaunch_command: &str,
-    relaunch_icon: &str,
-    display_name: &str,
-) -> ManagerResult<()> {
+fn store_string_matches(
+    store: &IPropertyStore,
+    key: &PROPERTYKEY,
+    expected: &str,
+) -> ManagerResult<bool> {
+    unsafe {
+        let value = store
+            .GetValue(key)
+            .map_err(|error| format!("Unable to read the taskbar property: {error}"))?;
+        let inner = &*value.Anonymous.Anonymous;
+        Ok(inner.vt == VT_LPWSTR
+            && !inner.Anonymous.pwszVal.is_null()
+            && inner
+                .Anonymous
+                .pwszVal
+                .as_wide()
+                .iter()
+                .copied()
+                .eq(expected.encode_utf16()))
+    }
+}
+
+/// Bind a managed window to its existing account shortcut. Windows uses that
+/// shortcut's icon and launch command; duplicated relaunch properties can
+/// override it with stale data. Canonical vendor windows never use this path.
+pub fn stamp_window_identity(hwnd: isize, aumid: &str) -> ManagerResult<()> {
     let _com = ComGuard::acquire()?;
     unsafe {
-        let window = HWND(hwnd as *mut _);
-        let store: IPropertyStore = SHGetPropertyStoreForWindow(window)
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as *mut _))
             .map_err(|error| format!("Unable to open the window store: {error}"))?;
-        let result = (|| {
-            set_store_string(&store, &PKEY_AppUserModel_ID, aumid)?;
-            set_store_string(&store, &PKEY_AppUserModel_RelaunchCommand, relaunch_command)?;
-            set_store_string(
-                &store,
-                &PKEY_AppUserModel_RelaunchIconResource,
-                relaunch_icon,
-            )?;
-            set_store_string(
-                &store,
-                &PKEY_AppUserModel_RelaunchDisplayNameResource,
-                display_name,
-            )?;
-            // No Commit: window stores apply immediately.
-            Ok(())
-        })();
-        // `store` is ref-counted: dropping it releases, no manual Release.
-        result
+        let owned = store_string_matches(&store, &PKEY_AppUserModel_ID, aumid)?;
+        let empty: PROPVARIANT = std::mem::zeroed();
+        let mut legacy = false;
+        for key in [
+            &PKEY_AppUserModel_RelaunchCommand,
+            &PKEY_AppUserModel_RelaunchIconResource,
+            &PKEY_AppUserModel_RelaunchDisplayNameResource,
+        ] {
+            let value = store
+                .GetValue(key)
+                .map_err(|error| format!("Unable to read account relaunch metadata: {error}"))?;
+            if value.Anonymous.Anonymous.vt != VT_EMPTY {
+                store.SetValue(key, &empty).map_err(|error| {
+                    format!("Unable to clear account relaunch metadata: {error}")
+                })?;
+                legacy = true;
+            }
+        }
+        if owned && !legacy {
+            return Ok(());
+        }
+        if owned {
+            // Retire Explorer's cached broken icon only for this owned group.
+            store
+                .SetValue(&PKEY_AppUserModel_ID, &empty)
+                .map_err(|error| format!("Unable to refresh account icon identity: {error}"))?;
+        }
+        // Publish identity last, after the matching shortcut is ready.
+        set_store_string(&store, &PKEY_AppUserModel_ID, aumid)
     }
 }
 /// Undo only the identity previously stamped by UsageHub on this Default.
@@ -1959,23 +2002,6 @@ fn restore_default_window_identity(hwnd: isize, ctx: &AccountContext) -> Manager
     }
 }
 
-/// Relaunch metadata shared by shortcut-adjacent surfaces and live windows.
-/// The command relaunches through the manager wrapper (same isolation env
-/// as every other path); `icon_resource` uses the `"<path>,0"` spelling.
-pub fn relaunch_identity(ctx: &AccountContext) -> ManagerResult<(String, String, String)> {
-    let icon = stable_account_icon(ctx.provider, &ctx.profile.id, &ctx.profile.color)?;
-    let (wrapper, args) = manager_launch_command(ctx)?;
-    Ok((
-        format!("\"{}\" {args}", wrapper.display()),
-        format!("{},0", icon.display()),
-        format!(
-            "UsageHub {} - {}",
-            ctx.provider.descriptor().key,
-            ctx.profile.name
-        ),
-    ))
-}
-
 /// Stamp every live window of `ctx` in `snapshot`. Returns successes;
 /// refusals are skipped, never fatal. Cheap when unchanged: a per-process
 /// `(hwnd -> pid + identity fingerprint)` cache skips windows that already
@@ -1996,11 +2022,24 @@ pub fn stamp_account_windows_in(ctx: &AccountContext, snapshot: &Snapshot) -> us
         }
         return restored;
     }
-    let aumid = account_app_user_model_id(ctx.provider, &ctx.profile.id);
-    let Ok((command, icon, name)) = relaunch_identity(ctx) else {
+    let Ok(shortcut) = ensure_account_shortcut(ctx) else {
         return 0;
     };
-    let fingerprint = format!("{aumid}|{command}|{icon}|{name}");
+    stamp_managed_account_windows_in(ctx, snapshot, &shortcut)
+}
+
+fn stamp_managed_account_windows_in(
+    ctx: &AccountContext,
+    snapshot: &Snapshot,
+    shortcut: &ShortcutInfo,
+) -> usize {
+    let aumid = &shortcut.app_user_model_id;
+    let fingerprint = format!(
+        "{}|{}|{}",
+        shortcut_fingerprint(ctx, &shortcut.target, &shortcut.arguments),
+        aumid,
+        shortcut.icon_path.display()
+    );
     let windows = account_live_windows_in(ctx, snapshot);
     // Decide under the lock, stamp outside it: a hung cross-process COM
     // call must never block other accounts or the worker thread.
@@ -2021,7 +2060,7 @@ pub fn stamp_account_windows_in(ctx: &AccountContext, snapshot: &Snapshot) -> us
     let mut stamped = 0usize;
     let mut done: Vec<(isize, u32)> = Vec::new();
     for window in &todo {
-        match stamp_window_identity(window.hwnd, &aumid, &command, &icon, &name) {
+        match stamp_window_identity(window.hwnd, aumid) {
             Ok(()) => {
                 done.push((window.hwnd, window.pid));
                 stamped += 1;
@@ -2140,10 +2179,8 @@ pub fn launch_and_stamp_account(ctx: &AccountContext, extra_args: &[String]) -> 
     Ok(pid)
 }
 
-/// Id-keyed icon path for one account WITHOUT creating anything: the same
-/// spelling [`stable_account_icon`] writes (current color tag included).
-/// Single 16x16 32-bit entry; the fill color comes from the account `color`
-/// (`#rrggbb`) or a stable id hash fallback.
+/// Legacy generated-icon path, retained only for scoped cleanup and existing
+/// shortcut references. New account identities use the official app icon.
 fn account_icon_path(provider: ProviderId, id: &str, color: &str) -> ManagerResult<PathBuf> {
     let root = paths::fork_config_dir().ok_or("Unable to resolve the config directory")?;
     let (red, green, blue) = icon_rgb(color, &format!("{provider:?}:{id}"));
@@ -2157,25 +2194,6 @@ fn account_icon_path(provider: ProviderId, id: &str, color: &str) -> ManagerResu
         "{provider_key}-{}-{tag}.ico",
         sanitize_file_stem(id)?
     )))
-}
-
-/// Stable icon file for one account: id-keyed with a color tag so renames
-/// reuse it and color changes cut over to a new file. Single 16x16 32-bit
-/// entry encoded by hand (no imaging dependency); the fill color comes from
-/// the account `color` (`#rrggbb`) or a stable id hash fallback.
-pub fn stable_account_icon(provider: ProviderId, id: &str, color: &str) -> ManagerResult<PathBuf> {
-    let file = account_icon_path(provider, id, color)?;
-    if !file.is_file() {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("Unable to create the icon directory: {error}"))?;
-        }
-        let (red, green, blue) = icon_rgb(color, &format!("{provider:?}:{id}"));
-        let bytes = encode_solid_ico(red, green, blue);
-        std::fs::write(&file, bytes)
-            .map_err(|error| format!("Unable to write the account icon: {error}"))?;
-    }
-    Ok(file)
 }
 
 /// Exact taskbar-artifact paths owned by one account, for deletion preview:
@@ -2273,52 +2291,6 @@ fn icon_rgb(color: &str, fallback_seed: &str) -> (u8, u8, u8) {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     FALLBACK[hash as usize % FALLBACK.len()]
-}
-
-fn encode_solid_ico(red: u8, green: u8, blue: u8) -> Vec<u8> {
-    const SIZE: usize = 16;
-    let mut out = Vec::with_capacity(6 + 16 + 40 + SIZE * SIZE * 4 + 32);
-    // ICONDIR: reserved, type=1, count=1.
-    out.extend_from_slice(&[0, 0, 1, 0, 1, 0]);
-    // ICONDIRENTRY: 16x16, 0 colors, 1 plane, 32bpp, data size, offset=6+16.
-    let data_size = (40 + SIZE * SIZE * 4 + 32) as u32;
-    out.extend_from_slice(&[
-        SIZE as u8,
-        SIZE as u8,
-        0,
-        0,
-        1,
-        0,
-        32,
-        0,
-        (data_size & 0xff) as u8,
-        ((data_size >> 8) & 0xff) as u8,
-        ((data_size >> 16) & 0xff) as u8,
-        ((data_size >> 24) & 0xff) as u8,
-        22,
-        0,
-        0,
-        0,
-    ]);
-    // BITMAPINFOHEADER: negative height = top-down, 32bpp, BI_RGB.
-    out.extend_from_slice(&40u32.to_le_bytes());
-    out.extend_from_slice(&(SIZE as i32).to_le_bytes());
-    out.extend_from_slice(&((SIZE as i32).wrapping_neg()).to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&32u16.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&((SIZE * SIZE * 4) as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    // XOR mask: solid BGRA + full alpha.
-    for _ in 0..SIZE * SIZE {
-        out.extend_from_slice(&[blue, green, red, 0xff]);
-    }
-    // AND mask: all zero (opaque).
-    out.extend_from_slice(&[0u8; 32]);
-    out
 }
 
 /// Stable shortcut file name: the immutable account id, never the display
@@ -2446,11 +2418,7 @@ pub fn ensure_account_shortcut(ctx: &AccountContext) -> ManagerResult<ShortcutIn
     } else {
         account_app_user_model_id(ctx.provider, &ctx.profile.id)
     };
-    let icon = if canonical {
-        discover_official_exe(ctx.provider)?
-    } else {
-        stable_account_icon(ctx.provider, &ctx.profile.id, &ctx.profile.color)?
-    };
+    let icon = official_app_icon(ctx.provider)?;
     let (exe, arguments) = manager_launch_command(ctx)?;
     let dir = shortcuts_root()?;
     std::fs::create_dir_all(&dir)
@@ -2587,18 +2555,23 @@ pub fn refresh_taskbar_identities() -> ManagerResult<(usize, usize)> {
                 Ok(ctx) => ctx,
                 Err(_) => continue,
             };
-            if ensure_account_shortcut(&ctx).is_ok() {
+            let shortcut = ensure_account_shortcut(&ctx);
+            if shortcut.is_ok() {
                 ensured += 1;
             }
             if profile.enabled {
-                stamp_account_windows_in(&ctx, &snapshot);
+                if is_canonical_default(&ctx) {
+                    stamp_account_windows_in(&ctx, &snapshot);
+                } else if let Ok(shortcut) = &shortcut {
+                    stamp_managed_account_windows_in(&ctx, &snapshot, shortcut);
+                }
             }
             // Track expected files without re-deriving names elsewhere.
             if let Ok(dir) = shortcuts_root() {
                 expected_lnk.insert(dir.join(shortcut_file_name(provider, profile)));
             }
             if !is_canonical_default(&ctx) {
-                if let Ok(icon) = stable_account_icon(provider, &profile.id, &profile.color) {
+                if let Ok(icon) = account_icon_path(provider, &profile.id, &profile.color) {
                     expected_icons.insert(icon);
                 }
             }
@@ -2788,24 +2761,6 @@ mod tests {
             account_app_user_model_id(ProviderId::Claude, "a/b c"),
             "CodeZeno.UsageHub.Claude.a_b_c"
         );
-    }
-
-    #[test]
-    fn icon_bytes_are_deterministic_per_color() {
-        let first = encode_solid_ico(10, 20, 30);
-        let second = encode_solid_ico(10, 20, 30);
-        assert_eq!(first, second);
-        assert_ne!(first, encode_solid_ico(10, 20, 31));
-        // ICONDIR magic + one 16x16 32-bit entry.
-        assert_eq!(&first[0..6], &[0, 0, 1, 0, 1, 0]);
-    }
-
-    #[test]
-    fn icon_color_parses_hex_with_stable_fallback() {
-        assert_eq!(icon_rgb("#ff0000", "seed"), (255, 0, 0));
-        let fallback = icon_rgb("not-a-color", "same-seed");
-        assert_eq!(fallback, icon_rgb("", "same-seed"));
-        assert_ne!(fallback, icon_rgb("", "other-seed"));
     }
 
     #[test]

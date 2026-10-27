@@ -6,6 +6,18 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.22.7] - 2026-10-28
+
+### Fixed
+
+- Use the original vendor executable icon in each account shortcut and let its matching window AUMID use that shortcut. Remove stale window relaunch overrides and rebind only an owned legacy group when needed, avoiding the generic file icon caused by malformed handmade ICOs. Keep per-account isolation and account-bar colors unchanged.
+
+### Changed
+
+- Cache vendor executable discovery for icon use only; retain the legacy generated-icon path for existing pin and cleanup handling.
+- Rewrite the GitHub README as a concise landing page with quick start, provider setup, account safety and links to detailed documentation; preserve incoming anchors and verify the actual GitHub rendering.
+
+
 ## [2.22.6] - 2026-10-27
 
 ### Changed
@@ -1615,4 +1627,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.4]: https://github.com/CodeZeno/Claude-Code-Usage-Monitor/compare/v2.22.3...v2.22.4
 [2.22.5]: https://github.com/rostikowb/UsageHub/releases/tag/v2.22.5
 [2.22.6]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...v2.22.6
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.6...usagehub
+[2.22.7]: https://github.com/rostikowb/UsageHub/compare/v2.22.6...v2.22.7
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.7...usagehub
