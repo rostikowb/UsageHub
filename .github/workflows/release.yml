@@ -60,4 +60,5 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: target/x86_64-pc-windows-msvc/release/usagehub.exe
+          overwrite_files: false
           generate_release_notes: true
