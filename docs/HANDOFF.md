@@ -2,6 +2,13 @@
 
 Актуальний знімок — **2026-10-31: 2.22.8 встановлено, перевірено та опубліковано**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
 
+## 2.23.2: двокрокове очищення + проєктний UI/UX скіл
+
+- У проєкт встановлено **UI/UX Pro Max** у `.omp/skills/ui-ux-pro-max` (SKILL.md + data/references/scripts, ~3.5 MB, з github.com/nextlevelbuilder/ui-ux-pro-max-skill). omp сканує `<repo>/.omp/skills/*/SKILL.md`; скіл закомічено разом із релізом. Застосовано його правила: confirmation dialogs, progressive disclosure, один primary action, підписи полів, видимий фокус.
+- `cleanup_ui` тепер двокроковий (`ManageState.cleanup_step`): **Крок 1** — три дії по одному рядку + одне речення наслідку, кеш у **Деталі**, кнопки **Продовжити/Скасувати**; **Крок 2** — компактний перегляд (`Буде видалено: N · SIZE`, статус бекапу, ID, **Назад/Виконати очищення**), технічні шляхи й попередження під **Деталі**. Довгі дисклеймери прибрано з основної поверхні.
+- Прогрес із 2.23.1 збережено (спінер + фаза + секунди).
+- Перевірено нативно обидва кроки на Claude Second; **Apply не натискався**, дані не видалялися. Suite **752 passed / 6 ignored**. Встановлено **8 731 648 байтів**, SHA-256 `5E742486983ECBF81AED1426EC437B9725ABB18130160305E5AC84DFA4625175`; опубліковано [v2.23.2](https://github.com/rostikowb/UsageHub/releases/tag/v2.23.2) з коміту `f6fd8486b3bd2f30e974ce37b9dc99be46311f45`.
+
 ## 2.23.1: прогрес очищення й зрозумілі дії
 
 - Причина «зависання»: перегляд (`preview`) Default/великих акаунтів рахує розміри каталогів; раніше UI не мав жодного індикатора. `cleanup.rs` тепер пише JSON-фази у файл з `--progress-file` (`Collecting targets`, `Stopping the account`, `Creating encrypted backup`, `Removing credentials`, `Removing files`, `Removing folders`, `Updating the account list`, `Ready`), а дашборд показує спінер, фазу й секунди.
