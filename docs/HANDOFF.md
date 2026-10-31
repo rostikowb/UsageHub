@@ -1,6 +1,6 @@
 # UsageHub: передача наступній сесії
 
-Актуальний знімок — **2026-10-31: 2.22.8 готується до публікації; публічний release поки v2.22.7**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
+Актуальний знімок — **2026-10-31: 2.22.8 встановлено, перевірено та опубліковано**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
 
 ## 2.22.8: зрозуміле очищення, скидання без втрати профілю, вхід Codex
 
@@ -24,6 +24,7 @@
 - Фінальний release build після останніх layout/locale правок: **8 648 192 байти**, SHA-256 **`CDEF9CEB0609C4B9F3EBEF6E04ECC37E7C90AC16FE1F94F0DCFBC4A070D00E4B`**, native version 2.22.8.0; hash встановленого `D:/Soft/UsageHub/usagehub.exe` перевірено після копіювання. Rollback: завантажити asset v2.22.7 з GitHub (на диску лишився rollback лише 2.22.6: `usagehub-2.22.6-before-icons.exe`).
 - Ізольований CLI-smoke у тимчасових `USAGEHUB_*` roots: `reset` → success, `removed_from_registry=false`, профіль у `list`, fixture-історія видалена; `delete` → success, removed, профіль і owned-каталог зникли; нічого поза scratch не змінено. `signin` коректно відмовляє для Default і Claude.
 - Реальний GUI 2.22.8: нове вікно очищення для Claude Second і Codex `second` (managed) показує чотири дії та точний id; для Codex Default відображається explicit opt-in і Preview заблокований без нього; Apply не натискався, реальні дані не змінювалися.
+- Опубліковано [v2.22.8](https://github.com/rostikowb/UsageHub/releases/tag/v2.22.8) з коміту `547da665e1347ef1ce6a89aa24f2589dfa966450`. GitHub API підтвердив єдиний asset `usagehub.exe`, size 8 648 192, digest `sha256:cdef9ceb…` — ідентичний встановленому; `/releases/latest` повернув v2.22.8. Це локальний gnullvm release, не доказ hosted MSVC CI чи повного updater-download/replace сценарію.
 - Бар після фіксу: недоступні Claude Second і Codex `second` показують порожні смужки з `!`, а не фальшиві 100%; робочі Default показують реальні відсотки.
 
 
