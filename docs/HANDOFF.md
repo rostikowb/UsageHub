@@ -2,6 +2,14 @@
 
 Актуальний знімок — **2026-10-31: 2.22.8 встановлено, перевірено та опубліковано**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
 
+## 2.23.1: прогрес очищення й зрозумілі дії
+
+- Причина «зависання»: перегляд (`preview`) Default/великих акаунтів рахує розміри каталогів; раніше UI не мав жодного індикатора. `cleanup.rs` тепер пише JSON-фази у файл з `--progress-file` (`Collecting targets`, `Stopping the account`, `Creating encrypted backup`, `Removing credentials`, `Removing files`, `Removing folders`, `Updating the account list`, `Ready`), а дашборд показує спінер, фазу й секунди.
+- Кнопки: **Переглянути, що буде видалено** ≠ **Виконати очищення**; після перегляду явно «Ще нічого не видалено». Список дій компактний (наслідок лише для вибраної), Apply видно без прокрутки.
+- Помилка preview пише «Нічого не змінено»; для `canonical alias ... no desktop identity` показується підказка відкрити акаунт і кнопка **Відкрити акаунт**.
+- Evidence на цій машині: Default уже проходив очищення (`cleanup_epoch`=1) і його тека Claude втратила `config.json`, тому повторний FullReset блокується захисною перевіркою — це не зависання. Claude Second має epoch=0, тобто **не видалявся**: виконувався лише preview; видалення потребує **Виконати очищення** + введення ID.
+- Встановлено **8 720 896 байтів**, SHA-256 `18F0DD70BB9380BA40D3450A1D8B8AE9ECC0A73746D1363DD8D832DB16CDE55F`; suite **752 passed / 6 ignored**; нативно перевірено спінер/фазу та видимість Apply. Опубліковано [v2.23.1](https://github.com/rostikowb/UsageHub/releases/tag/v2.23.1) з коміту `0d7493ba4facfb9c56d27b2be8baf510fdc6df48`.
+
 ## 2.23.0: автопошук акаунтів
 
 - `manager/discovery.rs` сканує Claude Desktop data (`%LOCALAPPDATA%\Claude-Data\*` з `config.json`), `~/.claude`, `CLAUDE_CONFIG_DIR`, явний `CODEX_HOME` (не `~/.codex`) і входи `openai-codex` з omp (`~/.omp/agent/agent.db`, read-only через наявний `winsqlite`). Межі: до 50 записів на корінь, без глибокого обходу.
