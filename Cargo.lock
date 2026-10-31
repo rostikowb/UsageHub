@@ -2799,7 +2799,7 @@ dependencies = [
 
 [[package]]
 name = "usagehub"
-version = "2.23.0"
+version = "2.23.1"
 dependencies = [
  "aes-gcm",
  "eframe",

@@ -986,11 +986,19 @@ fn cleanup_context(tokens: &[String]) -> Result<(ProviderId, String, AccountCont
     Ok((provider, id, context))
 }
 
+fn set_progress_file(tokens: &[String]) -> Result<(), Fail> {
+    if let Some(path) = flag(tokens, "--progress-file")? {
+        cleanup::set_progress_file(Some(std::path::PathBuf::from(path)));
+    }
+    Ok(())
+}
+
 fn cmd_cleanup_preview(tokens: &[String]) -> Result<Value, Fail> {
     let (provider, id, context) = cleanup_context(tokens)?;
     // scope_from_cli_name is the single owner of the cache|logout|delete|reset spelling.
     let scope = cleanup::scope_from_cli_name(&need(flag(tokens, "--scope")?, "--scope")?)
         .map_err(Fail::usage)?;
+    set_progress_file(tokens)?;
     // Strictly read-only: no guard, no mutation, no backup.
     let plan = cleanup::preview_cleanup(&context, scope).map_err(Fail::op)?;
     Ok(json!({
@@ -1004,6 +1012,7 @@ fn cmd_cleanup_apply(tokens: &[String]) -> Result<Value, Fail> {
     let (provider, id, context) = cleanup_context(tokens)?;
     let scope = cleanup::scope_from_cli_name(&need(flag(tokens, "--scope")?, "--scope")?)
         .map_err(Fail::usage)?;
+    set_progress_file(tokens)?;
     let confirm = need(flag(tokens, "--confirm")?, "--confirm")?;
     if confirm != id {
         return Err(Fail::usage(format!(

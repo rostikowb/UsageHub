@@ -6,6 +6,17 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.23.1] - 2026-10-31
+
+### Changed
+
+- Cleanup preview and apply now report live progress: a spinner, the current phase (collecting targets, stopping the account, encrypted backup, credentials, files, folders, account list) and elapsed seconds. The dialog explains that large accounts can take minutes and must stay open.
+- Clearer actions: **Preview what will be deleted** vs **Apply cleanup**, with an explicit "nothing has been deleted yet" note after a preview. The apply button no longer sits below the scroll fold, and Default states that it belongs to the official app and cannot be removed.
+
+### Fixed
+
+- Long previews of large Default accounts no longer look like a hang; the backend emits phase updates while it sizes directories and verifies the plan.
+
 ## [2.23.0] - 2026-10-31
 
 ### Added
@@ -1660,4 +1671,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.8]: https://github.com/rostikowb/UsageHub/compare/v2.22.7...v2.22.8
 [2.22.9]: https://github.com/rostikowb/UsageHub/compare/v2.22.8...v2.22.9
 [2.23.0]: https://github.com/rostikowb/UsageHub/compare/v2.22.9...v2.23.0
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.0...usagehub
+[2.23.1]: https://github.com/rostikowb/UsageHub/compare/v2.23.0...v2.23.1
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.1...usagehub

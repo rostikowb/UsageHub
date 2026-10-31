@@ -115,8 +115,44 @@ pub struct CleanupReport {
 
 /// Enumerate exact targets with proven ownership. Strictly read-only: no
 /// backup, no process stop, no deletion, no settings or task changes.
+/// Optional JSON-lines progress sink for the dashboard. Set by the CLI from
+/// `--progress-file`; each phase is appended so the UI can show what a long
+/// backup/deletion is doing without capturing the command's output.
+static PROGRESS_FILE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn set_progress_file(path: Option<std::path::PathBuf>) {
+    if let Ok(mut slot) = PROGRESS_FILE.lock() {
+        *slot = path;
+    }
+}
+
+fn progress(phase: &str) {
+    let Ok(slot) = PROGRESS_FILE.lock() else {
+        return;
+    };
+    let Some(path) = slot.as_ref() else { return };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "{{\"phase\":{},\"at\":{at}}}\n",
+        serde_json::to_string(phase).unwrap_or_else(|_| "\"\"".into())
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 pub fn preview_cleanup(ctx: &AccountContext, scope: CleanupScope) -> ManagerResult<CleanupPlan> {
+    progress("Collecting targets");
     let (targets, warnings) = derive_targets(ctx, scope)?;
+    progress("Ready");
     Ok(CleanupPlan {
         scope,
         provider: ctx.provider,
@@ -163,11 +199,13 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
     // Fresh-registry revalidation. Submitted plan paths and `backup_id` are
     // never trusted; scope/provider/account are confirmed against the live
     // registry and every target below is re-derived from `ctx`.
+    progress("Preparing");
     let fresh = resolve_context(plan.provider, &plan.account_id)?;
 
     // Graceful quiesce of the selected account only (lifecycle takes no
     // account guard around stop by design). Ok without a verified idle state
     // is NOT quiesced: abort before snapshot or any mutation.
+    progress("Stopping the account");
     let stop =
         super::lifecycle::stop_account_processes(plan.provider, &plan.account_id).map_err(
             |error| {
@@ -228,6 +266,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
                 plan.scope,
                 CleanupScope::AccountLocalData | CleanupScope::FullReset
             ));
+    progress("Creating encrypted backup");
     let backup_id = if needs_backup {
         // Vault targets recorded by the authenticated attestation; assigned
         // by both snapshot branches below and consulted before any mutation.
@@ -391,6 +430,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
     // Execute in passes: vault entries, skill-link inodes, files, then trees.
     let mut results = Vec::new();
     let mut aborted = false;
+    progress("Removing credentials");
     if !exec_credential_targets(&fresh, &derived, &mut results, &mut warnings) {
         aborted = true;
     }
@@ -429,6 +469,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
         }
     }
     if !aborted {
+        progress("Removing files");
         let scrub_path = desktop_scrub_path(&fresh);
         for target in derived.iter().filter(|t| {
             !matches!(
@@ -473,6 +514,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
         }
     }
     if !aborted {
+        progress("Removing folders");
         let clear_roots = canonical_clear_roots();
         for target in derived
             .iter()
@@ -530,6 +572,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
 
     // Only delete retires a managed profile. Reset keeps its registry and
     // source paths so the official application can create a fresh login.
+    progress("Updating the account list");
     let data_ok = !aborted && results.iter().all(|r| r.ok);
     let registry_required =
         plan.scope == CleanupScope::AccountLocalData && data_ok && fresh.is_managed();
@@ -567,6 +610,7 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
         warnings.push("Account entry preserved for a fresh sign-in".to_string());
     }
 
+    progress("Ready");
     let success = data_ok && registry_ok && (!registry_required || removed_from_registry);
     Ok(CleanupReport {
         scope: plan.scope,
