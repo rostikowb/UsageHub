@@ -6,6 +6,13 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.23.2] - 2026-10-31
+
+### Changed
+
+- Rebuild the account-cleanup dialog as a two-step flow. **Step 1** asks one question with three one-line actions (sign out, reset, delete) and a single sentence for the selected one; cache cleanup moved under **Details** so it can never silently become the main action. **Step 2** shows only the review: how many items and how much data will be deleted, backup status, the exact-ID field, then **Back** and **Apply cleanup**.
+- Remove the wall of disclaimers from the primary surface: "local data only" and target paths live under **Details**, while the main steps stay one screen tall.
+
 ## [2.23.1] - 2026-10-31
 
 ### Changed
@@ -1672,4 +1679,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.9]: https://github.com/rostikowb/UsageHub/compare/v2.22.8...v2.22.9
 [2.23.0]: https://github.com/rostikowb/UsageHub/compare/v2.22.9...v2.23.0
 [2.23.1]: https://github.com/rostikowb/UsageHub/compare/v2.23.0...v2.23.1
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.1...usagehub
+[2.23.2]: https://github.com/rostikowb/UsageHub/compare/v2.23.1...v2.23.2
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.2...usagehub

@@ -137,6 +137,8 @@ pub(super) struct ManageState {
     include_external_default: bool,
     no_backup_ack: bool,
     error_from_preview: bool,
+    /// Cleanup dialog step: 0 = choose action, 1 = review/apply.
+    cleanup_step: u8,
     skip_backup: bool,
     cleanup_result: Option<ManageValue>,
     confirm_force_stop: Option<String>,
@@ -181,6 +183,7 @@ impl Default for ManageState {
             include_external_default: false,
             no_backup_ack: false,
             error_from_preview: false,
+            cleanup_step: 0,
             skip_backup: false,
             cleanup_result: None,
             confirm_force_stop: None,
@@ -988,6 +991,7 @@ impl StudioApp {
                             } else {
                                 CleanupScopeSel::FullReset
                             };
+                        self.manage.cleanup_step = 0;
                         self.manage.navigate_cleanup = true;
                         self.manage.cleanup_preview = None;
                         self.manage.cleanup_preview_key = None;
@@ -1549,32 +1553,6 @@ impl StudioApp {
                     if profile.is_none() {
                         ui.colored_label(egui::Color32::from_rgb(196, 64, 64), language.text("This profile is no longer registered. Close this window and choose another account."));
                     }
-                    ui.label(language.text("Choose an action. Preview does not change data."));
-                    ui.weak(language.text("These actions affect local data only; they do not erase cloud or system-wide records."));
-                    ui.add_enabled_ui(!busy, |ui| {
-                        ui.radio_value(&mut self.manage.cleanup_scope, CleanupScopeSel::Logout, CleanupScopeSel::Logout.label(language));
-                        ui.radio_value(&mut self.manage.cleanup_scope, CleanupScopeSel::FullReset, CleanupScopeSel::FullReset.label(language));
-                        if ui.add_enabled(managed, egui::RadioButton::new(self.manage.cleanup_scope == CleanupScopeSel::LocalData, CleanupScopeSel::LocalData.label(language))).clicked() {
-                            self.manage.cleanup_scope = CleanupScopeSel::LocalData;
-                        }
-                        ui.collapsing(language.text("Advanced"), |ui| {
-                            ui.radio_value(&mut self.manage.cleanup_scope, CleanupScopeSel::Cache, CleanupScopeSel::Cache.label(language));
-                        });
-                        // One consequence line for the selected action only.
-                        ui.weak(language.text(match self.manage.cleanup_scope {
-                            CleanupScopeSel::Logout => "Removes identified local sign-in credentials; keeps chats, settings and identifiers contained in that history. Other credentials or sessions may remain.",
-                            CleanupScopeSel::FullReset => "Removes identified owned local sign-in data, history and settings; keeps the UsageHub profile for a fresh sign-in. Unknown or unowned data may remain.",
-                            CleanupScopeSel::LocalData => "Managed profiles only: removes local profile data and removes the profile from the bar after successful cleanup.",
-                            CleanupScopeSel::Cache => "Removes regenerable cached files only; no backup is created.",
-                        }));
-                        if external_default {
-                            ui.weak(language.text("Default belongs to the official app and cannot be removed from UsageHub."));
-                        }
-                        if external_default && self.manage.cleanup_scope == CleanupScopeSel::FullReset {
-                            ui.label(language.text("Default uses the official application's main local data, not a removable UsageHub profile. Reset affects that data."));
-                            ui.checkbox(&mut self.manage.include_external_default, language.text("I explicitly agree to reset the main Default account's local data."));
-                        }
-                    });
                     let current = current_cleanup_key(&self.manage, key);
                     if self.manage.cleanup_preview_key.as_ref() != Some(&current) {
                         self.manage.cleanup_preview = None;
@@ -1585,50 +1563,104 @@ impl StudioApp {
                     }
                     let blocked = external_default_reset_blocked(current.scope, external_default, current.include_external);
                     let allowed = profile.is_some() && (current.scope != CleanupScopeSel::LocalData || managed);
-                    if blocked {
-                        ui.label(language.text("Select the main-account consent above before previewing."));
-                    }
-                    if ui.add_enabled(!busy && !blocked && allowed, egui::Button::new(language.text("Preview what will be deleted"))).clicked() {
-                        self.manage.cleanup_preview = None;
-                        self.manage.cleanup_preview_key = None;
-                        self.manage.cleanup_confirm.clear();
-                        let argv = vec!["cleanup".into(), "preview".into(), "--provider".into(), current.provider.clone(), "--id".into(), current.account.clone(), "--scope".into(), current.scope.cli_name().into()];
-                        self.spawn_manage(OpKind::CleanupPreview { key: current.clone() }, argv);
-                    }
-                    if let Some(preview) = self.manage.cleanup_preview.clone() {
-                        if current.scope != CleanupScopeSel::Cache {
-                            ui.add_enabled_ui(!busy, |ui| {
-                                ui.collapsing(language.text("Advanced"), |ui| {
-                                    if ui.checkbox(&mut self.manage.skip_backup, language.text("Skip the encrypted backup")).changed() {
-                                        self.manage.no_backup_ack = false;
-                                    }
-                                    if self.manage.skip_backup {
-                                        ui.checkbox(&mut self.manage.no_backup_ack, language.text("I understand there will be no backup to undo this cleanup."));
-                                    }
-                                });
-                            });
-                        }
-                        ui.label(format!("{}: {}", language.text("Type this exact account ID to confirm"), current.account));
+                    ui.weak(language.text("Nothing changes until you confirm."));
+                    if self.manage.cleanup_step == 0 {
                         ui.add_enabled_ui(!busy, |ui| {
-                            ui.add(crate::ui::components::text_field::singleline(&mut self.manage.cleanup_confirm).desired_width(220.0));
+                            ui.radio_value(&mut self.manage.cleanup_scope, CleanupScopeSel::Logout, CleanupScopeSel::Logout.label(language));
+                            ui.radio_value(&mut self.manage.cleanup_scope, CleanupScopeSel::FullReset, CleanupScopeSel::FullReset.label(language));
+                            if ui.add_enabled(managed, egui::RadioButton::new(self.manage.cleanup_scope == CleanupScopeSel::LocalData, CleanupScopeSel::LocalData.label(language))).clicked() {
+                                self.manage.cleanup_scope = CleanupScopeSel::LocalData;
+                            }
+                            ui.weak(language.text(match self.manage.cleanup_scope {
+                                CleanupScopeSel::Logout => "Removes sign-in data only. Chats stay.",
+                                CleanupScopeSel::FullReset => "Clears sign-in, history and settings. The profile stays.",
+                                CleanupScopeSel::LocalData => "The same, and the profile leaves UsageHub and the bar.",
+                                CleanupScopeSel::Cache => "Regenerable cache only, no backup.",
+                            }));
+                            if external_default {
+                                ui.weak(language.text("Default belongs to the official app and cannot be removed from UsageHub."));
+                            }
+                            if external_default && self.manage.cleanup_scope == CleanupScopeSel::FullReset {
+                                ui.checkbox(&mut self.manage.include_external_default, language.text("I explicitly agree to reset the main Default account's local data."));
+                            }
                         });
-                        let key_ok = self.manage.cleanup_preview_key.as_ref() == Some(&current);
-                        let typed = cleanup_confirm_ready(&self.manage.cleanup_confirm, &current.account);
-                        let backup_ok = !self.manage.skip_backup || self.manage.no_backup_ack;
-                        let ready = key_ok && typed && backup_ok && !blocked && allowed && !busy;
-                        if !ready {
-                            let reason = if busy { "Wait for the operation to finish." } else if !key_ok { "Preview the current selection first." } else if blocked { "Select the main-account consent above before previewing." } else if !allowed { "This account cannot use the selected action." } else if !typed { "Type the exact account ID shown above." } else { "Acknowledge the no-backup choice above." };
-                            ui.weak(language.text(reason));
+                        if blocked {
+                            ui.weak(language.text("Select the main-account consent above before previewing."));
                         }
-                        ui.weak(language.text("Preview only lists targets. Nothing has been deleted yet."));
-                        if ui.add_enabled(ready, egui::Button::new(language.text("Apply cleanup"))).clicked() {
-                            let mut argv = vec!["cleanup".into(), "apply".into(), "--provider".into(), current.provider.clone(), "--id".into(), current.account.clone(), "--scope".into(), current.scope.cli_name().into(), "--confirm".into(), current.account.clone()];
-                            if self.manage.skip_backup { argv.push("--no-backup".into()); }
-                            self.spawn_manage(OpKind::CleanupApply, argv);
-                        }
-                        Self::render_cleanup_preview(ui, &preview, language, current.scope, self.manage.skip_backup);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!busy && !blocked && allowed, egui::Button::new(language.text("Continue"))).clicked() {
+                                self.manage.cleanup_preview = None;
+                                self.manage.cleanup_preview_key = None;
+                                self.manage.cleanup_confirm.clear();
+                                self.manage.cleanup_step = 1;
+                                let argv = vec!["cleanup".into(), "preview".into(), "--provider".into(), current.provider.clone(), "--id".into(), current.account.clone(), "--scope".into(), current.scope.cli_name().into()];
+                                self.spawn_manage(OpKind::CleanupPreview { key: current.clone() }, argv);
+                            }
+                            if ui.add_enabled(!busy, egui::Button::new(language.text("Cancel"))).clicked() {
+                                close = true;
+                            }
+                        });
+                        ui.collapsing(language.text("Details"), |ui| {
+                            ui.weak(language.text("These actions affect local data only; they do not erase cloud or system-wide records."));
+                            if ui.add_enabled(!busy, egui::Button::new(language.text("Clear cache only"))).clicked() {
+                                self.manage.cleanup_scope = CleanupScopeSel::Cache;
+                                self.manage.cleanup_preview = None;
+                                self.manage.cleanup_preview_key = None;
+                                self.manage.cleanup_confirm.clear();
+                                self.manage.cleanup_step = 1;
+                                let cache = current_cleanup_key(&self.manage, key);
+                                let argv = vec!["cleanup".into(), "preview".into(), "--provider".into(), cache.provider.clone(), "--id".into(), cache.account.clone(), "--scope".into(), "cache".into()];
+                                self.spawn_manage(OpKind::CleanupPreview { key: cache }, argv);
+                            }
+                        });
                     } else {
-                        ui.weak(language.text("Preview the current selection before applying."));
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!busy, egui::Button::new(language.text("Back"))).clicked() {
+                                self.manage.cleanup_step = 0;
+                                self.manage.cleanup_preview = None;
+                                self.manage.cleanup_preview_key = None;
+                                self.manage.cleanup_confirm.clear();
+                            }
+                            ui.label(egui::RichText::new(current.scope.label(language)).strong());
+                        });
+                        if blocked {
+                            ui.weak(language.text("Select the main-account consent above before previewing."));
+                        }
+                        if let Some(preview) = self.manage.cleanup_preview.clone() {
+                            Self::render_cleanup_preview(ui, &preview, language, current.scope, self.manage.skip_backup);
+                            if current.scope != CleanupScopeSel::Cache {
+                                ui.add_enabled_ui(!busy, |ui| {
+                                    ui.collapsing(language.text("Advanced"), |ui| {
+                                        if ui.checkbox(&mut self.manage.skip_backup, language.text("Skip the encrypted backup")).changed() {
+                                            self.manage.no_backup_ack = false;
+                                        }
+                                        if self.manage.skip_backup {
+                                            ui.checkbox(&mut self.manage.no_backup_ack, language.text("I understand there will be no backup to undo this cleanup."));
+                                        }
+                                    });
+                                });
+                            }
+                            ui.label(format!("{}: {}", language.text("Type this exact account ID to confirm"), current.account));
+                            ui.add_enabled_ui(!busy, |ui| {
+                                ui.add(crate::ui::components::text_field::singleline(&mut self.manage.cleanup_confirm).desired_width(220.0));
+                            });
+                            let key_ok = self.manage.cleanup_preview_key.as_ref() == Some(&current);
+                            let typed = cleanup_confirm_ready(&self.manage.cleanup_confirm, &current.account);
+                            let backup_ok = !self.manage.skip_backup || self.manage.no_backup_ack;
+                            let ready = key_ok && typed && backup_ok && !blocked && allowed && !busy;
+                            if !ready {
+                                let reason = if busy { "Wait for the operation to finish." } else if !key_ok { "Preparing the review…" } else if blocked { "Select the main-account consent above before previewing." } else if !allowed { "This account cannot use the selected action." } else if !typed { "Type the exact account ID shown above." } else { "Acknowledge the no-backup choice above." };
+                                ui.weak(language.text(reason));
+                            }
+                            ui.weak(language.text("Nothing has been deleted yet."));
+                            if ui.add_enabled(ready, egui::Button::new(language.text("Apply cleanup"))).clicked() {
+                                let mut argv = vec!["cleanup".into(), "apply".into(), "--provider".into(), current.provider.clone(), "--id".into(), current.account.clone(), "--scope".into(), current.scope.cli_name().into(), "--confirm".into(), current.account.clone()];
+                                if self.manage.skip_backup { argv.push("--no-backup".into()); }
+                                self.spawn_manage(OpKind::CleanupApply, argv);
+                            }
+                        } else {
+                            ui.weak(language.text("Preparing the review…"));
+                        }
                     }
                 }
                 if ui.add_enabled(!busy, egui::Button::new(language.text("Close"))).clicked() {
@@ -1646,6 +1678,7 @@ impl StudioApp {
             self.manage.cleanup_result = None;
             self.manage.error = None;
             self.manage.error_from_preview = false;
+            self.manage.cleanup_step = 0;
         }
     }
 
@@ -1657,8 +1690,20 @@ impl StudioApp {
         no_backup: bool,
     ) {
         let plan = cleanup_plan(preview);
-        ui.separator();
-        ui.heading(language.text("Review before applying"));
+        let targets = preview_targets(plan);
+        let bytes: u64 = targets
+            .iter()
+            .filter_map(|t| t.get("size_bytes").and_then(|s| s.as_u64()))
+            .sum();
+        ui.label(
+            egui::RichText::new(format!(
+                "{}: {} · {}",
+                language.text("Will be deleted"),
+                targets.len(),
+                human_bytes(bytes)
+            ))
+            .strong(),
+        );
         if scope != CleanupScopeSel::Cache {
             if no_backup {
                 ui.colored_label(
@@ -1666,39 +1711,33 @@ impl StudioApp {
                     language.text("No backup will be created."),
                 );
             } else {
-                ui.label(language.text("By default, an encrypted backup is retained for 7 days when needed, before cleanup."));
+                ui.label(language.text("Encrypted backup: 7 days"));
             }
         }
-        let targets = preview_targets(plan);
-        let bytes: u64 = targets
-            .iter()
-            .filter_map(|t| t.get("size_bytes").and_then(|s| s.as_u64()))
-            .sum();
-        ui.collapsing(
-            format!(
-                "{} ({} · {})",
-                language.text("Technical details"),
-                targets.len(),
-                human_bytes(bytes)
-            ),
-            |ui| {
-                if let Some(warnings) = plan.get("warnings").and_then(|v| v.as_array()) {
-                    for warning in warnings {
-                        ui.label(warning.as_str().unwrap_or("?"));
-                    }
+        let warning_count = plan
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .map_or(0, Vec::len);
+        if warning_count > 0 {
+            ui.weak(format!("{}: {warning_count}", language.text("Warnings")));
+        }
+        ui.collapsing(language.text("Details"), |ui| {
+            if let Some(warnings) = plan.get("warnings").and_then(|value| value.as_array()) {
+                for warning in warnings {
+                    ui.label(warning.as_str().unwrap_or("?"));
                 }
-                for target in targets.iter().take(64) {
-                    ui.label(format!(
-                        "{} · {}",
-                        str_field(target, "path"),
-                        str_field(target, "kind")
-                    ));
-                }
-                if targets.len() > 64 {
-                    ui.weak(format!("… +{}", targets.len() - 64));
-                }
-            },
-        );
+            }
+            for target in targets.iter().take(64) {
+                ui.label(format!(
+                    "{} · {}",
+                    str_field(target, "path"),
+                    str_field(target, "kind")
+                ));
+            }
+            if targets.len() > 64 {
+                ui.weak(format!("… +{}", targets.len() - 64));
+            }
+        });
     }
 
     fn backups_ui(&mut self, ui: &mut egui::Ui, provider: ProviderId, language: LanguageId) {
