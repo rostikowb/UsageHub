@@ -66,6 +66,16 @@ pub struct AccountProfile {
     /// Monotonic cleanup epoch: prevents pre-cleanup poll results from being
     /// rebound to the same profile after its credentials or data are cleared.
     pub cleanup_epoch: u64,
+    /// Created by automatic discovery rather than by the user.
+    #[serde(default)]
+    pub auto_discovered: bool,
+    /// Stable source identity (`omp:<email>` or a canonical directory path)
+    /// used to match this profile to a discovered source.
+    #[serde(default)]
+    pub discovery_key: String,
+    /// Consecutive scans in which an auto-discovered source was missing.
+    #[serde(default)]
+    pub discovery_misses: u32,
 }
 
 /// Lifetime ownership of an account profile.
@@ -97,6 +107,9 @@ impl Default for AccountProfile {
             label: String::new(),
             credential_targets: Vec::new(),
             cleanup_epoch: 0,
+            auto_discovered: false,
+            discovery_key: String::new(),
+            discovery_misses: 0,
         }
     }
 }

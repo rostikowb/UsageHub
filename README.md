@@ -58,7 +58,7 @@ Enable the providers you want under **Settings → Providers**. For OpenCode Go,
 
 ## Accounts and data safety
 
-Open **Settings → Accounts**, choose Claude Code or Codex, enter a name and select **Add account**. Sign in using the official app or CLI. Managed Claude Desktop accounts have isolated user-data directories; additional Codex profiles are **CLI-only**, not isolated Codex Desktop copies. A newly added profile starts signed out: the bar marks it with `!` until you sign in. For a Codex profile use **Sign in through CLI** on its card (it opens a console with that profile's `CODEX_HOME` and runs the official `codex login`) or run `usagehub --manage signin --provider codex --id ID`. Only the skills library is deliberately shared among managed accounts; credentials, config, and history are not shared through it.
+Open **Settings → Accounts**, choose Claude Code or Codex, enter a name and select **Add account**. Sign in using the official app or CLI. Managed Claude Desktop accounts have isolated user-data directories; additional Codex profiles are **CLI-only**, not isolated Codex Desktop copies. A newly added profile starts signed out: the bar marks it with `!` until you sign in. For a Codex profile use **Sign in through CLI** on its card (it opens a console with that profile's `CODEX_HOME` and runs the official `codex login`) or run `usagehub --manage signin --provider codex --id ID`. If omp already stores a ChatGPT sign-in for that account, **Import sign-in from omp** reuses it without another authorization (`--from-omp`, optionally `--email`), and `--list-omp` shows what is available. Only the skills library is deliberately shared among managed accounts; credentials, config, and history are not shared through it.
 
 To clean an account, select **Cleanup...** on its card. The window explains four separate actions:
 
@@ -70,6 +70,8 @@ To clean an account, select **Cleanup...** on its card. The window explains four
 | Cached files | Regenerable caches only, no backup. |
 
 Preview lists exact targets before anything changes, and Apply needs the typed stable account ID. Default uses the official app's shared local data, so it is never removable: its full reset requires an explicit opt-in. Destructive actions normally create an encrypted seven-day undo snapshot; skipping it is a separate Advanced acknowledgement. Cleanup is limited to proven owned data: it is not forensic erasure, a browser-wide wipe, or removal of vendor telemetry. See [migration and recovery](docs/migration.md) for account adoption, shared skills, and rollback.
+
+UsageHub also discovers accounts it does not know about yet: every few hours (default 6 h, configurable in Settings) it scans Claude Desktop data folders, the Claude CLI home, `CLAUDE_CONFIG_DIR`, an explicit `CODEX_HOME`, and ChatGPT sign-ins already stored by omp. A new source is added once; a profile created this way leaves the list only after three scans without its source, and discovery never deletes account data. Run **Scan for accounts** from the taskbar account menu, **Scan for accounts now** in Settings → Accounts, or `usagehub --manage discover [--apply]`.
 
 ## Data and privacy
 

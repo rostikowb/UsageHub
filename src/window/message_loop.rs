@@ -105,6 +105,10 @@ pub(super) unsafe extern "system" fn wnd_proc(
                     // Shortcut/COM stamping on a worker; coalesced in-flight.
                     crate::manager::widget::schedule_taskbar_identity_refresh("periodic");
                 }
+                TIMER_DISCOVERY => {
+                    // The worker checks the configured interval before scanning.
+                    crate::manager::widget::schedule_account_discovery(false);
+                }
                 TIMER_WINDOW_STATE => {
                     sync_theme_window_visibility();
                 }

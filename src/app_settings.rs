@@ -48,6 +48,22 @@ pub struct SettingsFile {
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_update_check_unix: Option<u64>,
+    /// Scan local provider installs for accounts that are not registered yet.
+    #[serde(default = "default_true")]
+    pub auto_discovery_enabled: bool,
+    /// Hours between automatic scans (manual scans ignore this).
+    #[serde(default = "default_discovery_interval_hours")]
+    pub discovery_interval_hours: u32,
+    #[serde(default)]
+    pub last_discovery_unix: u64,
+    #[serde(default)]
+    pub last_discovery_summary: String,
+    #[serde(default)]
+    pub last_discovery_added: u32,
+    #[serde(default)]
+    pub last_discovery_removed: u32,
+    #[serde(default)]
+    pub last_discovery_pending: u32,
     #[serde(default = "default_true")]
     show_claude_code: bool,
     #[serde(default)]
@@ -128,6 +144,13 @@ impl Default for SettingsFile {
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
+            auto_discovery_enabled: true,
+            discovery_interval_hours: default_discovery_interval_hours(),
+            last_discovery_unix: 0,
+            last_discovery_summary: String::new(),
+            last_discovery_added: 0,
+            last_discovery_removed: 0,
+            last_discovery_pending: 0,
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -183,6 +206,9 @@ impl SettingsFile {
         self.custom_theme_enabled = true;
         self.dashboard_width = valid_dashboard_dimension(self.dashboard_width);
         self.dashboard_height = valid_dashboard_dimension(self.dashboard_height);
+        if !(1..=168).contains(&self.discovery_interval_hours) {
+            self.discovery_interval_hours = default_discovery_interval_hours();
+        }
     }
 
     pub fn legacy_placement(&self) -> Option<LegacyPlacement> {
@@ -476,6 +502,13 @@ fn merge_provider_accounts(
         ids.insert(profile.id.clone());
         merged.push(profile.clone());
     }
+    // Auto-discovered profiles are registry-owned, like managed ones: a stale
+    // dashboard snapshot must not drop an account the scanner just added.
+    for profile in fresh.profiles.iter().filter(|p| p.auto_discovered) {
+        if ids.insert(profile.id.clone()) {
+            merged.push(profile.clone());
+        }
+    }
     // External profiles belong to the caller session: its additions, edits
     // and removals apply as-is. Fresh-only externals stay dropped (the
     // session removed them or never saw a concurrent addition); managed ids
@@ -674,6 +707,9 @@ fn wide_path(path: &Path) -> Vec<u16> {
 
 fn default_poll_interval() -> u32 {
     POLL_15_MIN
+}
+fn default_discovery_interval_hours() -> u32 {
+    6
 }
 fn default_true() -> bool {
     true

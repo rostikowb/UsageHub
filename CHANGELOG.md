@@ -6,6 +6,19 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-10-31
+
+### Added
+
+- **Automatic account discovery**: the resident app scans local provider sources every few hours (default 6 h, configurable 1–168 h) and once after startup, adding accounts it finds and removing only profiles it created itself after three consecutive scans without their source. Sources: Claude Desktop data directories, the Claude CLI home, `CLAUDE_CONFIG_DIR`, an explicit `CODEX_HOME`, and ChatGPT sign-ins already stored by omp. Discovery never deletes account data, never touches user-created profiles, and never re-adds retired IDs.
+- **Scan for accounts** in the taskbar account menu, plus *Scan for accounts now* in the dashboard accounts page, both bypassing the interval. `usagehub --manage discover [--apply]` exposes the same scan for scripts and diagnostics.
+
+## [2.22.9] - 2026-10-31
+
+### Added
+
+- **Import sign-in from omp**: a managed Codex profile can reuse an existing ChatGPT sign-in that omp already stores, instead of authorizing the account twice. `usagehub --manage signin --provider codex --id ID --from-omp [--email EMAIL]`, `--list-omp` to list the stored accounts, and the matching account-card button. omp's SQLite database is opened read-only through the Windows `winsqlite3` library; only the current access token is copied, never the rotating refresh token, and UsageHub refuses to replace a profile that has its own sign-in. Because omp remains the token owner, UsageHub never refreshes an imported token: when it expires the account reports that a re-import is needed instead of silently signing omp out.
+
 ## [2.22.8] - 2026-10-31
 
 ### Changed
@@ -1645,4 +1658,6 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.6]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...v2.22.6
 [2.22.7]: https://github.com/rostikowb/UsageHub/compare/v2.22.6...v2.22.7
 [2.22.8]: https://github.com/rostikowb/UsageHub/compare/v2.22.7...v2.22.8
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.8...usagehub
+[2.22.9]: https://github.com/rostikowb/UsageHub/compare/v2.22.8...v2.22.9
+[2.23.0]: https://github.com/rostikowb/UsageHub/compare/v2.22.9...v2.23.0
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.0...usagehub

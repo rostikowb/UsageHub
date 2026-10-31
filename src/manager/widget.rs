@@ -126,6 +126,57 @@ pub fn schedule_backup_purge() {
         });
 }
 
+/// Automatic local-account discovery on a worker thread.
+///
+/// Scheduled scans honour the configured interval and the persisted
+/// `last_discovery_unix`; a manual scan skips both. The worker reads the
+/// registry, runs the bounded scan, commits changes, and notifies the
+/// controller so the bar reloads without an extra timer.
+pub fn schedule_account_discovery(force: bool) {
+    std::thread::Builder::new()
+        .name("usagehub-discovery".into())
+        .spawn(move || {
+            let settings = crate::manager::state::load_fresh();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_secs())
+                .unwrap_or(0);
+            if !force {
+                if !settings.auto_discovery_enabled {
+                    return;
+                }
+                let interval = u64::from(settings.discovery_interval_hours.max(1)) * 3_600;
+                if settings.last_discovery_unix != 0
+                    && now.saturating_sub(settings.last_discovery_unix) < interval
+                {
+                    return;
+                }
+            }
+            match crate::manager::discovery::run(true) {
+                Ok(report) => {
+                    crate::diagnose::log(format!(
+                        "account discovery ({}): added={} removed={} pending={} warnings={}",
+                        if force { "manual" } else { "scheduled" },
+                        report.added.len(),
+                        report.removed.len(),
+                        report.pending_removal.len(),
+                        report.warnings.len()
+                    ));
+                    if !report.added.is_empty() || !report.removed.is_empty() {
+                        crate::manager::cli::notify_settings_updated();
+                    }
+                }
+                Err(error) => {
+                    crate::diagnose::log(format!("account discovery failed: {error}"));
+                }
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            crate::diagnose::log(format!("account discovery thread could not start: {error}"));
+        });
+}
+
 /// Open an account window for a widget slot: focus the running window when one
 /// exists, otherwise launch it. Runs the lifecycle call on the caller's
 /// thread; the window controller invokes this from a worker thread.

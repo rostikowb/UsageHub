@@ -223,7 +223,7 @@ fn ctx_for(provider: ProviderId, id: &str) -> Result<AccountContext, Fail> {
 
 /// Best-effort settings-changed broadcast to a running widget process.
 /// Absent window (fresh/smoke use) is silently fine.
-fn notify_settings_updated() {
+pub(crate) fn notify_settings_updated() {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
@@ -264,6 +264,7 @@ fn run(tokens: &[String]) -> Result<Value, Fail> {
         "stop" => cmd_stop(rest),
         "pin" => cmd_pin(rest),
         "cli" => cmd_provider_cli(tokens),
+        "discover" => cmd_discover(rest),
         "poll" => cmd_poll(rest),
         "snapshot" => cmd_snapshot(rest),
         "cleanup" => cmd_cleanup(rest),
@@ -278,7 +279,7 @@ fn run(tokens: &[String]) -> Result<Value, Fail> {
     }
 }
 
-const COMMAND_SUMMARY: &str = "expected one of: list create import rename open signin focus status stop pin cli poll snapshot cleanup backup skills migration doctor help";
+const COMMAND_SUMMARY: &str = "expected one of: list create import rename open signin focus status stop pin cli poll snapshot cleanup backup skills migration discover doctor help";
 
 fn help_text() -> Value {
     json!({
@@ -291,6 +292,8 @@ fn help_text() -> Value {
             "rename --provider claude|codex --id ID --name NAME",
             "open|focus|status --provider claude|codex --id ID",
             "signin --provider codex --id ID (open an isolated CLI sign-in console)",
+            "signin --provider codex --id ID --from-omp [--email EMAIL] (reuse an existing omp ChatGPT sign-in)",
+            "signin --provider codex --list-omp (list omp ChatGPT sign-ins)",
             "status [--provider claude|codex] (registry overview when --id is omitted)",
             "stop --provider claude|codex --id ID [--force]",
             "pin --provider claude|codex --id ID --value true|false [--order INTEGER] [--color #RRGGBB]",
@@ -304,6 +307,7 @@ fn help_text() -> Value {
             "skills import --path ABS [--replace]",
             "migration preview|import|cutover [--confirm cutover]",
             "migration legacy-backup --path PATH --action encrypt|purge|leave --confirm NAME",
+            "discover [--apply] (scan local Claude/Codex sources and add new accounts)",
             "doctor"
         ]
     })
@@ -438,9 +442,45 @@ fn cmd_open(tokens: &[String]) -> Result<Value, Fail> {
 
 fn cmd_sign_in(tokens: &[String]) -> Result<Value, Fail> {
     let provider = parse_provider(&need(flag(tokens, "--provider")?, "--provider")?)?;
+    if has_flag(tokens, "--list-omp") {
+        let credentials = crate::manager::omp_auth::codex_credentials().map_err(Fail::op)?;
+        return Ok(json!({
+            "accounts": credentials
+                .iter()
+                .map(|credential| json!({
+                    "email": credential.email,
+                    "account_id": credential.account_id,
+                    "expires_unix": credential.expires_unix,
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
     let id = need(flag(tokens, "--id")?, "--id")?;
+    if has_flag(tokens, "--from-omp") {
+        let email = flag(tokens, "--email")?;
+        let (email, path) =
+            lifecycle::import_omp_sign_in(provider, &id, email.as_deref()).map_err(Fail::op)?;
+        notify_settings_updated();
+        return Ok(json!({
+            "provider": provider.descriptor().key,
+            "id": id,
+            "imported_from_omp": true,
+            "email": email,
+            "path": path,
+        }));
+    }
     lifecycle::sign_in_account(provider, &id).map_err(Fail::op)?;
     Ok(json!({"provider": provider.descriptor().key, "id": id, "console_opened": true}))
+}
+
+fn cmd_discover(tokens: &[String]) -> Result<Value, Fail> {
+    let apply = has_flag(tokens, "--apply");
+    let report = crate::manager::discovery::run(apply).map_err(Fail::op)?;
+    if apply {
+        notify_settings_updated();
+    }
+    serde_json::to_value(report)
+        .map_err(|error| Fail::op(format!("Unable to encode discovery: {error}")))
 }
 
 fn cmd_focus(tokens: &[String]) -> Result<Value, Fail> {

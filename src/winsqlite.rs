@@ -196,6 +196,37 @@ impl Statement<'_> {
             )),
         }
     }
+
+    /// Read column zero from every remaining row.
+    fn all_text(&mut self, column: c_int) -> Result<Vec<String>, Error> {
+        let mut values = Vec::new();
+        loop {
+            match unsafe { sqlite3_step(self.raw) } {
+                SQLITE_DONE => return Ok(values),
+                SQLITE_ROW => {
+                    let text = unsafe { sqlite3_column_text(self.raw, column) };
+                    if text.is_null() {
+                        continue;
+                    }
+                    let bytes = unsafe { sqlite3_column_bytes(self.raw, column) };
+                    let bytes = usize::try_from(bytes)
+                        .map_err(|_| Error("SQLite returned an invalid text length".into()))?;
+                    let value = unsafe { std::slice::from_raw_parts(text, bytes) };
+                    values.push(
+                        String::from_utf8(value.to_vec())
+                            .map_err(|_| Error("SQLite returned text that is not UTF-8".into()))?,
+                    );
+                }
+                result => {
+                    return Err(error_message(
+                        self.connection.raw,
+                        "unable to read SQLite row",
+                        result,
+                    ))
+                }
+            }
+        }
+    }
 }
 
 impl Drop for Statement<'_> {
@@ -231,6 +262,13 @@ pub(crate) fn query_optional_text(
     let mut statement = connection.prepare(sql)?;
     statement.bind_text(1, &parameter)?;
     statement.optional_text(0)
+}
+
+/// Query column zero from every row of a read-only, parameter-free query.
+pub(crate) fn query_text_values(path: &Path, sql: &str) -> Result<Vec<String>, Error> {
+    let connection = Connection::open_read_only(path)?;
+    let mut statement = connection.prepare(sql)?;
+    statement.all_text(0)
 }
 
 #[cfg(test)]

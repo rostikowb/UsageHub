@@ -331,7 +331,8 @@ pub(super) fn execute_context_menu_action(
         | ContextMenuAction::LayerActions { .. }
         | ContextMenuAction::OpenUrl { .. }
         | ContextMenuAction::OpenAccount { .. }
-        | ContextMenuAction::FocusAccount { .. } => None,
+        | ContextMenuAction::FocusAccount { .. }
+        | ContextMenuAction::ScanAccounts => None,
     };
     if let Some(command) = static_command {
         unsafe {
@@ -377,6 +378,9 @@ pub(super) fn execute_context_menu_action(
         }
         ContextMenuAction::FocusAccount { provider, id } => {
             open_account_slot(hwnd, provider.descriptor().key.to_string(), id, true);
+        }
+        ContextMenuAction::ScanAccounts => {
+            crate::manager::widget::schedule_account_discovery(true);
         }
         _ => {}
     }
@@ -505,6 +509,17 @@ fn append_account_items(
         let id = 1_000 + actions.len();
         let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr()));
         actions.push(manage);
+
+        let scan = ContextMenuAction::ScanAccounts;
+        let label = native_interop::wide_str(&crate::context_menu::rendered_label(
+            _language,
+            "Scan for accounts",
+            _context,
+        ));
+        let flags = context_menu_action_flags(&scan, None);
+        let id = 1_000 + actions.len();
+        let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr()));
+        actions.push(scan);
     }
 }
 

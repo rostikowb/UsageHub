@@ -589,7 +589,24 @@ impl StudioApp {
     fn apply_manage_result(&mut self, kind: OpKind, data: ManageValue) {
         match kind {
             OpKind::Simple => {
-                self.manage.notice = Some(summarize_data(&data));
+                let discovery = data.get("applied").is_some() && data.get("added").is_some();
+                self.manage.notice = Some(if discovery {
+                    let added = data
+                        .get("added")
+                        .and_then(|value| value.as_array())
+                        .map_or(0, Vec::len);
+                    let removed = data
+                        .get("removed")
+                        .and_then(|value| value.as_array())
+                        .map_or(0, Vec::len);
+                    format!(
+                        "{}: {added} · {}: {removed}",
+                        self.language().text("New accounts"),
+                        self.language().text("Removed")
+                    )
+                } else {
+                    summarize_data(&data)
+                });
             }
             OpKind::Status { key } => {
                 let summary = account_status_summary(&data, self.language());
@@ -764,6 +781,52 @@ impl StudioApp {
             .unwrap_or_default();
         let now = SystemTime::now();
         let snapshot_unix = self.manage.last_snapshot_unix;
+        ui.horizontal_wrapped(|ui| {
+            let mut enabled = self.settings.auto_discovery_enabled;
+            if ui
+                .checkbox(
+                    &mut enabled,
+                    language.text("Discover accounts automatically"),
+                )
+                .changed()
+            {
+                self.settings.auto_discovery_enabled = enabled;
+                self.save_settings();
+            }
+            ui.label(language.text("Every"));
+            let mut hours = self.settings.discovery_interval_hours;
+            if ui
+                .add(egui::DragValue::new(&mut hours).range(1..=168).suffix(" h"))
+                .changed()
+            {
+                self.settings.discovery_interval_hours = hours;
+                self.save_settings();
+            }
+            if ui
+                .add_enabled(
+                    !self.manage_busy(),
+                    egui::Button::new(language.text("Scan for accounts now")),
+                )
+                .clicked()
+            {
+                self.spawn_manage(
+                    OpKind::Simple,
+                    vec!["discover".to_string(), "--apply".to_string()],
+                );
+            }
+        });
+        if self.settings.last_discovery_unix != 0 {
+            ui.weak(format!(
+                "{}: {} {} · {} {} · {} {}",
+                language.text("Last scan"),
+                language.text("New accounts"),
+                self.settings.last_discovery_added,
+                language.text("Removed"),
+                self.settings.last_discovery_removed,
+                language.text("Pending"),
+                self.settings.last_discovery_pending
+            ));
+        }
         ui.separator();
         // Add / import: ordinary operations, no confirmation.
         ui.horizontal_wrapped(|ui| {
@@ -848,6 +911,28 @@ impl StudioApp {
                                     key.to_string(),
                                     "--id".to_string(),
                                     id.clone(),
+                                ],
+                            );
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.manage_busy(),
+                                egui::Button::new(language.text("Import sign-in from omp")),
+                            )
+                            .on_hover_text(language.text(
+                                "Reuses an existing omp ChatGPT sign-in. UsageHub never refreshes omp's token.",
+                            ))
+                            .clicked()
+                        {
+                            self.spawn_manage(
+                                OpKind::Simple,
+                                vec![
+                                    "signin".to_string(),
+                                    "--provider".to_string(),
+                                    key.to_string(),
+                                    "--id".to_string(),
+                                    id.clone(),
+                                    "--from-omp".to_string(),
                                 ],
                             );
                         }

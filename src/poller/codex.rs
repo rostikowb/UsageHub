@@ -98,6 +98,14 @@ pub(super) fn poll_account(path: &Path) -> Result<UsageData, PollError> {
         Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
             if path.file_name().is_some_and(|name| name == "auth.json") {
+                if imported_from_omp(path) {
+                    // omp owns the rotating refresh token; refreshing here
+                    // would sign the same account out inside omp.
+                    diagnose::log(
+                        "Codex sign-in imported from omp expired; re-import instead of refreshing",
+                    );
+                    return Err(PollError::TokenExpired);
+                }
                 if let Some(directory) = path.parent() {
                     cli_refresh_codex_token(directory);
                 }
@@ -367,6 +375,14 @@ pub(super) fn codex_auth_path() -> Option<PathBuf> {
             .join(".codex")
             .join("auth.json"),
     )
+}
+
+/// True for an auth file whose tokens were imported from omp (marker field).
+fn imported_from_omp(auth_path: &Path) -> bool {
+    std::fs::read_to_string(auth_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|value| value.get("usagehub_omp_email").is_some())
 }
 
 fn read_codex_credentials_at(auth_path: &Path) -> Option<CodexTokenData> {

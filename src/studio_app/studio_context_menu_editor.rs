@@ -354,6 +354,7 @@ pub(super) fn context_menu_action_script(action: &ContextMenuAction) -> String {
             )
         }
         ContextMenuAction::ManageAccounts => "manage_accounts()".into(),
+        ContextMenuAction::ScanAccounts => "scan_accounts()".into(),
     }
 }
 

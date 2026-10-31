@@ -66,6 +66,8 @@ pub enum ContextMenuAction {
     },
     /// Open the dashboard account management surface.
     ManageAccounts,
+    /// Scan local provider sources for accounts that are not registered yet.
+    ScanAccounts,
     SetUpdateFrequency {
         #[serde(
             alias = "milliseconds",

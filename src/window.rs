@@ -230,6 +230,9 @@ const BACKUP_PURGE_INTERVAL_MS: u32 = 3_600_000;
 /// The worker coalesces behind one in-flight flag; the native helper owns
 /// snapshot caching so a tick never shells out per account.
 const TIMER_TASKBAR_IDENTITIES: usize = 42;
+const TIMER_DISCOVERY: usize = 43;
+/// Cheap throttle tick: the worker itself honours the configured hours.
+const DISCOVERY_TICK_INTERVAL_MS: u32 = 15 * 60 * 1_000;
 const TASKBAR_IDENTITIES_INTERVAL_MS: u32 = 20_000;
 
 /// Width budget for dynamic account columns. The native collision pass still
@@ -2777,6 +2780,15 @@ pub fn run() {
             None,
         );
         crate::manager::widget::schedule_taskbar_identity_refresh("startup");
+        // Local account discovery: a throttled worker (default every 6 hours)
+        // plus an explicit "Scan for accounts" menu action.
+        set_controller_timer(
+            Some(hwnd),
+            TIMER_DISCOVERY,
+            DISCOVERY_TICK_INTERVAL_MS,
+            None,
+        );
+        crate::manager::widget::schedule_account_discovery(false);
 
         // Sample collision geometry off-thread and ask the stable controller to
         // reconcile shell-hosted windows every two seconds.

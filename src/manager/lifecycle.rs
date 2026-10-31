@@ -633,6 +633,9 @@ pub fn create_account(
             label: String::new(),
             credential_targets: Vec::new(),
             cleanup_epoch: 0,
+            auto_discovered: false,
+            discovery_key: String::new(),
+            discovery_misses: 0,
         };
         // Reject sources the poller cannot serve before persisting.
         AccountContext::from_profile(provider, &profile)?;
@@ -760,6 +763,9 @@ pub fn import_account(
             label: String::new(),
             credential_targets: Vec::new(),
             cleanup_epoch: 0,
+            auto_discovered: false,
+            discovery_key: String::new(),
+            discovery_misses: 0,
         };
         AccountContext::from_profile(provider, &profile)?;
         // Adopt in place: never move. Ensure a skills junction only when the
@@ -829,6 +835,81 @@ pub fn sign_in_account(provider: ProviderId, id: &str) -> ManagerResult<()> {
     supported(provider)?;
     let ctx = load_context(provider, id)?;
     crate::manager::native::open_codex_sign_in(&ctx)
+}
+
+/// Reuse an existing omp ChatGPT sign-in for a managed Codex CLI profile.
+///
+/// Only the access token is copied. omp keeps the rotating refresh token, so
+/// UsageHub never refreshes these tokens and cannot sign omp out; re-run the
+/// import when the access token expires (omp refreshes its own copy).
+pub fn import_omp_sign_in(
+    provider: ProviderId,
+    id: &str,
+    email: Option<&str>,
+) -> ManagerResult<(String, PathBuf)> {
+    supported(provider)?;
+    if provider != ProviderId::Codex {
+        return Err("omp sign-in import is only available for Codex".into());
+    }
+    let ctx = load_context(provider, id)?;
+    if !ctx.is_managed() {
+        return Err(
+            "Default already reads the standard CODEX_HOME; import applies to managed CLI profiles only"
+                .into(),
+        );
+    }
+    let root = ctx
+        .config_dir
+        .clone()
+        .or_else(|| ctx.desktop_dir.clone())
+        .ok_or("This profile has no Codex CLI home")?;
+    paths::ensure_dir(&root)?;
+    let auth_path = root.join("auth.json");
+    if let Ok(existing) = std::fs::read_to_string(&auth_path) {
+        let parsed: Option<serde_json::Value> = serde_json::from_str(&existing).ok();
+        let imported = parsed
+            .as_ref()
+            .is_some_and(|value| value.get("usagehub_omp_email").is_some());
+        let has_own_tokens = parsed
+            .as_ref()
+            .and_then(|value| value.get("tokens"))
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(|token| token.as_str())
+            .is_some_and(|token| !token.trim().is_empty());
+        if has_own_tokens && !imported {
+            return Err(
+                "This profile already has its own sign-in; refusing to replace it from omp".into(),
+            );
+        }
+    }
+    let credentials = crate::manager::omp_auth::codex_credentials()?;
+    let credential = crate::manager::omp_auth::select_credential(&credentials, email)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    if !credential.usable_at(now) {
+        return Err(format!(
+            "omp's ChatGPT sign-in for '{}' has expired; open omp so it can refresh, then import again",
+            credential.email
+        ));
+    }
+    // No refresh token is copied on purpose: rotating it would invalidate the
+    // same sign-in inside omp.
+    let document = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": serde_json::Value::Null,
+        "tokens": {
+            "access_token": credential.access,
+            "account_id": credential.account_id,
+        },
+        "usagehub_omp_email": credential.email,
+    });
+    let bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("Unable to encode the imported sign-in: {error}"))?;
+    std::fs::write(&auth_path, bytes)
+        .map_err(|error| format!("Unable to write {}: {error}", auth_path.display()))?;
+    Ok((credential.email.clone(), auth_path))
 }
 
 /// Focus this account's existing window instead of opening a duplicate.
