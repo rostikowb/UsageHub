@@ -485,8 +485,17 @@ fn merge_provider_accounts(
         .iter()
         .filter(|profile| profile.ownership != AccountOwnership::Managed)
     {
+        // A stale external snapshot may predate in-place adoption. If the
+        // manager subsequently deleted that id, its reservation is a tombstone.
+        if fresh.find(&profile.id).is_none() && fresh.used_ids.contains(&profile.id) {
+            continue;
+        }
         if ids.insert(profile.id.clone()) {
-            merged.push(profile.clone());
+            let mut profile = profile.clone();
+            if let Some(current) = fresh.find(&profile.id) {
+                profile.cleanup_epoch = profile.cleanup_epoch.max(current.cleanup_epoch);
+            }
+            merged.push(profile);
         }
     }
     incoming.profiles = merged;
@@ -1113,6 +1122,56 @@ mod tests {
         assert!(saved.accounts.claude.find("account_1").is_none());
         assert!(saved.accounts.claude.used_ids.contains("account_1"));
         assert_eq!(saved.accounts.claude.selected, "default");
+        assert!(saved.usage_countdown);
+    }
+
+    #[test]
+    fn stale_external_save_cannot_revive_adopted_deleted_profile() {
+        use crate::accounts::{AccountOwnership, AccountProfile};
+        crate::manager::state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles.push(AccountProfile {
+                id: "adopted_second".into(),
+                ownership: AccountOwnership::External,
+                cleanup_epoch: 4,
+                ..Default::default()
+            });
+            settings
+                .accounts
+                .claude
+                .used_ids
+                .insert("adopted_second".into());
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        let mut stale = load_settings();
+        crate::manager::state::mutate_settings(|settings| {
+            let adopted = settings.accounts.claude.find_mut("adopted_second").unwrap();
+            adopted.ownership = AccountOwnership::Managed;
+            adopted.cleanup_epoch = 5;
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        // This is the authoritative retirement transaction used after deletion.
+        crate::manager::state::mutate_settings(|settings| {
+            settings
+                .accounts
+                .claude
+                .profiles
+                .retain(|p| p.id != "adopted_second");
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        stale.accounts.claude.profiles.push(AccountProfile {
+            id: "new_external".into(),
+            ownership: AccountOwnership::External,
+            ..Default::default()
+        });
+        stale.usage_countdown = true;
+        save_settings(&stale).unwrap();
+        let saved = load_settings();
+        assert!(saved.accounts.claude.find("adopted_second").is_none());
+        assert!(saved.accounts.claude.used_ids.contains("adopted_second"));
+        assert!(saved.accounts.claude.find("new_external").is_some());
         assert!(saved.usage_countdown);
     }
 

@@ -632,6 +632,7 @@ pub fn create_account(
             color: String::new(),
             label: String::new(),
             credential_targets: Vec::new(),
+            cleanup_epoch: 0,
         };
         // Reject sources the poller cannot serve before persisting.
         AccountContext::from_profile(provider, &profile)?;
@@ -758,6 +759,7 @@ pub fn import_account(
             color: String::new(),
             label: String::new(),
             credential_targets: Vec::new(),
+            cleanup_epoch: 0,
         };
         AccountContext::from_profile(provider, &profile)?;
         // Adopt in place: never move. Ensure a skills junction only when the
@@ -818,6 +820,15 @@ pub fn open_account(provider: ProviderId, id: &str) -> ManagerResult<()> {
     let ctx = load_context(provider, id)?;
     crate::manager::native::launch_and_stamp_account(&ctx, &[])?;
     Ok(())
+}
+
+/// Open the account's provider sign-in flow in a visible console. Codex
+/// profiles are CLI-only, so this is their only isolated sign-in path; no
+/// operation guard is held because the user completes the login themselves.
+pub fn sign_in_account(provider: ProviderId, id: &str) -> ManagerResult<()> {
+    supported(provider)?;
+    let ctx = load_context(provider, id)?;
+    crate::manager::native::open_codex_sign_in(&ctx)
 }
 
 /// Focus this account's existing window instead of opening a duplicate.

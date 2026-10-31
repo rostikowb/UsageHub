@@ -229,6 +229,17 @@ acknowledgement and never deletes.
   confirmed plan through. Cache-only plans need no backup; other scopes
   require all-owned targets plus a verified snapshot unless the user explicitly
   confirms irreversible deletion without a backup.
+- `reset` clears the selected account's owned local auth, config, history and
+  settings but keeps its registry entry, pins and source paths so the official
+  app can create a fresh sign-in; managed launch roots are recreated empty.
+  Only `delete` retires a managed profile, and only after every owned target
+  succeeded. A partial failure keeps the profile registered and reports the
+  failed targets. Retired ids stay reserved, and a stale external settings
+  snapshot cannot re-insert them. Each destructive attempt advances the
+  profile's cleanup epoch so older in-flight poll results are ignored.
+- `logout` keeps chats, preferences and identifiers inside that history. It
+  removes identified local sign-in material only; it is not anonymisation and
+  other sessions or cloud records may remain.
 - The old plaintext generation stays recoverable: encrypted legacy snapshots
   restore to the original legacy directory only, with the same conflict
   checks as account backups plus an explicit plaintext warning.

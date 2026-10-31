@@ -63,6 +63,9 @@ pub struct AccountProfile {
     /// Only listed targets may be backed up or deleted; unknown targets are
     /// reported, never guessed.
     pub credential_targets: Vec<String>,
+    /// Monotonic cleanup epoch: prevents pre-cleanup poll results from being
+    /// rebound to the same profile after its credentials or data are cleared.
+    pub cleanup_epoch: u64,
 }
 
 /// Lifetime ownership of an account profile.
@@ -93,6 +96,7 @@ impl Default for AccountProfile {
             color: String::new(),
             label: String::new(),
             credential_targets: Vec::new(),
+            cleanup_epoch: 0,
         }
     }
 }
@@ -277,6 +281,7 @@ impl AccountProfile {
             && self.config_dir == other.config_dir
             && self.credentials_path == other.credentials_path
             && self.desktop_dir == other.desktop_dir
+            && self.cleanup_epoch == other.cleanup_epoch
     }
 
     /// Explicit source kind selected by this profile. The runtime/poller MUST

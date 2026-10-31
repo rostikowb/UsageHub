@@ -2773,18 +2773,16 @@ fn profile_source_roots(
         .collect()
 }
 
-/// Stored record serialization matches the authenticated metadata hash: the
-/// exact same-id/source profile this restore would re-insert.
+/// Match a verified snapshot profile while allowing the monotonic cleanup
+/// epoch to advance. All ownership, source and presentation fields remain
+/// exact; the snapshot profile was authenticated during stream verification.
 fn registered_record_matches(
     profile: &crate::accounts::AccountProfile,
-    snapshot_sha: &str,
+    snapshot: &crate::accounts::AccountProfile,
 ) -> bool {
-    if snapshot_sha.is_empty() {
-        return false;
-    }
-    serde_json::to_vec(profile)
-        .map(|bytes| sha256_hex(&bytes) == snapshot_sha)
-        .unwrap_or(false)
+    let mut comparable = profile.clone();
+    comparable.cleanup_epoch = snapshot.cleanup_epoch;
+    profile.cleanup_epoch >= snapshot.cleanup_epoch && comparable == *snapshot
 }
 
 fn snapshot_profile_sha(manifest: &FileManifest) -> &str {
@@ -2812,7 +2810,6 @@ fn ownership_conflicts(
     settings: &crate::app_settings::SettingsFile,
     provider: ProviderId,
     restored: Option<&crate::accounts::AccountProfile>,
-    snapshot_sha: &str,
     targets: &RestoreTargets,
 ) -> Vec<String> {
     let mut conflicts = Vec::new();
@@ -2835,8 +2832,7 @@ fn ownership_conflicts(
         };
         for profile in &accounts.profiles {
             let same_authenticated = probe == provider
-                && restored.is_some_and(|restored| restored.id == profile.id)
-                && registered_record_matches(profile, snapshot_sha);
+                && restored.is_some_and(|restored| registered_record_matches(profile, restored));
             if same_authenticated {
                 continue;
             }
@@ -2917,8 +2913,7 @@ fn reserve_restored_profile(
         ));
     }
     super::state::mutate_settings(|settings| {
-        let conflicts =
-            ownership_conflicts(settings, provider, Some(profile), snapshot_sha, targets);
+        let conflicts = ownership_conflicts(settings, provider, Some(profile), targets);
         if !conflicts.is_empty() {
             return Err(restore_conflict_message(backup_id, &conflicts));
         }
@@ -2928,7 +2923,7 @@ fn reserve_restored_profile(
             .iter()
             .find(|existing| existing.id == profile.id)
         {
-            return if registered_record_matches(existing, snapshot_sha) {
+            return if registered_record_matches(existing, profile) {
                 Ok(false)
             } else {
                 Err(format!(
@@ -2949,14 +2944,12 @@ fn reserve_restored_profile(
 /// changed are both left alone. `used_ids` stays retired — a claimed id is
 /// never handed to a new account.
 fn release_restored_profile(provider: ProviderId, profile: &crate::accounts::AccountProfile) {
-    let Ok(reserved_sha) = serde_json::to_vec(profile).map(|bytes| sha256_hex(&bytes)) else {
-        return;
-    };
+    let reserved = profile.clone();
     let _ = super::state::mutate_settings(|settings| -> ManagerResult<()> {
         let accounts = provider_accounts_mut(settings, provider)?;
-        accounts.profiles.retain(|existing| {
-            !(existing.id == profile.id && registered_record_matches(existing, &reserved_sha))
-        });
+        accounts
+            .profiles
+            .retain(|existing| !(existing.id == reserved.id && *existing == reserved));
         Ok(())
     });
 }
@@ -3127,7 +3120,6 @@ pub fn restore_backup(backup_id: &str) -> ManagerResult<()> {
         &settings,
         target,
         snapshot_profile.as_ref(),
-        snapshot_sha,
         &restore_targets,
     ));
     if manifest.kind == ManifestKind::Account {
@@ -3142,7 +3134,11 @@ pub fn restore_backup(backup_id: &str) -> ManagerResult<()> {
             .profiles
             .iter()
             .find(|profile| profile.id == manifest.account_id)
-            .is_some_and(|existing| !registered_record_matches(existing, snapshot_sha));
+            .is_some_and(|existing| {
+                snapshot_profile
+                    .as_ref()
+                    .is_none_or(|snapshot| !registered_record_matches(existing, snapshot))
+            });
         if mismatched {
             conflicts.push(format!("registered account id '{}'", manifest.account_id));
         }
@@ -3482,7 +3478,7 @@ pub fn restore_backup(backup_id: &str) -> ManagerResult<()> {
                     .find(|existing| existing.id == profile.id)
             });
             let registry_outcome = match stored {
-                Some(existing) if registered_record_matches(existing, snapshot_sha) => Ok(()),
+                Some(existing) if registered_record_matches(existing, &profile) => Ok(()),
                 Some(_) => Err(format!(
                     "Refusing to restore backup '{backup_id}': registered account id '{}' no longer matches",
                     profile.id

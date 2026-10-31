@@ -1348,6 +1348,22 @@ fn account_primary_window(windows: &[LiveWindow]) -> Option<WindowCandidate> {
 // Launch / focus / stop
 // ---------------------------------------------------------------------------
 
+pub(crate) fn ensure_managed_launch_roots(ctx: &AccountContext) -> ManagerResult<()> {
+    if ctx.is_managed() {
+        if let Some(base) = account_base_dir(ctx)? {
+            paths::ensure_dir(&base)?;
+            paths::ensure_dir(&base.join("tmp"))?;
+            if ctx.provider == ProviderId::Claude && ctx.desktop_dir.is_some() {
+                paths::ensure_dir(&base.join("claude-config"))?;
+            }
+        }
+        if let Some(config) = &ctx.config_dir {
+            paths::ensure_dir(&paths::require_absolute(config)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Build the official-app command for `ctx`: explicit child environment,
 /// per-account `--user-data-dir`, managed roots + tmp (+ nested Desktop
 /// CLI config) ensured first. External default profiles launch without
@@ -1362,16 +1378,7 @@ fn prepare_launch_command(
     } else {
         account_base_dir(ctx)?
     };
-    if ctx.is_managed() {
-        if let Some(base) = &base {
-            paths::ensure_dir(base)?;
-            paths::ensure_dir(&base.join("tmp"))?;
-            // Adopted managed Desktop profiles may lack their nested CLI home.
-            if ctx.provider == ProviderId::Claude && ctx.desktop_dir.is_some() {
-                paths::ensure_dir(&base.join("claude-config"))?;
-            }
-        }
-    }
+    ensure_managed_launch_roots(ctx)?;
     let mut command = std::process::Command::new(&exe);
     match ctx.provider {
         ProviderId::Claude => {
@@ -1428,6 +1435,40 @@ fn spawn_detached(
     // `try_wait` both reports and reaps without blocking.
     let _ = child.try_wait();
     Ok((pid, child))
+}
+
+/// Open an interactive sign-in console for an isolated Codex CLI profile.
+/// The console owns the login flow; UsageHub only prepares the same
+/// `CODEX_HOME` the poller reads. Nothing is captured or terminated here.
+pub fn open_codex_sign_in(ctx: &AccountContext) -> ManagerResult<()> {
+    if ctx.provider != ProviderId::Codex {
+        return Err("Only Codex CLI profiles need a separate sign-in console".into());
+    }
+    if is_canonical_default(ctx) {
+        return Err(
+            "Default uses the official app or the default CODEX_HOME; no isolated sign-in is needed"
+                .into(),
+        );
+    }
+    ensure_managed_launch_roots(ctx)?;
+    let mut command = std::process::Command::new("cmd.exe");
+    command.args(["/k", "codex login"]);
+    for (key, value) in account_child_env(ctx)? {
+        command.env(key, value);
+    }
+    if let Some(base) = account_base_dir(ctx)? {
+        command.current_dir(base);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_CONSOLE: the login prompts need a real console.
+        command.creation_flags(0x0000_0010);
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("Unable to open the Codex sign-in console: {error}"))?;
+    Ok(())
 }
 
 /// Focus this account's existing window instead of opening a duplicate.

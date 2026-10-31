@@ -1,6 +1,31 @@
 # UsageHub: передача наступній сесії
 
-Актуальний знімок — **2026-10-28: 2.22.7 встановлено, перевірено та опубліковано**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
+Актуальний знімок — **2026-10-31: 2.22.8 готується до публікації; публічний release поки v2.22.7**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
+
+## 2.22.8: зрозуміле очищення, скидання без втрати профілю, вхід Codex
+
+### Причини, підтверджені evidence
+
+- Реєстр після скарги користувача все ще містив Claude Second (managed, enabled, pinned) і Codex `account_1` (managed CLI-профіль). Історію минулого Apply не відновлено: **невідомо, чи він завершився**, тому не заявляйте, що видалення "не спрацювало" з конкретної причини.
+- Підтверджені дефекти коду: CLI повертав `success: false` усередині успішного envelope; `reset` прибирав managed-профіль із реєстру, тому не було чистого "скинути й увійти знову"; preview для `delete`/`reset` містив суперечливі logout-warnings ("history/config kept") при цілих owned-каталогах у targets; у Remaining напрямку недоступна квота малювала повний gauge (100%); stale external snapshot міг повернути вже видалений adopted id.
+- Codex `account_1` не "зламався": у `%LOCALAPPDATA%\UsageHub\profiles\codex\account_1` немає `auth.json`, тому poller віддає `no_credentials`. Окремого Codex-сховища, створеного omp, на диску не знайдено; живий `~/.codex/auth.json` належить Default.
+
+### Що змінено
+
+- `studio_manage.rs` + локалі: вікно очищення з чотирма поясненими діями (вийти й зберегти чати; скинути для нового входу; видалити профіль; кеш), точний stable id, Default opt-in, backup за замовчуванням, no-backup лише в Advanced з окремим підтвердженням. Вікно лишається відкритим під час операції й показує success/partial/failure, чи профіль прибрано з бару. Вікно центроване (`Align2::CENTER_CENTER`) і має робочу висоту.
+- `cleanup.rs/cli.rs`: `reset` зберігає профіль, pin і source paths (managed launch roots відновлюються під час open); тільки `delete` прибирає managed-профіль після повного успіху. Кожна спроба підвищує `cleanup_epoch`; CLI зберігає structured report і повідомляє monitor навіть при помилці.
+- `theme_engine.rs`: недоступне вікно → `display = 0`; реально звітовані 0% у Remaining → 100%.
+- `app_settings.rs`: stale external copy не може воскресити id, який зарезервований, але вже не зареєстрований; epoch не відкочується.
+- `native.rs/lifecycle.rs/cli.rs`: `--manage signin --provider codex --id ID` та кнопка **Увійти через CLI** відкривають видиму консоль `codex login` з `CODEX_HOME` цього профілю.
+
+### Перевірки
+
+- Повний suite після правок: **744 passed, 0 failed, 6 ignored**. Warnings лишилися; `clippy -D warnings` не зелений.
+- Фінальний release build після останніх layout/locale правок: **8 648 192 байти**, SHA-256 **`CDEF9CEB0609C4B9F3EBEF6E04ECC37E7C90AC16FE1F94F0DCFBC4A070D00E4B`**, native version 2.22.8.0; hash встановленого `D:/Soft/UsageHub/usagehub.exe` перевірено після копіювання. Rollback: завантажити asset v2.22.7 з GitHub (на диску лишився rollback лише 2.22.6: `usagehub-2.22.6-before-icons.exe`).
+- Ізольований CLI-smoke у тимчасових `USAGEHUB_*` roots: `reset` → success, `removed_from_registry=false`, профіль у `list`, fixture-історія видалена; `delete` → success, removed, профіль і owned-каталог зникли; нічого поза scratch не змінено. `signin` коректно відмовляє для Default і Claude.
+- Реальний GUI 2.22.8: нове вікно очищення для Claude Second і Codex `second` (managed) показує чотири дії та точний id; для Codex Default відображається explicit opt-in і Preview заблокований без нього; Apply не натискався, реальні дані не змінювалися.
+- Бар після фіксу: недоступні Claude Second і Codex `second` показують порожні смужки з `!`, а не фальшиві 100%; робочі Default показують реальні відсотки.
+
 
 ## 2.22.7: виправлення іконки й оновлений README
 

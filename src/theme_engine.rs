@@ -1750,9 +1750,8 @@ impl DataContext {
         );
         self.insert(&format!("{name}.session.percentage"), session);
         self.insert(&format!("{name}.session.remaining"), 100.0 - session);
-        // An Antigravity pool window that was not reported draws an empty
-        // gauge in either usage direction instead of a full "remaining" one.
-        let shown_session = if name.starts_with("antigravity") && !session_available {
+        // An unreported window is not a full remaining allowance.
+        let shown_session = if !session_available {
             0.0
         } else {
             display(session)
@@ -1760,11 +1759,7 @@ impl DataContext {
         self.insert(&format!("{name}.session.display"), shown_session);
         self.insert(&format!("{name}.five_hour.percentage"), five_hour);
         self.insert(&format!("{name}.five_hour.remaining"), 100.0 - five_hour);
-        // An Antigravity pool window that was not reported draws an empty
-        // gauge in either usage direction instead of a full "remaining" one.
-        let shown_five_hour = if name.starts_with("antigravity")
-            && !usage.is_some_and(|usage| usage.session.available)
-        {
+        let shown_five_hour = if !usage.is_some_and(|usage| usage.session.available) {
             0.0
         } else {
             display(five_hour)
@@ -1772,9 +1767,7 @@ impl DataContext {
         self.insert(&format!("{name}.five_hour.display"), shown_five_hour);
         self.insert(&format!("{name}.weekly.percentage"), weekly);
         self.insert(&format!("{name}.weekly.remaining"), 100.0 - weekly);
-        // An Antigravity pool window that was not reported draws an empty
-        // gauge in either usage direction instead of a full "remaining" one.
-        let shown_weekly = if name.starts_with("antigravity") && !weekly_available {
+        let shown_weekly = if !weekly_available {
             0.0
         } else {
             display(weekly)
@@ -1790,16 +1783,20 @@ impl DataContext {
             );
             self.insert(
                 &format!("{name}.monthly.display"),
-                display(monthly.percentage),
+                if monthly.available {
+                    display(monthly.percentage)
+                } else {
+                    0.0
+                },
             );
         } else {
             self.insert(&format!("{name}.monthly.percentage"), 0.0);
             self.insert(&format!("{name}.monthly.remaining"), 100.0);
-            self.insert(&format!("{name}.monthly.display"), display(0.0));
+            self.insert(&format!("{name}.monthly.display"), 0.0);
         }
         self.insert(
             &format!("{name}.monthly.available"),
-            monthly.is_some() as u8 as f64,
+            monthly.is_some_and(|monthly| monthly.available) as u8 as f64,
         );
         self.insert(&format!("{name}.available"), usage.is_some() as u8 as f64);
         // Carried over from an earlier poll: real figures, not current ones.
@@ -1923,16 +1920,7 @@ impl DataContext {
             .or_else(|| self.limit_default(&name))
             .or_else(|| {
                 let key = Self::account_default_key(&name)?;
-                let value = *Self::account_defaults().values.get(&key)?;
-                Some(
-                    if key.ends_with(".display")
-                        && self.values.get("display.countdown").copied().unwrap_or(0.0) != 0.0
-                    {
-                        100.0 - value
-                    } else {
-                        value
-                    },
-                )
+                Self::account_defaults().values.get(&key).copied()
             })
     }
 

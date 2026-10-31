@@ -258,6 +258,7 @@ fn run(tokens: &[String]) -> Result<Value, Fail> {
         "import" => cmd_import(rest),
         "rename" => cmd_rename(rest),
         "open" => cmd_open(rest),
+        "signin" => cmd_sign_in(rest),
         "focus" => cmd_focus(rest),
         "status" => cmd_status(rest),
         "stop" => cmd_stop(rest),
@@ -277,7 +278,7 @@ fn run(tokens: &[String]) -> Result<Value, Fail> {
     }
 }
 
-const COMMAND_SUMMARY: &str = "expected one of: list create import rename open focus status stop pin cli poll snapshot cleanup backup skills migration doctor help";
+const COMMAND_SUMMARY: &str = "expected one of: list create import rename open signin focus status stop pin cli poll snapshot cleanup backup skills migration doctor help";
 
 fn help_text() -> Value {
     json!({
@@ -289,6 +290,7 @@ fn help_text() -> Value {
             "import --provider claude|codex --path ABS --name NAME",
             "rename --provider claude|codex --id ID --name NAME",
             "open|focus|status --provider claude|codex --id ID",
+            "signin --provider codex --id ID (open an isolated CLI sign-in console)",
             "status [--provider claude|codex] (registry overview when --id is omitted)",
             "stop --provider claude|codex --id ID [--force]",
             "pin --provider claude|codex --id ID --value true|false [--order INTEGER] [--color #RRGGBB]",
@@ -432,6 +434,13 @@ fn cmd_open(tokens: &[String]) -> Result<Value, Fail> {
         return Err(Fail::op(message));
     }
     Ok(json!({"provider": provider.descriptor().key, "id": id, "opened": true}))
+}
+
+fn cmd_sign_in(tokens: &[String]) -> Result<Value, Fail> {
+    let provider = parse_provider(&need(flag(tokens, "--provider")?, "--provider")?)?;
+    let id = need(flag(tokens, "--id")?, "--id")?;
+    lifecycle::sign_in_account(provider, &id).map_err(Fail::op)?;
+    Ok(json!({"provider": provider.descriptor().key, "id": id, "console_opened": true}))
 }
 
 fn cmd_focus(tokens: &[String]) -> Result<Value, Fail> {
@@ -965,12 +974,15 @@ fn cmd_cleanup_apply(tokens: &[String]) -> Result<Value, Fail> {
     // then hand orchestration (guard, stop, snapshot, verify, delete) to
     // cleanup::apply_cleanup. CLI creates NO backup here by design.
     let plan = cleanup::preview_cleanup(&context, scope).map_err(Fail::op)?;
-    let report = if has_flag(tokens, "--no-backup") {
-        cleanup::apply_cleanup_irreversible(&plan).map_err(Fail::op)?
+    let result = if has_flag(tokens, "--no-backup") {
+        cleanup::apply_cleanup_irreversible(&plan)
     } else {
-        cleanup::apply_cleanup(&plan).map_err(Fail::op)?
+        cleanup::apply_cleanup(&plan)
     };
+    // Even an error can follow a committed epoch or a partially committed
+    // registry/cache update, so the monitor must always reload after apply.
     notify_settings_updated();
+    let report = result.map_err(Fail::op)?;
     Ok(json!({
         "provider": provider.descriptor().key,
         "account_id": id,

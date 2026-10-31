@@ -58,11 +58,18 @@ Enable the providers you want under **Settings → Providers**. For OpenCode Go,
 
 ## Accounts and data safety
 
-Open **Settings → Accounts**, choose Claude Code or Codex, enter a name and select **Add account**. Sign in using the official app or CLI. Managed Claude Desktop accounts have isolated user-data directories; additional Codex profiles are **CLI-only**, not isolated Codex Desktop copies. Only the skills library is deliberately shared among managed accounts; credentials, config, and history are not shared through it.
+Open **Settings → Accounts**, choose Claude Code or Codex, enter a name and select **Add account**. Sign in using the official app or CLI. Managed Claude Desktop accounts have isolated user-data directories; additional Codex profiles are **CLI-only**, not isolated Codex Desktop copies. A newly added profile starts signed out: the bar marks it with `!` until you sign in. For a Codex profile use **Sign in through CLI** on its card (it opens a console with that profile's `CODEX_HOME` and runs the official `codex login`) or run `usagehub --manage signin --provider codex --id ID`. Only the skills library is deliberately shared among managed accounts; credentials, config, and history are not shared through it.
 
-To clean the main account, select **Cleanup...** on its **Default** card. Review the preview and type the account ID before applying. For external Default data, choose **Full reset** and explicitly enable **Include external Default data**; without that opt-in it remains blocked. Preview alone removes nothing.
+To clean an account, select **Cleanup...** on its card. The window explains four separate actions:
 
-Destructive logout, deletion, and full reset normally create an encrypted seven-day undo snapshot; deleting without a backup is a separate explicit irreversible choice. Regenerable cache cleanup does not require a backup. Cleanup is limited to proven owned data: it is not forensic erasure, a browser-wide wipe, or removal of vendor telemetry. See [migration and recovery](docs/migration.md) for account adoption, shared skills, and rollback.
+| Action | What it does |
+| --- | --- |
+| Sign out, keep chats | Removes identified local sign-in credentials. Chats, settings and identifiers inside that history stay; other sessions may remain. |
+| Full reset | Clears owned local sign-in data, history and settings, but keeps the UsageHub profile so the official app can sign in again. |
+| Delete profile | Managed profiles only: the same local cleanup, then the profile leaves UsageHub and the bar. |
+| Cached files | Regenerable caches only, no backup. |
+
+Preview lists exact targets before anything changes, and Apply needs the typed stable account ID. Default uses the official app's shared local data, so it is never removable: its full reset requires an explicit opt-in. Destructive actions normally create an encrypted seven-day undo snapshot; skipping it is a separate Advanced acknowledgement. Cleanup is limited to proven owned data: it is not forensic erasure, a browser-wide wipe, or removal of vendor telemetry. See [migration and recovery](docs/migration.md) for account adoption, shared skills, and rollback.
 
 ## Data and privacy
 

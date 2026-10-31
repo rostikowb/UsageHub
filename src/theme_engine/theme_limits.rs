@@ -48,7 +48,9 @@ impl DataContext {
             ("remaining", 100.0 - percentage),
             (
                 "display",
-                if countdown {
+                if !limit.usage.available {
+                    0.0
+                } else if countdown {
                     100.0 - percentage
                 } else {
                     percentage
@@ -140,13 +142,7 @@ impl DataContext {
             "available" | "percentage" | "is_active" | "reset.unix" | "reset.seconds"
             | "reset.minutes" | "reset.hours" | "reset.days" => Some(0.0),
             "remaining" => Some(100.0),
-            "display" => Some(
-                if self.values.get("display.countdown").copied().unwrap_or(0.0) != 0.0 {
-                    100.0
-                } else {
-                    0.0
-                },
-            ),
+            "display" => Some(0.0),
             _ => None,
         }
     }
@@ -285,7 +281,7 @@ mod tests {
                 );
                 assert_eq!(
                     evaluate(&format!("{base}.display"), &context).unwrap(),
-                    100.0
+                    0.0
                 );
                 assert_eq!(
                     evaluate(&format!("{base}.reset.unix"), &context).unwrap(),

@@ -502,6 +502,39 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
+    #[test]
+    fn cleanup_epoch_rejects_old_poll_without_dropping_other_slots() {
+        let mut settings = crate::accounts::AccountSettings::default();
+        let first = crate::accounts::AccountProfile {
+            id: "first".into(),
+            pinned: true,
+            ..Default::default()
+        };
+        let second = crate::accounts::AccountProfile {
+            id: "second".into(),
+            pinned: true,
+            ..Default::default()
+        };
+        settings.claude.profiles = vec![first.clone(), second.clone()];
+        settings.claude.selected = "first".into();
+        let mut data = AppUsageData::default();
+        for profile in [first, second] {
+            data.accounts.push(AccountUsage {
+                provider: ProviderId::Claude,
+                profile,
+                source_signature: String::new(),
+                source_path: None,
+                usage: Some(UsageData::default()),
+                error: None,
+                selected: false,
+            });
+        }
+        settings.claude.profiles[0].cleanup_epoch += 1;
+        data.select_accounts(&settings);
+        assert_eq!(data.accounts.len(), 1);
+        assert_eq!(data.accounts[0].profile.id, "second");
+        assert!(data.get(ProviderId::Claude).is_none());
+    }
 
     #[test]
     fn desktop_cache_invalidation_is_per_account() {

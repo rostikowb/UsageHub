@@ -94,7 +94,7 @@ fn normalized_account_ids_keep_theme_values_independent() {
         &Canvas::default(),
         ThemeRuntime::default().with_countdown(true),
     );
-    assert_eq!(empty.get("accounts.codex.Work.weekly.display"), Some(100.0));
+    assert_eq!(empty.get("accounts.codex.Work.weekly.display"), Some(0.0));
     assert_eq!(empty.get_string("accounts.codex.Work.name"), Some(""));
 }
 
@@ -2977,7 +2977,13 @@ fn reported_windows_are_available_even_when_idle_without_reset_times() {
                 percentage: 0.0,
                 resets_at: reset,
             },
-            monthly: Some(UsageSection::default()),
+            // Monthly windows come from a reported pool; the test varies
+            // reset timestamps, not availability.
+            monthly: Some(UsageSection {
+                available: true,
+                percentage: 0.0,
+                resets_at: None,
+            }),
             ..Default::default()
         };
         let data = AppUsageData::from_iter(
@@ -3109,6 +3115,46 @@ fn credit_badges_abbreviate_a_balance_too_wide_for_the_tray() {
     assert_eq!(
         format_template("{codex.credits.balance / 1000:0.0}k", &context(1234.0)),
         "1.2k"
+    );
+}
+
+#[test]
+fn remaining_gauges_distinguish_unavailable_from_real_zero_usage() {
+    use crate::models::{UsageData, UsageSection};
+    for (available, expected) in [(false, 0.0), (true, 100.0)] {
+        let usage = AppUsageData::from_iter([(
+            ProviderId::Claude,
+            UsageData {
+                session: UsageSection {
+                    available,
+                    percentage: 0.0,
+                    resets_at: None,
+                },
+                weekly: UsageSection {
+                    available,
+                    percentage: 0.0,
+                    resets_at: None,
+                },
+                ..Default::default()
+            },
+        )]);
+        let context = DataContext::from_usage_with_runtime(
+            Some(&usage),
+            &Canvas::default(),
+            ThemeRuntime::default().with_countdown(true),
+        );
+        assert_eq!(context.get("claude.session.display"), Some(expected));
+        assert_eq!(context.get("claude.weekly.display"), Some(expected));
+        assert_eq!(context.get("claude.monthly.display"), Some(0.0));
+    }
+    let empty = DataContext::from_usage_with_runtime(
+        None,
+        &Canvas::default(),
+        ThemeRuntime::default().with_countdown(true),
+    );
+    assert_eq!(
+        empty.get("accounts.claude.missing.session.display"),
+        Some(0.0)
     );
 }
 

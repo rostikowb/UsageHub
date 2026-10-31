@@ -6,6 +6,22 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.22.8] - 2026-10-31
+
+### Changed
+
+- Replace the ambiguous cleanup radio row with four explained actions: sign out but keep chats, full reset for a fresh sign-in, delete a managed profile, and cache-only cleanup. Each shows its consequences and the exact stable account ID; Default reset keeps its explicit opt-in, the encrypted backup stays the default, and skipping it lives under Advanced with its own acknowledgement.
+- Keep the cleanup window open through progress and results, distinguish completed, partial and failed operations, and state whether the profile was removed from the bar or kept for a new sign-in.
+- Full reset of a managed profile now keeps its UsageHub slot and recreates empty launch roots for the official app; only delete retires the profile. Backups still restore the authenticated profile across a cleanup epoch.
+- Codex CLI profiles gain **Sign in through CLI**: it opens a console with that profile's `CODEX_HOME` and runs the official `codex login`, instead of leaving the profile unsigned with only a `!` in the bar. `usagehub --manage signin --provider codex --id ID` exposes the same action.
+
+### Fixed
+
+- Cleanup reports with `success: false` were returned inside a successful CLI envelope; they now surface as a non-zero failed operation with the structured report, and every apply attempt notifies the monitor.
+- Unreported quotas in Remaining direction drew a full gauge; an unavailable window is now empty, while a genuinely reported 0% usage still reads 100% remaining.
+- A stale external settings snapshot could resurrect an adopted profile that was later deleted; retired IDs now reject incoming external copies.
+- Logout/reset previews no longer claim configuration and history are kept when the selected scope deletes them.
+
 ## [2.22.7] - 2026-10-28
 
 ### Fixed
@@ -1628,4 +1644,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.22.5]: https://github.com/rostikowb/UsageHub/releases/tag/v2.22.5
 [2.22.6]: https://github.com/rostikowb/UsageHub/compare/v2.22.5...v2.22.6
 [2.22.7]: https://github.com/rostikowb/UsageHub/compare/v2.22.6...v2.22.7
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.7...usagehub
+[2.22.8]: https://github.com/rostikowb/UsageHub/compare/v2.22.7...v2.22.8
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.22.8...usagehub

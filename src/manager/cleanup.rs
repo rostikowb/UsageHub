@@ -107,9 +107,8 @@ pub struct CleanupReport {
     pub backup_id: Option<String>,
     pub results: Vec<CleanupTargetResult>,
     pub warnings: Vec<String>,
-    /// True only when the profile entry was actually removed from the
-    /// registry (managed accounts, delete/reset scopes, after all owned data
-    /// was cleaned). Retired ids are always preserved.
+    /// True only when a managed profile was removed after a complete delete.
+    /// Reset retains the profile; retired ids are always preserved.
     pub removed_from_registry: bool,
     pub success: bool,
 }
@@ -368,6 +367,27 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
     // Unknown-junction hard stop BEFORE any mutation.
     prescan_no_surprise_links(&derived)?;
 
+    // Retire in-flight readings before touching credentials or files. The
+    // epoch is persisted under the settings lock and cache reconciliation
+    // drops older snapshots; late publishers are rebased against this epoch.
+    state::mutate_settings(|settings| {
+        let accounts = match plan.provider {
+            ProviderId::Claude => &mut settings.accounts.claude,
+            ProviderId::Codex => &mut settings.accounts.codex,
+            _ => return Err("This provider does not support account profiles".to_string()),
+        };
+        let profile = accounts
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == plan.account_id)
+            .ok_or_else(|| format!("Unknown account '{}'", plan.account_id))?;
+        profile.cleanup_epoch = profile
+            .cleanup_epoch
+            .checked_add(1)
+            .ok_or_else(|| "Cleanup epoch exhausted".to_string())?;
+        Ok(())
+    })?;
+
     // Execute in passes: vault entries, skill-link inodes, files, then trees.
     let mut results = Vec::new();
     let mut aborted = false;
@@ -508,35 +528,46 @@ fn apply_impl(plan: &CleanupPlan, with_backup: bool) -> ManagerResult<CleanupRep
         }
     }
 
-    // Registry removal only after complete owned-data cleanup. Retired ids
-    // are preserved (only the profile entry is removed). External accounts
-    // keep their entry: reset wipes opted-in data, not the account slot.
-    let data_ok = results.iter().all(|r| r.ok);
-    let registry_required = matches!(
-        plan.scope,
-        CleanupScope::AccountLocalData | CleanupScope::FullReset
-    ) && data_ok
-        && fresh.is_managed();
+    // Only delete retires a managed profile. Reset keeps its registry and
+    // source paths so the official application can create a fresh login.
+    let data_ok = !aborted && results.iter().all(|r| r.ok);
+    let registry_required =
+        plan.scope == CleanupScope::AccountLocalData && data_ok && fresh.is_managed();
     let mut removed_from_registry = false;
+    let mut registry_ok = true;
     if registry_required {
         match remove_profile_from_registry(plan.provider, &plan.account_id) {
             Ok(()) => removed_from_registry = true,
-            Err(error) => warnings.push(format!(
-                "Data deleted but registry removal failed (retry is safe): {error}"
-            )),
+            Err(error) => {
+                // The settings file is committed before cache reconciliation.
+                // A cache write failure can therefore occur after retirement.
+                removed_from_registry =
+                    std::fs::read_to_string(crate::app_settings::settings_path())
+                        .ok()
+                        .and_then(|contents| {
+                            serde_json::from_str::<crate::app_settings::SettingsFile>(&contents)
+                                .ok()
+                        })
+                        .and_then(|settings| {
+                            settings
+                                .accounts
+                                .get(plan.provider)
+                                .map(|accounts| accounts.find(&plan.account_id).is_none())
+                        })
+                        .unwrap_or(false);
+                registry_ok = false;
+                warnings.push(if removed_from_registry {
+                    format!("Profile removed, but registry/cache reconciliation failed: {error}")
+                } else {
+                    format!("Data deleted but registry removal failed (retry is safe): {error}")
+                });
+            }
         }
-    } else if matches!(
-        plan.scope,
-        CleanupScope::AccountLocalData | CleanupScope::FullReset
-    ) && data_ok
-    {
-        warnings.push(
-            "External account entry preserved in the registry; only the opted-in data was wiped"
-                .to_string(),
-        );
+    } else if plan.scope == CleanupScope::FullReset && data_ok {
+        warnings.push("Account entry preserved for a fresh sign-in".to_string());
     }
 
-    let success = data_ok && (!registry_required || removed_from_registry);
+    let success = data_ok && registry_ok && (!registry_required || removed_from_registry);
     Ok(CleanupReport {
         scope: plan.scope,
         provider: plan.provider,
@@ -909,16 +940,16 @@ fn derive_targets(
     match scope {
         CleanupScope::AccountCache => collect_cache_targets(ctx, &mut targets, &mut warnings)?,
         CleanupScope::AccountLogout => {
-            collect_logout_targets(ctx, &mut targets, &mut warnings)?;
+            collect_logout_targets(ctx, &mut targets, &mut warnings, true)?;
         }
         CleanupScope::AccountLocalData => {
-            collect_logout_targets(ctx, &mut targets, &mut warnings)?;
+            collect_logout_targets(ctx, &mut targets, &mut warnings, false)?;
             collect_local_targets(ctx, &mut targets, &mut warnings)?;
         }
         CleanupScope::FullReset => {
-            collect_logout_targets(ctx, &mut targets, &mut warnings)?;
-            collect_local_targets(ctx, &mut targets, &mut warnings)?;
+            collect_logout_targets(ctx, &mut targets, &mut warnings, false)?;
             collect_reset_targets(ctx, &mut targets, &mut warnings)?;
+            collect_local_targets(ctx, &mut targets, &mut warnings)?;
         }
     }
     // Owned launcher artifacts for Managed delete/reset: exact-owned-id
@@ -1047,6 +1078,7 @@ fn collect_logout_targets(
     ctx: &AccountContext,
     targets: &mut Vec<CleanupTarget>,
     warnings: &mut Vec<String>,
+    logout_only: bool,
 ) -> ManagerResult<()> {
     if let Some(file) = ctx.credential_file.clone() {
         if std::fs::symlink_metadata(&file).is_ok() {
@@ -1089,10 +1121,12 @@ fn collect_logout_targets(
                 size_bytes,
                 covered_by_backup: None,
             });
-            warnings.push(
-                "Desktop config.json: only the OAuth token cache keys are redacted by logout; identity, prefs, history, and skills are kept"
-                    .to_string(),
-            );
+            if logout_only {
+                warnings.push(
+                    "Desktop config.json: only the OAuth token cache keys are redacted by logout; identity, prefs, history, and skills are kept"
+                        .to_string(),
+                );
+            }
         }
         let mut cookies_found = 0;
         for name in [
@@ -1122,14 +1156,16 @@ fn collect_logout_targets(
             });
             cookies_found += 1;
         }
-        if cookies_found > 0 {
+        if cookies_found > 0 && logout_only {
             warnings.push(
                 "Cookie session stores cleared; transport security, persistent state, prefs, and history are kept"
                     .to_string(),
             );
         }
     }
-    warnings.push("Configuration, history, and skill links are kept by logout".to_string());
+    if logout_only {
+        warnings.push("Configuration, history, and skill links are kept by logout".to_string());
+    }
     Ok(())
 }
 
@@ -1191,6 +1227,19 @@ fn collect_local_targets(
                     base.display()
                 ));
             }
+            continue;
+        }
+        // Reset has already added canonical roots. Do not claim a mapped
+        // external path is untouched when that same tree is in the plan.
+        if !ctx.is_managed()
+            && targets.iter().any(|target| {
+                target.kind == CleanupTargetKind::Directory
+                    && std::fs::canonicalize(base)
+                        .ok()
+                        .zip(std::fs::canonicalize(&target.path).ok())
+                        .is_some_and(|(base, root)| base.starts_with(root))
+            })
+        {
             continue;
         }
         if !ctx.is_managed() {
@@ -2117,9 +2166,8 @@ fn publisher_dirs(root: &Path, prefix: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// Report legacy plaintext backup generations found at the top level of a
-/// canonical root. They are never acted on here; migration owns the explicit
-/// encrypt/purge/leave choice.
+/// Report legacy plaintext backup generations included in canonical reset
+/// roots. Copies outside those roots are not covered.
 fn scan_legacy_leftovers(root: &Path, warnings: &mut Vec<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -2129,7 +2177,7 @@ fn scan_legacy_leftovers(root: &Path, warnings: &mut Vec<String>) {
         let name = entry.file_name().to_string_lossy().to_lowercase();
         if name.contains("backup") || name.ends_with(".bak") || name.ends_with(".backup") {
             warnings.push(format!(
-                "Legacy backup '{}' left in place; choose encrypt/purge/leave via migration",
+                "Legacy backup '{}' is inside a reset target and will be removed; copies elsewhere are not covered",
                 entry.path().display()
             ));
         }
@@ -2157,6 +2205,66 @@ mod tests {
 
     fn ctx_for(profile: &AccountProfile) -> AccountContext {
         AccountContext::from_profile(ProviderId::Claude, profile).unwrap()
+    }
+
+    #[test]
+    fn reset_retains_adopted_profile_and_recreates_empty_launch_roots() {
+        use crate::manager::{native, state};
+        native::set_test_snapshot(Vec::new());
+        native::allow_test_signals();
+        let root = TempDir::new().unwrap();
+        let desktop = root.path().join("adopted-desktop");
+        let config = desktop.join("claude-config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            desktop.join("config.json"),
+            r#"{"oauth:tokenCacheV2":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(config.join("history.json"), "fixture history").unwrap();
+        let id = "reset_fixture_adopted";
+        state::mutate_settings(|settings| {
+            settings.accounts.claude.profiles.push(AccountProfile {
+                id: id.into(),
+                desktop_dir: desktop.to_string_lossy().into_owned(),
+                config_dir: config.to_string_lossy().into_owned(),
+                ownership: AccountOwnership::Managed,
+                pinned: true,
+                ..Default::default()
+            });
+            settings.accounts.claude.used_ids.insert(id.into());
+            Ok(())
+        })
+        .unwrap();
+        let ctx = resolve_context(ProviderId::Claude, id).unwrap();
+        let plan = preview_cleanup(&ctx, CleanupScope::FullReset).unwrap();
+        assert!(!plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("kept by logout")));
+        assert!(!plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("identity, prefs, history, and skills are kept")));
+        let report = apply_cleanup(&plan).unwrap();
+        assert!(report.success);
+        assert!(!report.removed_from_registry);
+        let retained = resolve_context(ProviderId::Claude, id).unwrap();
+        assert!(retained.profile.pinned);
+        assert!(retained.profile.cleanup_epoch > ctx.profile.cleanup_epoch);
+        assert!(!desktop.join("config.json").exists());
+        assert!(!config.join("history.json").exists());
+        native::ensure_managed_launch_roots(&retained).unwrap();
+        assert!(desktop.is_dir() && config.is_dir());
+        assert!(!desktop.join("config.json").exists());
+        assert!(!config.join("history.json").exists());
+        assert_eq!(
+            native::account_command_marker(&retained).unwrap().unwrap(),
+            desktop.to_string_lossy().to_lowercase()
+        );
+        crate::manager::backup::restore_backup(report.backup_id.as_deref().unwrap()).unwrap();
+        assert!(desktop.join("config.json").is_file());
+        assert!(config.join("history.json").is_file());
     }
 
     #[test]
