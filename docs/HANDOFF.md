@@ -2,6 +2,13 @@
 
 Актуальний знімок — **2026-10-31: 2.22.8 встановлено, перевірено та опубліковано**. Нижче збережено історію попередніх перевірок. Це не гарантія майбутнього стану машини: джерело істини — актуальний код і живі процеси; не завершуйте процес за старим PID. `origin` — https://github.com/rostikowb/UsageHub, `upstream` — CodeZeno; робоча гілка — `usagehub`. Не робіть руйнівних `reset` або `clean`.
 
+## 2.23.3: вікно акаунта виходить на передній план
+
+- Симптом: вікно Claude `Claude for Windows` видиме, `enabled=True`, `IsHungAppWindow=False`, але кліки не діють. `WindowFromPoint` у центрі повертав **Telegram** (pid 20772), а `--manage focus` відповідав `focused: true`, хоча `GetForegroundWindow()` лишався Telegram. Тобто вікно не зависло — воно було під іншим вікном, а Windows відмовила фоновому процесу в foreground.
+- `native.rs::focus_account_window`: якщо звичайний `SetForegroundWindow` не дав foreground, тимчасово викликається `AttachThreadInput(поточний, foreground-потік)` + `BringWindowToTop` + `SetForegroundWindow`, потім від’єднання; пропускається, якщо foreground-потік завис. Додатковий `SwitchToThisWindow` і лог, якщо Windows усе одно відмовила. Чужі topmost/styles не змінюються.
+- Перевірено нативно: Telegram на передньому плані (20772) → `--manage focus --provider claude --id default` → foreground став Claude (pid 23324, hwnd 4457448); hit-test у центрі теж Claude.
+- Встановлено **8 732 160 байтів**, SHA-256 `DF78C48C9C569C784AE2E5AC0ECDB548186CDD694A5653DEF7B0FDE20A7D9598`; suite **752 passed / 6 ignored**; опубліковано [v2.23.3](https://github.com/rostikowb/UsageHub/releases/tag/v2.23.3) з коміту `a398a571355cfcc6c00df43e0296e5fdb7248d2d`.
+
 ## 2.23.2: двокрокове очищення + проєктний UI/UX скіл
 
 - У проєкт встановлено **UI/UX Pro Max** у `.omp/skills/ui-ux-pro-max` (SKILL.md + data/references/scripts, ~3.5 MB, з github.com/nextlevelbuilder/ui-ux-pro-max-skill). omp сканує `<repo>/.omp/skills/*/SKILL.md`; скіл закомічено разом із релізом. Застосовано його правила: confirmation dialogs, progressive disclosure, один primary action, підписи полів, видимий фокус.
