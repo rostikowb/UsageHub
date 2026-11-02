@@ -6,6 +6,12 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.23.3] - 2026-11-02
+
+### Fixed
+
+- Opening or focusing an account now raises its window explicitly when Windows denies the normal foreground grant. Previously the command reported success while an unrelated overlapping window (for example Telegram) kept receiving the clicks, which made the account window look unresponsive. The fallback still only touches that account's own verified window and logs when Windows keeps another window in front.
+
 ## [2.23.2] - 2026-10-31
 
 ### Changed
@@ -1680,4 +1686,5 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 [2.23.0]: https://github.com/rostikowb/UsageHub/compare/v2.22.9...v2.23.0
 [2.23.1]: https://github.com/rostikowb/UsageHub/compare/v2.23.0...v2.23.1
 [2.23.2]: https://github.com/rostikowb/UsageHub/compare/v2.23.1...v2.23.2
-[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.2...usagehub
+[2.23.3]: https://github.com/rostikowb/UsageHub/compare/v2.23.2...v2.23.3
+[Unreleased]: https://github.com/rostikowb/UsageHub/compare/v2.23.3...usagehub

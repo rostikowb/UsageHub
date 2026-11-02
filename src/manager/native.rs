@@ -55,8 +55,8 @@ use windows::Win32::System::Registry::{
     KEY_READ,
 };
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows::Win32::System::Variant::{VT_EMPTY, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::{
@@ -67,10 +67,11 @@ use windows::Win32::UI::Shell::{
     AO_NONE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow,
-    ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SW_RESTORE, WM_CLOSE, WS_CAPTION, WS_CHILD,
-    WS_DISABLED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsWindow, IsWindowVisible,
+    PostMessageW, SetForegroundWindow, ShowWindowAsync, SwitchToThisWindow, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER, SW_RESTORE, WM_CLOSE, WS_CAPTION, WS_CHILD, WS_DISABLED, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_THICKFRAME,
 };
 
 use crate::accounts::AccountProfile;
@@ -1522,6 +1523,38 @@ pub fn focus_account_window(ctx: &AccountContext) -> ManagerResult<bool> {
         // quota polls. Restore asynchronously and respect foreground-lock rules.
         let _ = ShowWindowAsync(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
+        if GetForegroundWindow() != hwnd {
+            // Windows denies the foreground grant to a background caller. The
+            // user asked for this window from the bar, so attach to the
+            // current foreground thread for the duration of the activation.
+            // A hung foreground thread is skipped: attaching to it could block
+            // this worker while it owns the account-operation guard.
+            let foreground = GetForegroundWindow();
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(foreground, None)
+            };
+            let current_thread = GetCurrentThreadId();
+            let attached = foreground_thread != 0
+                && foreground_thread != current_thread
+                && !IsHungAppWindow(foreground).as_bool()
+                && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+            if attached {
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(current_thread, foreground_thread, false);
+            }
+            if GetForegroundWindow() != hwnd {
+                let _ = BringWindowToTop(hwnd);
+                let _ = SwitchToThisWindow(hwnd, true);
+            }
+            if GetForegroundWindow() != hwnd {
+                crate::diagnose::log(
+                    "account focus requested but Windows kept another window in front",
+                );
+            }
+        }
         Ok(true)
     }
 }
