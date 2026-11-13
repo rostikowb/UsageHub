@@ -6,6 +6,17 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.23.4] - 2026-11-13
+
+### Added
+
+- Compact account cards whose density follows the number of pinned accounts, not the number of providers. Four pinned accounts fit on the bar with three segments per row and five use one; six and seven switch to a percentage-only value column with the 5h/7d captions hidden.
+- Super-compact tier for more than four pinned accounts: the reset countdown is dropped, the percentage keeps a 44 px column, and only cards that still cannot fit move behind the overflow chip. The row reserves space left of the centered app buttons instead of relying on a collision ejection.
+
+### Changed
+
+- A pinned account now gets the same card width whether it shares its provider with other pinned accounts or not, so four Codex accounts fit exactly like four mixed Claude/Codex accounts.
+
 ## [2.23.3] - 2026-11-02
 
 ### Fixed

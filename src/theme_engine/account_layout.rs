@@ -36,6 +36,21 @@ pub const ACCOUNT_CARD_ID_PREFIX: &str = "usagehub-account--";
 /// cloned provider group) does not supply its own width.
 pub const ACCOUNT_CARD_WIDTH: f64 = 96.0;
 pub const ACCOUNT_CARD_GAP: f64 = 3.0;
+/// Width of the value column (`95% · 4г`) at the authored 12 px font.
+pub const ACCOUNT_CARD_VALUE_WIDTH: f64 = 62.0;
+/// One progress segment plus its 1 px gap.
+pub const ACCOUNT_SEGMENT_STEP: f64 = 11.0;
+/// Space between the segmented bar and the value column.
+pub const ACCOUNT_CARD_PADDING: f64 = 4.0;
+/// Full-density segment count authored by the classic themes.
+pub const ACCOUNT_SEGMENTS_MAX: u16 = 10;
+/// Keep the account row left of the centered Windows app buttons. The taskbar
+/// collision pass still protects Start and pinned icons, but this reservation
+/// makes four compact cards fit without relying on an ejection.
+pub const ACCOUNT_SAFE_CARD_BUDGET: f64 = 480.0;
+/// Super-compact value column: percentage only, no reset countdown.
+pub const ACCOUNT_COMPACT_VALUE_WIDTH: f64 = 44.0;
+pub const ACCOUNT_COMPACT_FONT_SIZE: f64 = 10.0;
 /// Chrome kept beside the row (session/weekly labels in the classic family).
 pub const ACCOUNT_ROW_CHROME: f64 = 42.0;
 pub const ACCOUNT_OVERFLOW_WIDTH: f64 = 30.0;
@@ -161,10 +176,45 @@ pub fn mark_busy_cards(cards: &mut [AccountCard], is_busy: impl Fn(ProviderId, &
 /// Partition cards into bar-visible and overflow sets against a width budget.
 /// At least one card stays visible when any exist; the rest (plus any beyond
 /// [`ACCOUNT_MAX_VISIBLE_CARDS`]) go to the overflow account chooser.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Density is account-count driven, not provider-count driven: four pinned
+/// accounts always share the same compact card width whether they belong to
+/// one provider or four. `segments`/`card_width` describe the card geometry
+/// the theme expander must materialize for `visible`; `overflow` cards keep
+/// the authored geometry and live behind the overflow chip.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AccountLayout {
     pub visible: Vec<AccountCard>,
     pub overflow: Vec<AccountCard>,
+    /// Segments per progress row for the visible cards.
+    pub segments: u16,
+    /// Width of one visible card, including the value column.
+    pub card_width: f64,
+    /// Value column width for the visible cards.
+    pub value_width: f64,
+    /// Value font size for the visible cards.
+    pub value_font_size: f64,
+    /// Super-compact cards show only the percentage, not `95% · 4г`.
+    pub percentage_only: bool,
+}
+
+impl AccountLayout {
+    pub fn is_compact(&self) -> bool {
+        self.segments < ACCOUNT_SEGMENTS_MAX
+    }
+}
+
+fn card_width_for(segments: u16, value_width: f64) -> f64 {
+    f64::from(segments) * ACCOUNT_SEGMENT_STEP - 1.0 + ACCOUNT_CARD_PADDING + value_width
+}
+
+fn cards_width(count: usize, segments: u16, value_width: f64) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    ACCOUNT_ROW_CHROME
+        + count as f64 * card_width_for(segments, value_width)
+        + (count.saturating_sub(1)) as f64 * ACCOUNT_CARD_GAP
 }
 
 pub fn layout_accounts(cards: &[AccountCard], max_width: f64) -> AccountLayout {
@@ -173,36 +223,75 @@ pub fn layout_accounts(cards: &[AccountCard], max_width: f64) -> AccountLayout {
     } else {
         ACCOUNT_MAX_WIDTH_FALLBACK
     };
+    // Stay left of the centered app buttons even when the taskbar budget is
+    // larger. The collision pass still protects Start/pinned icons.
+    let budget = max_width.min(ACCOUNT_SAFE_CARD_BUDGET);
     if cards.is_empty() {
         return AccountLayout {
             visible: Vec::new(),
             overflow: Vec::new(),
+            segments: ACCOUNT_SEGMENTS_MAX,
+            card_width: card_width_for(ACCOUNT_SEGMENTS_MAX, ACCOUNT_CARD_VALUE_WIDTH),
+            value_width: ACCOUNT_CARD_VALUE_WIDTH,
+            value_font_size: 12.0,
+            percentage_only: false,
         };
     }
-    // Use account-provider count for the shared, conservative card estimate.
-    // The imported classic layout also checks its resolved surface width.
-    let provider_count = ACCOUNT_CARD_PROVIDERS
-        .iter()
-        .filter(|provider| cards.iter().any(|card| card.provider == **provider))
-        .count()
-        .max(1);
-    let classic_width = ((10 + provider_count - 1) / provider_count * 11 - 1 + 4 + 62) as f64;
-    let card_step = ACCOUNT_CARD_WIDTH.max(classic_width) + ACCOUNT_CARD_GAP;
-    let mut capacity =
-        ((max_width - ACCOUNT_ROW_CHROME + ACCOUNT_CARD_GAP) / card_step).floor() as usize;
-    capacity = capacity.clamp(1, ACCOUNT_MAX_VISIBLE_CARDS.min(cards.len().max(1)));
-    // Reserve the overflow chip when not everything fits.
-    if cards.len() > capacity {
-        let with_chip = ((max_width - ACCOUNT_ROW_CHROME - ACCOUNT_OVERFLOW_WIDTH
-            + ACCOUNT_CARD_GAP)
-            / card_step)
-            .floor() as usize;
-        capacity = with_chip.clamp(1, capacity);
+
+    let target = cards.len().min(ACCOUNT_MAX_VISIBLE_CARDS);
+    // Full value (`95% · 4г`) first, widest geometry that fits.
+    let mut chosen = None;
+    for candidate in (1..=ACCOUNT_SEGMENTS_MAX).rev() {
+        if cards_width(target, candidate, ACCOUNT_CARD_VALUE_WIDTH) <= budget {
+            chosen = Some((
+                candidate,
+                ACCOUNT_CARD_VALUE_WIDTH,
+                12.0,
+                false,
+            ));
+            break;
+        }
     }
-    let capacity = capacity.min(cards.len());
+    // More than four accounts: percentage-only cards with no reset countdown.
+    if chosen.is_none() {
+        for candidate in (1..=2).rev() {
+            if cards_width(target, candidate, ACCOUNT_COMPACT_VALUE_WIDTH) <= budget {
+                chosen = Some((
+                    candidate,
+                    ACCOUNT_COMPACT_VALUE_WIDTH,
+                    ACCOUNT_COMPACT_FONT_SIZE,
+                    true,
+                ));
+                break;
+            }
+        }
+    }
+
+    if let Some((segments, value_width, value_font_size, percentage_only)) = chosen {
+        return AccountLayout {
+            visible: cards[..target].to_vec(),
+            overflow: cards[target..].to_vec(),
+            segments,
+            card_width: card_width_for(segments, value_width),
+            value_width,
+            value_font_size,
+            percentage_only,
+        };
+    }
+
+    // Even the smallest card cannot show the whole set: keep as many as fit
+    // beside the overflow chip, and never render an empty bar.
+    let step = card_width_for(1, ACCOUNT_COMPACT_VALUE_WIDTH) + ACCOUNT_CARD_GAP;
+    let with_chip = ((budget - ACCOUNT_ROW_CHROME - ACCOUNT_OVERFLOW_WIDTH) / step).floor();
+    let capacity = (with_chip as usize).clamp(1, target);
     AccountLayout {
         visible: cards[..capacity].to_vec(),
         overflow: cards[capacity..].to_vec(),
+        segments: 1,
+        card_width: card_width_for(1, ACCOUNT_COMPACT_VALUE_WIDTH),
+        value_width: ACCOUNT_COMPACT_VALUE_WIDTH,
+        value_font_size: ACCOUNT_COMPACT_FONT_SIZE,
+        percentage_only: true,
     }
 }
 
@@ -352,6 +441,9 @@ fn expand_left_dock_classic(theme: &ThemeDocument, layout: &AccountLayout) -> Th
                             clone.parent = remap.get(parent).cloned();
                         }
                         rewrite_subtree_strings(&mut clone, key, &card.binding_key());
+                        if layout.is_compact() {
+                            apply_card_plan(&mut clone, layout, source.id == object.id);
+                        }
                         if source.id == object.id {
                             roots.push(clone);
                         } else {
@@ -371,6 +463,20 @@ fn expand_left_dock_classic(theme: &ThemeDocument, layout: &AccountLayout) -> Th
             ));
         }
         roots.extend(descendants);
+        // The imported theme keeps the 5h/7d captions outside the provider
+        // subtrees. Super-compact cards start at the same x, so hide the
+        // global captions as well; otherwise they overlap the first value.
+        if layout.segments <= 2 || layout.percentage_only {
+            for child in &mut roots {
+                if let SceneContent::Text { template, .. } = &child.content {
+                    if template.contains("i18n.session_window")
+                        || template.contains("i18n.weekly_window")
+                    {
+                        child.render = Expression("0".into());
+                    }
+                }
+            }
+        }
         surface.children = roots;
         let claude = layout
             .visible
@@ -382,15 +488,23 @@ fn expand_left_dock_classic(theme: &ThemeDocument, layout: &AccountLayout) -> Th
             .iter()
             .filter(|card| card.provider == ProviderId::Codex)
             .count();
-        let count = format!("(providers.count - providers.claude.enabled - providers.codex.enabled + {claude} * providers.claude.enabled + {codex} * providers.codex.enabled)");
         let extra = if layout.overflow.is_empty() {
             0.0
         } else {
             ACCOUNT_OVERFLOW_WIDTH + ACCOUNT_CARD_GAP
         };
-        surface.width = Expression(format!(
-            "42 + {count} * (ceil(10 / max(1, providers.count)) * 11 - 1 + 4 + 62) + max(0, {count} - 1) * 3 + (providers.opencode.enabled + providers.cursor.enabled) * 28 + {extra}"
-        ));
+        if layout.is_compact() {
+            let count = layout.visible.len();
+            let width = layout.card_width;
+            surface.width = Expression(format!(
+                "42 + {count} * {width} + max(0, {count} - 1) * 3 + (providers.opencode.enabled + providers.cursor.enabled) * 28 + {extra}"
+            ));
+        } else {
+            let count = format!("(providers.count - providers.claude.enabled - providers.codex.enabled + {claude} * providers.claude.enabled + {codex} * providers.codex.enabled)");
+            surface.width = Expression(format!(
+                "42 + {count} * (ceil(10 / max(1, providers.count)) * 11 - 1 + 4 + 62) + max(0, {count} - 1) * 3 + (providers.opencode.enabled + providers.cursor.enabled) * 28 + {extra}"
+            ));
+        }
     }
     expanded
 }
@@ -504,6 +618,61 @@ fn expand_marker_theme(theme: &ThemeDocument, layout: &AccountLayout) -> ThemeDo
         }
     }
     expanded
+}
+
+/// Shrink one authored provider/card object to the layout's compact density.
+/// `is_root` marks the provider group whose width drives the row layout; its
+/// descendants keep their relative offsets except the segmented gauges and the
+/// value column, which are re-flowed beside the shorter bar.
+fn apply_card_plan(object: &mut SceneObject, layout: &AccountLayout, is_root: bool) {
+    let segment_width = f64::from(layout.segments) * ACCOUNT_SEGMENT_STEP - 1.0;
+    if is_root {
+        object.width = Expression(format!("{}", layout.card_width));
+    }
+    match &mut object.content {
+        SceneContent::Progress {
+            segments,
+            segments_expression,
+            ..
+        } => {
+            *segments = layout.segments;
+            *segments_expression = None;
+            object.width = Expression(format!("{segment_width}"));
+        }
+        SceneContent::Text {
+            template,
+            font_size,
+            ..
+        } => {
+            // At one or two segments the 5h/7d caption no longer fits beside
+            // the bar; the value already carries the percentage and reset.
+            if (layout.segments <= 2 || layout.percentage_only)
+                && (template.contains("i18n.session_window")
+                    || template.contains("i18n.weekly_window"))
+            {
+                object.render = Expression("0".into());
+            }
+            if object.x.0.contains("providers.count")
+                && object.x.0.contains("11")
+                && object.x.0.contains("+ 4")
+            {
+                object.x = Expression(format!("{}", segment_width + ACCOUNT_CARD_PADDING));
+                if layout.percentage_only && template.contains(":usage_line}") {
+                    // `usage_badge` is the same line without the reset suffix
+                    // and still renders `!` for an errored account.
+                    *template = template.replace(":usage_line}", ":usage_badge}");
+                }
+                if template.contains("usage_line")
+                    || template.contains("usage_badge")
+                    || template.contains("credits.balance")
+                {
+                    object.width = Expression(format!("{}", layout.value_width));
+                    *font_size = Expression(format!("{}", layout.value_font_size));
+                }
+            }
+        }
+        SceneContent::None => {}
+    }
 }
 
 fn evaluate_width_literal(expression: &Expression, _label: &str) -> Option<f64> {
@@ -1187,6 +1356,205 @@ mod tests {
         assert!(surface.width.0.len() > "200".len());
     }
 
+    fn compact_left_dock_theme() -> ThemeDocument {
+        let mut theme = builtin_like_theme();
+        theme.id = "left-dock-usage".into();
+        let surface = &mut theme.surfaces[0];
+        let mut second = surface.children[1].clone();
+        second.id = "second-provider".into();
+        let mut codex = surface.children[1].clone();
+        codex.id = "codex-provider".into();
+        codex.render = Expression("providers.codex.enabled".into());
+        surface.children.extend([second, codex]);
+        let mut value = SceneObject::object("claude-value", "Claude value");
+        value.parent = Some("claude-provider".into());
+        value.x = Expression("ceil(10 / max(1, providers.count)) * 11 - 1 + 4".into());
+        value.width = Expression("62".into());
+        value.height = Expression("13".into());
+        value.y = Expression("5".into());
+        value.content = SceneContent::Text {
+            template: "{claude.session.display:usage_line}".into(),
+            font_family: "Segoe UI".into(),
+            font_size: Expression("12".into()),
+            weight: FontWeight::Regular,
+            rendering: FontRendering::Antialiased,
+            contrast: Expression("1.4".into()),
+            align: TextAlign::Left,
+            color: Paint::new("#FFFFFFFF"),
+        };
+        let mut label = SceneObject::object("claude-label", "Claude session label");
+        label.parent = Some("claude-provider".into());
+        label.x = Expression("13".into());
+        label.width = Expression("18".into());
+        label.height = Expression("13".into());
+        label.y = Expression("5".into());
+        label.content = SceneContent::Text {
+            template: "{i18n.session_window}".into(),
+            font_family: "Segoe UI".into(),
+            font_size: Expression("12".into()),
+            weight: FontWeight::Regular,
+            rendering: FontRendering::Antialiased,
+            contrast: Expression("1.4".into()),
+            align: TextAlign::Left,
+            color: Paint::new("#888888FF"),
+        };
+        let mut global_label = SceneObject::object("global-session-label", "Global session label");
+        global_label.x = Expression("13".into());
+        global_label.width = Expression("18".into());
+        global_label.height = Expression("13".into());
+        global_label.y = Expression("5".into());
+        global_label.content = SceneContent::Text {
+            template: "{i18n.session_window}".into(),
+            font_family: "Segoe UI".into(),
+            font_size: Expression("12".into()),
+            weight: FontWeight::Regular,
+            rendering: FontRendering::Antialiased,
+            contrast: Expression("1.4".into()),
+            align: TextAlign::Left,
+            color: Paint::new("#888888FF"),
+        };
+        surface.children.extend([value, label, global_label]);
+        theme
+    }
+
+    #[test]
+    fn four_pinned_accounts_use_compact_density_when_the_bar_is_narrow() {
+        let cards = visible_account_cards(&pinned_settings(&["a", "b", "c", "d"]), None);
+        let layout = layout_accounts(&cards, 560.0);
+        assert_eq!(layout.visible.len(), 4);
+        assert!(layout.overflow.is_empty());
+        // 4 * (3 * 11 - 1 + 4 + 62) + 3 gaps + 42 chrome = 443 <= 480.
+        assert_eq!(layout.segments, 3);
+        assert_eq!(layout.card_width, 98.0);
+        assert!(layout.is_compact());
+    }
+
+    #[test]
+    fn compact_density_is_independent_of_provider_count() {
+        let same_provider = visible_account_cards(&pinned_settings(&["a", "b", "c", "d"]), None);
+        let mut mixed_settings = pinned_settings(&["a", "b"]);
+        mixed_settings.codex = pinned_settings(&["c", "d"]).claude;
+        let mixed = visible_account_cards(&mixed_settings, None);
+        assert_eq!(same_provider.len(), 4);
+        assert_eq!(mixed.len(), 4);
+
+        let same_layout = layout_accounts(&same_provider, 560.0);
+        let mixed_layout = layout_accounts(&mixed, 560.0);
+        assert_eq!(same_layout.segments, mixed_layout.segments);
+        assert_eq!(same_layout.card_width, mixed_layout.card_width);
+        assert_eq!(same_layout.visible.len(), 4);
+        assert_eq!(mixed_layout.visible.len(), 4);
+    }
+
+    #[test]
+    fn five_and_six_pinned_accounts_get_supercompact_density() {
+        let five = layout_accounts(
+            &visible_account_cards(&pinned_settings(&["a", "b", "c", "d", "e"]), None),
+            560.0,
+        );
+        assert_eq!(five.visible.len(), 5);
+        assert_eq!(five.segments, 1);
+        assert_eq!(five.card_width, 76.0);
+        assert!(five.overflow.is_empty());
+
+        let six = layout_accounts(
+            &visible_account_cards(&pinned_settings(&["a", "b", "c", "d", "e", "f"]), None),
+            560.0,
+        );
+        assert_eq!(six.visible.len(), 6);
+        assert_eq!(six.segments, 2);
+        assert_eq!(six.card_width, 69.0);
+        assert!(six.percentage_only);
+        assert!(six.overflow.is_empty());
+    }
+
+    #[test]
+    fn overflow_only_starts_when_even_one_segment_cannot_fit() {
+        let cards = visible_account_cards(
+            &pinned_settings(&["a", "b", "c", "d", "e", "f", "g", "h"]),
+            None,
+        );
+        let layout = layout_accounts(&cards, 560.0);
+        assert_eq!(layout.visible.len(), 6);
+        assert_eq!(layout.overflow.len(), 2);
+        assert_eq!(layout.segments, 1);
+        assert!(layout.percentage_only);
+    }
+
+    #[test]
+    fn left_dock_compacts_four_cards_and_hides_labels_at_one_segment() {
+        let cards = visible_account_cards(&pinned_settings(&["a", "b", "c", "d"]), None);
+        let layout = layout_accounts(&cards, 560.0);
+        let expanded = expand_theme_for_accounts(&compact_left_dock_theme(), &layout);
+        let surface = &expanded.surfaces[0];
+        assert!(surface.width.0.contains("4 * 98"));
+        let roots: Vec<_> = surface
+            .children
+            .iter()
+            .filter(|child| child.parent.as_deref() == Some("provider-row"))
+            .collect();
+        assert_eq!(roots.len(), 4);
+        let progress: Vec<_> = surface
+            .children
+            .iter()
+            .filter_map(|child| match &child.content {
+                SceneContent::Progress {
+                    segments,
+                    segments_expression,
+                    ..
+                } => Some((*segments, segments_expression.is_none())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec![(3, true); 4]);
+        let value = surface
+            .children
+            .iter()
+            .find(|child| child.id.ends_with("--5") || child.name == "Claude value")
+            .or_else(|| {
+                surface
+                    .children
+                    .iter()
+                    .find(|child| matches!(&child.content, SceneContent::Text { template, .. } if template.contains("usage_line")))
+            })
+            .expect("value text spawned");
+        assert_eq!(value.x.0, "36");
+        assert_eq!(value.width.0, "62");
+
+        let seven = layout_accounts(
+            &visible_account_cards(
+                &pinned_settings(&["a", "b", "c", "d", "e", "f", "g"]),
+                None,
+            ),
+            560.0,
+        );
+        assert_eq!(seven.segments, 1);
+        assert!(seven.percentage_only);
+        let expanded = expand_theme_for_accounts(&compact_left_dock_theme(), &seven);
+        let surface = &expanded.surfaces[0];
+        let labels: Vec<_> = surface
+            .children
+            .iter()
+            .filter(|child| {
+                matches!(&child.content, SceneContent::Text { template, .. } if template.contains("i18n.session_window"))
+            })
+            .collect();
+        assert!(!labels.is_empty());
+        assert!(labels.iter().all(|label| label.render.0 == "0"));
+        let values: Vec<_> = surface
+            .children
+            .iter()
+            .filter(|child| {
+                matches!(&child.content, SceneContent::Text { template, .. } if template.contains("usage_line"))
+            })
+            .collect();
+        assert!(values.iter().all(|value| value.x.0 == "14"));
+        assert!(values
+            .iter()
+            .all(|value| matches!(&value.content, SceneContent::Text { template, .. } if template.contains(":usage_badge}"))));
+        assert!(values.iter().all(|value| value.width.0 == "44"));
+    }
+
     fn data_with_selection(pairs: &[(&str, bool)]) -> AppUsageData {
         use crate::models::AccountUsage;
         let mut data = AppUsageData::default();
@@ -1475,8 +1843,8 @@ mod tests {
         let settings = pinned_settings(&["a1", "a2", "a3", "a4"]);
         let cards = visible_account_cards(&settings, None);
         let layout = layout_accounts(&cards, 200.0);
-        assert_eq!(layout.visible.len(), 1);
-        assert_eq!(layout.overflow.len(), 3);
+        assert_eq!(layout.visible.len(), 2);
+        assert_eq!(layout.overflow.len(), 2);
     }
 
     #[test]
