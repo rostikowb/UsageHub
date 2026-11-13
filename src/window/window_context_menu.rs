@@ -400,7 +400,11 @@ pub(super) fn show_account_overflow_menu(hwnd: HWND) {
         let Some(state) = state.as_ref() else {
             return;
         };
-        let cards = crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref());
+        let cards = crate::manager::widget::visible_cards(
+            &state.accounts,
+            state.data.as_ref(),
+            state.providers,
+        );
         let budget = account_bar_budget(state);
         let layout = theme_engine::account_layout::layout_accounts(&cards, budget);
         if layout.overflow.is_empty() {
@@ -451,7 +455,13 @@ fn append_account_section(
 ) {
     let cards = lock_state()
         .as_ref()
-        .map(|state| crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref()));
+        .map(|state| {
+            crate::manager::widget::visible_cards(
+                &state.accounts,
+                state.data.as_ref(),
+                state.providers,
+            )
+        });
     let Some(cards) = cards else {
         return;
     };

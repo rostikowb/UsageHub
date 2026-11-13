@@ -44,10 +44,6 @@ pub const ACCOUNT_SEGMENT_STEP: f64 = 11.0;
 pub const ACCOUNT_CARD_PADDING: f64 = 4.0;
 /// Full-density segment count authored by the classic themes.
 pub const ACCOUNT_SEGMENTS_MAX: u16 = 10;
-/// Keep the account row left of the centered Windows app buttons. The taskbar
-/// collision pass still protects Start and pinned icons, but this reservation
-/// makes four compact cards fit without relying on an ejection.
-pub const ACCOUNT_SAFE_CARD_BUDGET: f64 = 480.0;
 /// Super-compact value column: percentage only, no reset countdown.
 pub const ACCOUNT_COMPACT_VALUE_WIDTH: f64 = 44.0;
 pub const ACCOUNT_COMPACT_FONT_SIZE: f64 = 10.0;
@@ -223,9 +219,7 @@ pub fn layout_accounts(cards: &[AccountCard], max_width: f64) -> AccountLayout {
     } else {
         ACCOUNT_MAX_WIDTH_FALLBACK
     };
-    // Stay left of the centered app buttons even when the taskbar budget is
-    // larger. The collision pass still protects Start/pinned icons.
-    let budget = max_width.min(ACCOUNT_SAFE_CARD_BUDGET);
+    let budget = max_width;
     if cards.is_empty() {
         return AccountLayout {
             visible: Vec::new(),
@@ -1423,10 +1417,21 @@ mod tests {
         let layout = layout_accounts(&cards, 560.0);
         assert_eq!(layout.visible.len(), 4);
         assert!(layout.overflow.is_empty());
-        // 4 * (3 * 11 - 1 + 4 + 62) + 3 gaps + 42 chrome = 443 <= 480.
-        assert_eq!(layout.segments, 3);
-        assert_eq!(layout.card_width, 98.0);
+        // 4 * (5 * 11 - 1 + 4 + 62) + 3 gaps + 42 chrome = 531 <= 560.
+        assert_eq!(layout.segments, 5);
+        assert_eq!(layout.card_width, 120.0);
         assert!(layout.is_compact());
+    }
+
+    #[test]
+    fn three_pinned_accounts_keep_nine_segments() {
+        let cards = visible_account_cards(&pinned_settings(&["a", "b", "c"]), None);
+        let layout = layout_accounts(&cards, 560.0);
+        assert_eq!(layout.visible.len(), 3);
+        assert_eq!(layout.segments, 9);
+        assert_eq!(layout.card_width, 164.0);
+        assert!(!layout.percentage_only);
+        assert!(layout.overflow.is_empty());
     }
 
     #[test]
@@ -1453,8 +1458,8 @@ mod tests {
             560.0,
         );
         assert_eq!(five.visible.len(), 5);
-        assert_eq!(five.segments, 1);
-        assert_eq!(five.card_width, 76.0);
+        assert_eq!(five.segments, 3);
+        assert_eq!(five.card_width, 98.0);
         assert!(five.overflow.is_empty());
 
         let six = layout_accounts(
@@ -1462,21 +1467,21 @@ mod tests {
             560.0,
         );
         assert_eq!(six.visible.len(), 6);
-        assert_eq!(six.segments, 2);
-        assert_eq!(six.card_width, 69.0);
-        assert!(six.percentage_only);
+        assert_eq!(six.segments, 1);
+        assert_eq!(six.card_width, 76.0);
+        assert!(!six.percentage_only);
         assert!(six.overflow.is_empty());
     }
 
     #[test]
     fn overflow_only_starts_when_even_one_segment_cannot_fit() {
         let cards = visible_account_cards(
-            &pinned_settings(&["a", "b", "c", "d", "e", "f", "g", "h"]),
+            &pinned_settings(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]),
             None,
         );
         let layout = layout_accounts(&cards, 560.0);
-        assert_eq!(layout.visible.len(), 6);
-        assert_eq!(layout.overflow.len(), 2);
+        assert_eq!(layout.visible.len(), 8);
+        assert_eq!(layout.overflow.len(), 1);
         assert_eq!(layout.segments, 1);
         assert!(layout.percentage_only);
     }
@@ -1487,7 +1492,7 @@ mod tests {
         let layout = layout_accounts(&cards, 560.0);
         let expanded = expand_theme_for_accounts(&compact_left_dock_theme(), &layout);
         let surface = &expanded.surfaces[0];
-        assert!(surface.width.0.contains("4 * 98"));
+        assert!(surface.width.0.contains("4 * 120"));
         let roots: Vec<_> = surface
             .children
             .iter()
@@ -1506,7 +1511,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(progress, vec![(3, true); 4]);
+        assert_eq!(progress, vec![(5, true); 4]);
         let value = surface
             .children
             .iter()
@@ -1518,7 +1523,7 @@ mod tests {
                     .find(|child| matches!(&child.content, SceneContent::Text { template, .. } if template.contains("usage_line")))
             })
             .expect("value text spawned");
-        assert_eq!(value.x.0, "36");
+        assert_eq!(value.x.0, "58");
         assert_eq!(value.width.0, "62");
 
         let seven = layout_accounts(
@@ -1528,7 +1533,7 @@ mod tests {
             ),
             560.0,
         );
-        assert_eq!(seven.segments, 1);
+        assert_eq!(seven.segments, 2);
         assert!(seven.percentage_only);
         let expanded = expand_theme_for_accounts(&compact_left_dock_theme(), &seven);
         let surface = &expanded.surfaces[0];
@@ -1548,7 +1553,7 @@ mod tests {
                 matches!(&child.content, SceneContent::Text { template, .. } if template.contains("usage_line"))
             })
             .collect();
-        assert!(values.iter().all(|value| value.x.0 == "14"));
+        assert!(values.iter().all(|value| value.x.0 == "25"));
         assert!(values
             .iter()
             .all(|value| matches!(&value.content, SceneContent::Text { template, .. } if template.contains(":usage_badge}"))));

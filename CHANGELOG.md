@@ -10,8 +10,12 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ### Added
 
-- Compact account cards whose density follows the number of pinned accounts, not the number of providers. Four pinned accounts fit on the bar with three segments per row and five use one; six and seven switch to a percentage-only value column with the 5h/7d captions hidden.
-- Super-compact tier for more than four pinned accounts: the reset countdown is dropped, the percentage keeps a 44 px column, and only cards that still cannot fit move behind the overflow chip. The row reserves space left of the centered app buttons instead of relying on a collision ejection.
+- Compact account cards whose density follows the number of pinned accounts, not the number of providers. Three pinned accounts keep nine segments per row; four fit with five, five with three, and six with one segment and hidden 5h/7d captions.
+- Super-compact tier from seven accounts: the reset countdown is dropped, the percentage keeps a 44 px column, and only cards beyond the eight-visible cap move behind the overflow chip.
+
+### Fixed
+
+- Pinned accounts of a provider that is hidden from the widget (for example **Claude Code** switched off) no longer occupy an account slot. Previously that invisible slot still counted toward card density, squeezing three visible Codex accounts into the four-account width and leaving blank space.
 
 ### Changed
 

@@ -898,7 +898,11 @@ fn theme_with_placement(state: &AppState, auto_ejected: bool) -> Option<ThemeDoc
     // on every layout. Non-aware custom themes pass through untouched; the
     // third pinned account appears without any manual theme JSON.
     let budget = account_bar_budget(state);
-    let cards = crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref());
+    let cards = crate::manager::widget::visible_cards(
+        &state.accounts,
+        state.data.as_ref(),
+        state.providers,
+    );
     let mut layout = theme_engine::account_layout::layout_accounts(&cards, budget);
     if theme_engine::account_layout::is_left_dock_classic(&theme) {
         // The shared estimate accounts for cards but not the other enabled
@@ -2540,8 +2544,8 @@ pub fn run() {
         // Seed selected accounts for a fresh namespace; the built-in Classic
         // remains the default and explicit theme selections are untouched.
         if configured_theme.is_none() && settings.active_theme_path.is_none() {
-            if crate::manager::widget::visible_cards(&settings.accounts, None).is_empty() {
-                let enabled = settings.enabled_providers();
+            let enabled = settings.enabled_providers();
+            if crate::manager::widget::visible_cards(&settings.accounts, None, enabled).is_empty() {
                 let mut seeded = Vec::new();
                 for provider in [ProviderId::Claude, ProviderId::Codex] {
                     if !enabled.contains(provider) {

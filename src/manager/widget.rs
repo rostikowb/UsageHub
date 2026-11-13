@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::accounts::AccountSettings;
 use crate::manager::ManagerResult;
-use crate::providers::ProviderId;
+use crate::providers::{ProviderId, ProviderSet};
 use crate::theme_engine::account_layout::{self, AccountCard};
 
 /// Enabled + pinned slots in display order, with busy badges overlaid and
@@ -32,8 +32,14 @@ use crate::theme_engine::account_layout::{self, AccountCard};
 pub fn visible_cards(
     settings: &AccountSettings,
     data: Option<&crate::models::AppUsageData>,
+    enabled: ProviderSet,
 ) -> Vec<AccountCard> {
     let mut cards = account_layout::visible_account_cards(settings, data);
+    // A pinned account for a provider that is hidden from the widget must not
+    // consume a card slot or squeeze the visible providers. The provider
+    // toggle (for example "Claude Code" off) owns the presentation; the
+    // pinned flag only decides which of its accounts show once it is on.
+    cards.retain(|card| enabled.contains(card.provider));
     account_layout::mark_busy_cards(&mut cards, |provider, id| account_busy(provider, id));
     cards
 }
@@ -199,4 +205,32 @@ pub fn provider_from_key(key: &str) -> Option<ProviderId> {
         .iter()
         .find(|descriptor| descriptor.key.eq_ignore_ascii_case(key.trim()))
         .map(|descriptor| descriptor.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts::{AccountProfile, AccountSettings};
+
+    fn profile(id: &str) -> AccountProfile {
+        AccountProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            pinned: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hidden_provider_cards_do_not_consume_slots() {
+        let mut settings = AccountSettings::default();
+        settings.claude.profiles = vec![profile("claude-hidden")];
+        settings.codex.profiles = vec![profile("codex-visible")];
+        let enabled = ProviderSet::from_enabled([ProviderId::Codex]);
+
+        let cards = visible_cards(&settings, None, enabled);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "codex-visible");
+    }
 }
