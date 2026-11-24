@@ -135,6 +135,10 @@ impl ProviderId {
             .find(|descriptor| descriptor.native_menu_command_id == command_id)
             .map(|descriptor| descriptor.id)
     }
+
+    pub const fn supports_account_profiles(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
 }
 
 impl Default for ProviderId {
@@ -253,6 +257,16 @@ mod tests {
             assert_eq!(
                 ProviderId::from_native_menu_command_id(descriptor.native_menu_command_id),
                 Some(descriptor.id)
+            );
+        }
+    }
+
+    #[test]
+    fn only_claude_and_codex_support_account_profiles() {
+        for provider in ProviderId::ALL {
+            assert_eq!(
+                provider.supports_account_profiles(),
+                matches!(provider, ProviderId::Claude | ProviderId::Codex)
             );
         }
     }

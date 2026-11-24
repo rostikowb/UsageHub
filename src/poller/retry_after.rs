@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::sync::{Mutex, OnceLock};
@@ -9,14 +9,23 @@ use ureq::middleware::MiddlewareNext;
 use ureq::SendBody;
 
 use super::HttpResponse;
+use crate::providers::ProviderId;
 
 // Bound the stored cooldown so a bad header cannot lock out an account.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 const MANUAL_RETRY_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_RATE_LIMIT_DELAY: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ActiveScope {
+    provider: ProviderId,
+    account_id: String,
+}
+
 thread_local! {
     static MANUAL_REFRESH: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_SCOPE: RefCell<Option<ActiveScope>> = const { RefCell::new(None) };
+    static LAST_HTTP_STATUS: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
 // Provider requests run synchronously on poll workers, so keep the manual
@@ -30,6 +39,45 @@ pub(super) fn with_manual_refresh<T>(manual: bool, poll: impl FnOnce() -> T) -> 
     }
     let _reset = Reset(MANUAL_REFRESH.replace(manual));
     poll()
+}
+
+/// Bind a poll worker thread to one provider/account scope so HTTP middleware
+/// can capture its last status code and associate any Retry-After cooldown
+/// without storing secrets.
+pub(super) fn with_poll_scope<T>(
+    provider: ProviderId,
+    account_id: Option<&str>,
+    poll: impl FnOnce() -> T,
+) -> (T, Option<u16>) {
+    struct Reset {
+        previous_scope: Option<ActiveScope>,
+        previous_status: Option<u16>,
+    }
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ACTIVE_SCOPE.with(|cell| {
+                *cell.borrow_mut() = self.previous_scope.take();
+            });
+            LAST_HTTP_STATUS.set(self.previous_status);
+        }
+    }
+    let scope = ActiveScope {
+        provider,
+        account_id: account_id.unwrap_or("").to_string(),
+    };
+    let previous_scope = ACTIVE_SCOPE.with(|cell| cell.borrow_mut().replace(scope));
+    let previous_status = LAST_HTTP_STATUS.replace(None);
+    let _reset = Reset {
+        previous_scope,
+        previous_status,
+    };
+    let result = poll();
+    let status = LAST_HTTP_STATUS.get();
+    (result, status)
+}
+
+fn current_scope() -> Option<ActiveScope> {
+    ACTIVE_SCOPE.with(|cell| cell.borrow().clone())
 }
 
 /// Header probes need fresh responses even while the account is rate limited.
@@ -55,6 +103,7 @@ impl Cooldown {
 #[derive(Default)]
 struct RetryAfter {
     cooldowns: Mutex<HashMap<u64, Cooldown>>,
+    scope_keys: Mutex<HashMap<ActiveScope, u64>>,
 }
 
 fn shared() -> &'static RetryAfter {
@@ -107,16 +156,24 @@ impl RetryAfter {
             return response;
         }
         let key = request_key(&request);
+        let scope = current_scope();
         let manual_probe = {
             let now = Instant::now();
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             cooldowns.retain(|_, cooldown| !cooldown.remaining(now).is_zero());
             if let Some(cooldown) = cooldowns.get_mut(&key) {
                 cooldown.last_used = now;
+                if let Some(scope) = scope.clone() {
+                    self.scope_keys
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(scope, key);
+                }
                 if !MANUAL_REFRESH.get()
                     || now.duration_since(cooldown.last_probe.unwrap_or(cooldown.received))
                         <= MANUAL_RETRY_AFTER
                 {
+                    LAST_HTTP_STATUS.set(Some(cooldown.status));
                     crate::diagnose::log(format!(
                         "http {target}: not sent, cooldown {}s left",
                         cooldown.remaining(now).as_secs()
@@ -136,6 +193,7 @@ impl RetryAfter {
         log_http(&target, "", &response);
         let response = response?;
         let status = response.status();
+        LAST_HTTP_STATUS.set(Some(status.as_u16()));
         // A probe tests recovery from an existing cooldown; a failed probe
         // must keep its original deadline, even with a new Retry-After header.
         if !manual_probe && (status.as_u16() == 429 || status.is_server_error()) {
@@ -168,14 +226,55 @@ impl RetryAfter {
                         status: status.as_u16(),
                     };
                 }
+                if let Some(scope) = scope {
+                    self.scope_keys
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(scope, key);
+                }
             }
         } else if status.is_success() {
             self.cooldowns
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
+            let mut scope_keys = self.scope_keys.lock().unwrap_or_else(|e| e.into_inner());
+            scope_keys.retain(|entry_scope, entry_key| {
+                *entry_key != key && scope.as_ref() != Some(entry_scope)
+            });
         }
         Ok(response)
+    }
+
+    fn cooldown_remaining(
+        &self,
+        provider: ProviderId,
+        account_id: Option<&str>,
+        now: Instant,
+    ) -> Option<Duration> {
+        let scope = ActiveScope {
+            provider,
+            account_id: account_id.unwrap_or("").to_string(),
+        };
+        let key = self
+            .scope_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&scope)
+            .copied()?;
+        let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let remaining = cooldowns
+            .get(&key)
+            .map(|cooldown| cooldown.remaining(now))
+            .filter(|remaining| !remaining.is_zero());
+        if remaining.is_none() {
+            cooldowns.remove(&key);
+            self.scope_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&scope);
+        }
+        remaining
     }
 
     fn retry_delay_ms(&self, fallback_ms: u32, poll_started: Instant, now: Instant) -> u32 {
@@ -203,6 +302,10 @@ pub(super) fn middleware(
 
 pub fn retry_delay_ms(fallback_ms: u32, poll_started: Instant) -> u32 {
     shared().retry_delay_ms(fallback_ms, poll_started, Instant::now())
+}
+
+pub fn cooldown_remaining(provider: ProviderId, account_id: Option<&str>) -> Option<Duration> {
+    shared().cooldown_remaining(provider, account_id, Instant::now())
 }
 
 fn log_http(target: &str, note: &str, response: &Result<HttpResponse, ureq::Error>) {
@@ -693,7 +796,7 @@ mod tests {
                 .get(format!("http://{address}/usage"))
                 .config()
                 .proxy(None)
-                .timeout_global(Some(Duration::from_secs(5)))
+                .timeout_global(Some(Duration::from_secs(10)))
                 .build()
                 .call()
         };
@@ -708,5 +811,50 @@ mod tests {
         assert!(matches!(status, Err(ureq::Error::StatusCode(429))));
         // The listener is closed: an actual retry would fail to connect.
         assert!(matches!(fetch(), Err(ureq::Error::StatusCode(429))));
+    }
+
+    #[test]
+    fn poll_scope_tracks_last_http_status_and_cooldown_remaining_per_account() {
+        let state = RetryAfter::default();
+        let (res, status) = with_poll_scope(ProviderId::Claude, Some("personal"), || {
+            state.handle(request("personal"), |_| Ok(response(429, Some("120"))))
+        });
+        assert!(res.is_ok());
+        assert_eq!(status, Some(429));
+        let remaining = state
+            .cooldown_remaining(ProviderId::Claude, Some("personal"), Instant::now())
+            .expect("cooldown should be active for personal");
+        assert!(remaining > Duration::from_secs(110));
+        assert!(state
+            .cooldown_remaining(ProviderId::Claude, Some("work"), Instant::now())
+            .is_none());
+
+        // Blocked automatic poll still surfaces the cooldown status code.
+        let (blocked, blocked_status) =
+            with_poll_scope(ProviderId::Claude, Some("personal"), || {
+                state.handle(request("personal"), |_| panic!("sent during cooldown"))
+            });
+        assert!(matches!(blocked, Err(ureq::Error::StatusCode(429))));
+        assert_eq!(blocked_status, Some(429));
+
+        // Successful manual probe clears the cooldown and remaining duration.
+        let key = request_key(&request("personal"));
+        state
+            .cooldowns
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .received = Instant::now() - Duration::from_secs(61);
+        let (ok, ok_status) = with_manual_refresh(true, || {
+            with_poll_scope(ProviderId::Claude, Some("personal"), || {
+                state.handle(request("personal"), |_| Ok(response(200, None)))
+            })
+        });
+        assert!(ok.is_ok());
+        assert_eq!(ok_status, Some(200));
+        assert!(state
+            .cooldown_remaining(ProviderId::Claude, Some("personal"), Instant::now())
+            .is_none());
     }
 }

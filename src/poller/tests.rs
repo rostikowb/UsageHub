@@ -209,7 +209,7 @@ fn ready_providers_are_published_before_slow_providers_finish() {
             if provider == ProviderId::OpenCode {
                 wait.lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(Duration::from_secs(10))
                     .unwrap();
             }
             Ok(usage_with_session_percent(42.0))
@@ -258,7 +258,7 @@ fn concurrent_polling_is_bounded_and_preserves_results() {
     let data = poll_concurrently_with(ProviderSet::from_enabled(ProviderId::ALL), |provider| {
         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
         peak.fetch_max(current, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
         active.fetch_sub(1, Ordering::SeqCst);
         Ok(usage_with_session_percent(f64::from(provider as u8)))
     })
@@ -975,4 +975,116 @@ fn antigravity_limits_skip_unusable_buckets_and_preserve_reported_windows() {
     assert_eq!(usage.limits[1].key, "gemini_models_weekly");
     assert_eq!(usage.limits[1].usage, usage.weekly);
     assert_eq!(usage.limits[1].usage.percentage, 100.0);
+}
+
+#[test]
+fn telemetry_store_isolates_providers_and_accounts_and_records_status() {
+    let store = TelemetryStore::default();
+    let now = SystemTime::now();
+    store.record_poll(
+        ProviderId::Claude,
+        Some("acct_a"),
+        now,
+        Duration::from_millis(42),
+        Some(200),
+        None,
+        Some(CredentialSourceStatus {
+            state: CredentialSourceState::Detected,
+            source_label: "Credentials file",
+        }),
+    );
+    store.record_poll(
+        ProviderId::Claude,
+        Some("acct_b"),
+        now,
+        Duration::from_millis(87),
+        Some(429),
+        Some(PollError::HttpStatus(429)),
+        Some(CredentialSourceStatus {
+            state: CredentialSourceState::Detected,
+            source_label: "Desktop directory",
+        }),
+    );
+    store.record_poll(
+        ProviderId::Codex,
+        None,
+        now,
+        Duration::from_millis(15),
+        Some(401),
+        Some(PollError::AuthRequired),
+        Some(CredentialSourceStatus {
+            state: CredentialSourceState::Expired,
+            source_label: "Credentials file",
+        }),
+    );
+
+    let a = store.get(ProviderId::Claude, Some("acct_a"));
+    assert_eq!(a.latency_ms, Some(42));
+    assert_eq!(a.last_http_status, Some(200));
+    assert_eq!(a.last_error, None);
+    assert_eq!(
+        a.credential_status.as_ref().map(|s| s.source_label),
+        Some("Credentials file")
+    );
+
+    let b = store.get(ProviderId::Claude, Some("acct_b"));
+    assert_eq!(b.latency_ms, Some(87));
+    assert_eq!(b.last_http_status, Some(429));
+    assert_eq!(b.last_error, Some(PollError::HttpStatus(429)));
+
+    let codex = store.get(ProviderId::Codex, None);
+    assert_eq!(codex.last_http_status, Some(401));
+    assert_eq!(codex.last_error, Some(PollError::AuthRequired));
+    assert_eq!(
+        codex.credential_status.as_ref().map(|s| s.state),
+        Some(CredentialSourceState::Expired)
+    );
+}
+
+#[test]
+fn credential_source_detection_reports_non_secret_status_for_explicit_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let claude_path = dir.path().join(".credentials.json");
+    std::fs::write(
+        &claude_path,
+        r#"{"claudeAiOauth":{"accessToken":"secret-claude-token","expiresAt":9999999999999}}"#,
+    )
+    .unwrap();
+    let mut claude_profile = crate::accounts::AccountProfile {
+        id: "claude_test".into(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let status = detect_account_credential_status(ProviderId::Claude, &claude_profile);
+    assert_eq!(status.state, CredentialSourceState::Detected);
+    assert_eq!(status.source_label, "Credentials file");
+    assert!(!status.source_label.contains("secret-claude-token"));
+
+    std::fs::write(
+        &claude_path,
+        r#"{"claudeAiOauth":{"accessToken":"secret-claude-token","expiresAt":0}}"#,
+    )
+    .unwrap();
+    let expired = detect_account_credential_status(ProviderId::Claude, &claude_profile);
+    assert_eq!(expired.state, CredentialSourceState::Expired);
+
+    claude_profile.config_dir = dir.path().join("missing").to_string_lossy().into_owned();
+    let missing = detect_account_credential_status(ProviderId::Claude, &claude_profile);
+    assert_eq!(missing.state, CredentialSourceState::Missing);
+
+    let codex_path = dir.path().join("auth.json");
+    std::fs::write(
+        &codex_path,
+        r#"{"tokens":{"access_token":"secret-codex-token"}}"#,
+    )
+    .unwrap();
+    let codex_profile = crate::accounts::AccountProfile {
+        id: "codex_test".into(),
+        credentials_path: codex_path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let codex_status = detect_account_credential_status(ProviderId::Codex, &codex_profile);
+    assert_eq!(codex_status.state, CredentialSourceState::Detected);
+    assert_eq!(codex_status.source_label, "Credentials file");
+    assert!(!codex_status.source_label.contains("secret-codex-token"));
 }

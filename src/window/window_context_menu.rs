@@ -45,6 +45,18 @@ pub(super) fn show_context_menu_document(
                 return;
             }
         };
+        let available_update_version =
+            lock_state()
+                .as_ref()
+                .and_then(|state| match &state.update_status {
+                    UpdateStatus::Available(update) => Some(update.version().to_string()),
+                    _ => None,
+                });
+        if let Some(version) = available_update_version.as_deref() {
+            if !has_top_level_update_action(&document.items) {
+                append_update_banner_item(menu, language, version, origin.as_ref(), &mut actions);
+            }
+        }
         append_context_menu_items(
             menu,
             &document.items,
@@ -146,20 +158,27 @@ unsafe fn append_context_menu_items(
                     &item.label,
                     context,
                 ));
-                let _ = AppendMenuW(
+                if AppendMenuW(
                     menu,
                     MF_POPUP,
                     submenu.0 as usize,
                     PCWSTR::from_raw(label.as_ptr()),
-                );
+                )
+                .is_err()
+                {
+                    let _ = DestroyMenu(submenu);
+                }
             }
             ContextMenuItemKind::Action { action } => {
                 let id = 1_000 + actions.len();
-                let label = native_interop::wide_str(&context_menu::rendered_label(
-                    language,
-                    &item.label,
-                    context,
-                ));
+                let rendered = if matches!(action, ContextMenuAction::CheckForUpdates) {
+                    dynamic_update_action_label(language).unwrap_or_else(|| {
+                        context_menu::rendered_label(language, &item.label, context)
+                    })
+                } else {
+                    context_menu::rendered_label(language, &item.label, context)
+                };
+                let label = native_interop::wide_str(&rendered);
                 let flags = context_menu_action_flags(action, origin);
                 let _ = AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr()));
                 actions.push(action.clone());
@@ -417,6 +436,7 @@ pub(super) fn show_account_overflow_menu(hwnd: HWND) {
         return;
     }
     let mut actions = Vec::new();
+    let owner = controller_for(hwnd);
     unsafe {
         let Ok(menu) = CreatePopupMenu() else {
             return;
@@ -424,23 +444,75 @@ pub(super) fn show_account_overflow_menu(hwnd: HWND) {
         append_account_items(menu, &cards, language, &data_context, &mut actions);
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = SetForegroundWindow(owner);
         let selected = TrackPopupMenu(
             menu,
             TPM_RIGHTBUTTON | TPM_RETURNCMD,
             point.x,
             point.y,
             None,
-            hwnd,
+            owner,
             None,
         )
         .0 as usize;
         let _ = DestroyMenu(menu);
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
         if selected >= 1_000 {
             if let Some(action) = actions.get(selected - 1_000).cloned() {
                 execute_context_menu_action(hwnd, action, None);
             }
         }
+    }
+}
+
+fn has_top_level_update_action(items: &[ContextMenuItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item.kind,
+            ContextMenuItemKind::Action {
+                action: ContextMenuAction::CheckForUpdates
+            }
+        )
+    })
+}
+
+fn dynamic_update_action_label(language: LanguageId) -> Option<String> {
+    let state = lock_state();
+    let state = state.as_ref()?;
+    match &state.update_status {
+        UpdateStatus::Available(update) => Some(context_menu::update_action_label(
+            language,
+            Some(update.version()),
+            false,
+            false,
+        )),
+        UpdateStatus::Checking => Some(context_menu::update_action_label(
+            language, None, true, false,
+        )),
+        UpdateStatus::Applying => Some(context_menu::update_action_label(
+            language, None, false, true,
+        )),
+        UpdateStatus::Idle | UpdateStatus::UpToDate => None,
+    }
+}
+
+unsafe fn append_update_banner_item(
+    menu: HMENU,
+    language: LanguageId,
+    available_version: &str,
+    origin: Option<&(usize, String)>,
+    actions: &mut Vec<ContextMenuAction>,
+) {
+    let action = ContextMenuAction::CheckForUpdates;
+    let id = 1_000 + actions.len();
+    let label = native_interop::wide_str(&context_menu::update_banner_label(
+        language,
+        available_version,
+    ));
+    let flags = context_menu_action_flags(&action, origin);
+    if AppendMenuW(menu, flags, id, PCWSTR::from_raw(label.as_ptr())).is_ok() {
+        actions.push(action);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
 }
 
@@ -453,15 +525,9 @@ fn append_account_section(
     context: &DataContext,
     actions: &mut Vec<ContextMenuAction>,
 ) {
-    let cards = lock_state()
-        .as_ref()
-        .map(|state| {
-            crate::manager::widget::visible_cards(
-                &state.accounts,
-                state.data.as_ref(),
-                state.providers,
-            )
-        });
+    let cards = lock_state().as_ref().map(|state| {
+        crate::manager::widget::visible_cards(&state.accounts, state.data.as_ref(), state.providers)
+    });
     let Some(cards) = cards else {
         return;
     };
@@ -475,12 +541,16 @@ fn append_account_section(
         };
         append_account_items(submenu, &cards, language, context, actions);
         let label = native_interop::wide_str(&language.text("Accounts"));
-        let _ = AppendMenuW(
+        if AppendMenuW(
             menu,
             MF_POPUP,
             submenu.0 as usize,
             PCWSTR::from_raw(label.as_ptr()),
-        );
+        )
+        .is_err()
+        {
+            let _ = DestroyMenu(submenu);
+        }
     }
 }
 
@@ -607,6 +677,35 @@ mod tests {
                     assert_eq!(actions, vec![ContextMenuAction::Exit]);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn update_banner_prepends_update_action_only_when_not_already_top_level() {
+        let classic = context_menu::classic_context_menu();
+        assert!(!has_top_level_update_action(&classic.items));
+
+        let mut custom = context_menu::ContextMenuDocument::blank("Custom");
+        custom.items.insert(
+            0,
+            ContextMenuItem::action(
+                "top-update",
+                "Check for updates",
+                ContextMenuAction::CheckForUpdates,
+            ),
+        );
+        assert!(has_top_level_update_action(&custom.items));
+
+        let mut actions = Vec::new();
+        unsafe {
+            let menu = CreatePopupMenu().unwrap();
+            append_update_banner_item(menu, LanguageId::English, "2.24.0", None, &mut actions);
+            let count = GetMenuItemCount(Some(menu));
+            let first_id = GetMenuItemID(menu, 0);
+            DestroyMenu(menu).unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(first_id, 1000);
+            assert_eq!(actions, vec![ContextMenuAction::CheckForUpdates]);
         }
     }
 }

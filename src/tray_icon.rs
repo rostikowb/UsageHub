@@ -189,6 +189,39 @@ fn remove_registered_theme_icons(hwnd: HWND) {
     }
 }
 
+fn current_language() -> crate::localization::LanguageId {
+    let settings = crate::app_settings::load_settings();
+    crate::localization::resolve_language(
+        settings
+            .language
+            .as_deref()
+            .and_then(crate::localization::LanguageId::from_code),
+    )
+}
+
+fn tooltip_with_update_status(
+    tooltip: &str,
+    status: &crate::dashboard::UpdateStatus,
+    language: crate::localization::LanguageId,
+) -> String {
+    let crate::dashboard::UpdateStatus::Available(version) = status else {
+        return tooltip.to_string();
+    };
+    let clean = version.trim().trim_start_matches('v');
+    if clean.is_empty() {
+        return tooltip.to_string();
+    }
+    let banner = format!("{}: v{clean}", language.strings().update_available);
+    let trimmed = tooltip.trim();
+    if trimmed.is_empty() {
+        banner
+    } else if trimmed.contains(clean) {
+        tooltip.to_string()
+    } else {
+        format!("{banner}\n{trimmed}")
+    }
+}
+
 /// Register or refresh the single persistent application tray icon.
 pub fn sync(hwnd: HWND, tooltip: &str) {
     remove_registered_theme_icons(hwnd);
@@ -196,6 +229,8 @@ pub fn sync(hwnd: HWND, tooltip: &str) {
     if hicon.is_invalid() {
         return;
     }
+    let update_status = crate::dashboard::read_update_status(hwnd.0 as isize);
+    let effective_tooltip = tooltip_with_update_status(tooltip, &update_status, current_language());
 
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
@@ -205,7 +240,7 @@ pub fn sync(hwnd: HWND, tooltip: &str) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = hicon;
-        copy_to_tip(tooltip, &mut nid.szTip);
+        copy_to_tip(&effective_tooltip, &mut nid.szTip);
 
         // NIM_ADD succeeds on first registration. If the icon is already
         // present, NIM_MODIFY refreshes its image, callback and tooltip.
@@ -220,6 +255,8 @@ pub fn sync(hwnd: HWND, tooltip: &str) {
 /// shell owns their order and overflow placement just like every other app icon.
 pub fn sync_themed(hwnd: HWND, icons: &[ThemedTrayIcon]) {
     remove_id(hwnd, APP_TRAY_ICON_ID);
+    let update_status = crate::dashboard::read_update_status(hwnd.0 as isize);
+    let language = current_language();
     let mut refreshed_ids = Vec::with_capacity(icons.len());
     for icon in icons {
         let hicon = create_themed_icon(icon);
@@ -227,6 +264,7 @@ pub fn sync_themed(hwnd: HWND, icons: &[ThemedTrayIcon]) {
             continue;
         }
         let id = themed_icon_id(icon.surface_index);
+        let effective_tooltip = tooltip_with_update_status(&icon.tooltip, &update_status, language);
         unsafe {
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -235,7 +273,7 @@ pub fn sync_themed(hwnd: HWND, icons: &[ThemedTrayIcon]) {
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_APP_TRAY;
             nid.hIcon = hicon;
-            copy_to_tip(&icon.tooltip, &mut nid.szTip);
+            copy_to_tip(&effective_tooltip, &mut nid.szTip);
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
             }
@@ -336,5 +374,37 @@ mod tests {
     fn theme_icon_ids_do_not_overlap_the_application_icon() {
         assert_ne!(themed_icon_id(0), APP_TRAY_ICON_ID);
         assert_ne!(themed_icon_id(42), themed_icon_id(43));
+    }
+
+    #[test]
+    fn tray_tooltip_surfaces_available_update_version() {
+        use crate::dashboard::UpdateStatus;
+        use crate::localization::LanguageId;
+
+        let base = "Claude Code 5h: 10% | 7d: 25%";
+        assert_eq!(
+            tooltip_with_update_status(base, &UpdateStatus::Idle, LanguageId::English),
+            base
+        );
+        assert_eq!(
+            tooltip_with_update_status(base, &UpdateStatus::Checking, LanguageId::English),
+            base
+        );
+        assert_eq!(
+            tooltip_with_update_status(
+                base,
+                &UpdateStatus::Available("2.24.0".into()),
+                LanguageId::English
+            ),
+            "Update available: v2.24.0\nClaude Code 5h: 10% | 7d: 25%"
+        );
+        assert_eq!(
+            tooltip_with_update_status(
+                "",
+                &UpdateStatus::Available("v2.24.0".into()),
+                LanguageId::English
+            ),
+            "Update available: v2.24.0"
+        );
     }
 }
