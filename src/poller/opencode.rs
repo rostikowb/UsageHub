@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{build_agent, parse_iso8601, PollError};
 use crate::diagnose;
@@ -258,19 +258,19 @@ pub(crate) fn encrypt_auth_cookie(cookie: &str) -> Result<String, String> {
 /// Decode and DPAPI-unprotect an `authCookieEncrypted` value.
 pub(crate) fn decrypt_auth_cookie(encoded: &str) -> Result<String, String> {
     let blob = base64_decode(encoded.trim())?;
-    let mut plaintext = dpapi_unprotect(&blob)?;
-    let result = String::from_utf8(plaintext.clone())
-        .map_err(|_| "Decrypted OpenCode auth cookie is not valid UTF-8".to_string())
-        .and_then(|value| {
-            let trimmed = value.trim().to_string();
-            if valid_cookie(&trimmed) {
-                Ok(trimmed)
-            } else {
-                Err("Decrypted OpenCode auth cookie is invalid".to_string())
-            }
-        });
-    plaintext.zeroize();
-    result
+    let mut plaintext = Zeroizing::new(dpapi_unprotect(&blob)?);
+    let raw = String::from_utf8(std::mem::take(&mut *plaintext)).map_err(|err| {
+        let mut bytes = err.into_bytes();
+        bytes.zeroize();
+        "Decrypted OpenCode auth cookie is not valid UTF-8".to_string()
+    })?;
+    let raw = Zeroizing::new(raw);
+    let trimmed = raw.trim().to_string();
+    if valid_cookie(&trimmed) {
+        Ok(trimmed)
+    } else {
+        Err("Decrypted OpenCode auth cookie is invalid".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,8 +374,9 @@ fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
         return Err("Unable to unprotect OpenCode cookie with DPAPI".to_string());
     }
     Ok(unsafe {
-        let plaintext =
-            std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        let out_slice = std::slice::from_raw_parts_mut(output.pb_data, output.cb_data as usize);
+        let plaintext = out_slice.to_vec();
+        out_slice.zeroize();
         LocalFree(output.pb_data as *mut std::ffi::c_void);
         plaintext
     })

@@ -134,10 +134,6 @@ pub fn rotated_log_path(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-pub fn prev_log_path() -> PathBuf {
-    rotated_log_path(&log_path())
-}
-
 pub fn log_status() -> LogFileStatus {
     let path = log_path();
     let prev = rotated_log_path(&path);
@@ -150,17 +146,14 @@ pub fn log_status() -> LogFileStatus {
 
 fn rotate_log_file(path: &Path) -> std::io::Result<()> {
     let prev = rotated_log_path(path);
-    if let Err(first_err) = std::fs::rename(path, &prev) {
-        let _ = std::fs::remove_file(&prev);
-        if let Err(retry_err) = std::fs::rename(path, &prev) {
-            return Err(if retry_err.kind() == std::io::ErrorKind::NotFound {
-                first_err
-            } else {
-                retry_err
-            });
+    match std::fs::rename(path, &prev) {
+        Ok(()) => Ok(()),
+        Err(first_err) if first_err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&prev)?;
+            std::fs::rename(path, &prev)
         }
+        Err(first_err) => Err(first_err),
     }
-    Ok(())
 }
 
 /// Record panics even when diagnostic recording is disabled.
@@ -825,10 +818,8 @@ fn try_redact_email(input: &str, i: usize) -> Option<(usize, String)> {
     }
     pos += 1;
 
-    let domain_start = pos;
     let mut label_count = 0usize;
-    let mut last_label_start = domain_start;
-    let mut last_label_len = 0usize;
+    let mut last_label: Option<(usize, usize)> = None;
     loop {
         let label_start = pos;
         while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-') {
@@ -839,8 +830,7 @@ fn try_redact_email(input: &str, i: usize) -> Option<(usize, String)> {
             return None;
         }
         label_count += 1;
-        last_label_start = label_start;
-        last_label_len = label_len;
+        last_label = Some((label_start, label_len));
         if bytes.get(pos) == Some(&b'.') {
             pos += 1;
             continue;
@@ -848,6 +838,7 @@ fn try_redact_email(input: &str, i: usize) -> Option<(usize, String)> {
         break;
     }
 
+    let (last_label_start, last_label_len) = last_label?;
     if label_count < 2
         || !(2..=24).contains(&last_label_len)
         || !bytes[last_label_start..last_label_start + last_label_len]
