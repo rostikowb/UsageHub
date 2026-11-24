@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use zeroize::Zeroize;
 
 use super::{build_agent, parse_iso8601, PollError};
 use crate::diagnose;
+use crate::manager::credentials::{base64_decode, base64_encode};
 use crate::models::{UsageData, UsageSection};
 
 const GO_STATUS_URL: &str = "https://opencode.ai/console/api/go/status";
@@ -14,14 +16,17 @@ const DASHBOARD_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Ap
      (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const WORKSPACE_ID_ENV: &str = "OPENCODE_GO_WORKSPACE_ID";
 const AUTH_COOKIE_ENV: &str = "OPENCODE_GO_AUTH_COOKIE";
+const AUTH_COOKIE_ENCRYPTED_ENV: &str = "OPENCODE_GO_AUTH_COOKIE_ENCRYPTED";
 const CONFIG_FILE_ENV: &str = "OPENCODE_GO_CONFIG_FILE";
 
 #[derive(Deserialize)]
 struct DashboardConfig {
     #[serde(alias = "workspaceId", alias = "workspaceID")]
     workspace_id: String,
-    #[serde(alias = "authCookie", alias = "cookie")]
-    auth_cookie: String,
+    #[serde(default, alias = "authCookie", alias = "cookie")]
+    auth_cookie: Option<String>,
+    #[serde(default, alias = "authCookieEncrypted", alias = "encryptedCookie")]
+    auth_cookie_encrypted: Option<String>,
 }
 
 struct DashboardCredentials {
@@ -150,17 +155,12 @@ fn section_from_window(window: &UsageWindow) -> UsageSection {
 }
 
 fn read_dashboard_credentials() -> Option<DashboardCredentials> {
-    if let (Some(workspace_id), Some(auth_cookie)) = (
+    if let Some(credentials) = read_env_credentials(
         non_empty_environment(WORKSPACE_ID_ENV),
         non_empty_environment(AUTH_COOKIE_ENV),
+        non_empty_environment(AUTH_COOKIE_ENCRYPTED_ENV),
     ) {
-        if valid_workspace_id(&workspace_id) && valid_cookie(&auth_cookie) {
-            return Some(DashboardCredentials {
-                workspace_id,
-                auth_cookie,
-                source: "environment".to_string(),
-            });
-        }
+        return Some(credentials);
     }
 
     dashboard_config_paths()
@@ -168,19 +168,227 @@ fn read_dashboard_credentials() -> Option<DashboardCredentials> {
         .find_map(|path| read_dashboard_config(&path))
 }
 
+fn read_env_credentials(
+    workspace_id: Option<String>,
+    plain_cookie: Option<String>,
+    encrypted_cookie: Option<String>,
+) -> Option<DashboardCredentials> {
+    let workspace_id = workspace_id?;
+    if !valid_workspace_id(&workspace_id) {
+        return None;
+    }
+    if let Some(auth_cookie) = plain_cookie.filter(|value| valid_cookie(value)) {
+        return Some(DashboardCredentials {
+            workspace_id,
+            auth_cookie,
+            source: "environment".to_string(),
+        });
+    }
+    if let Some(encoded) = encrypted_cookie {
+        match decrypt_auth_cookie(&encoded) {
+            Ok(auth_cookie) => {
+                return Some(DashboardCredentials {
+                    workspace_id,
+                    auth_cookie,
+                    source: "environment (encrypted)".to_string(),
+                });
+            }
+            Err(error) => {
+                diagnose::log(format!(
+                    "OpenCode encrypted environment cookie could not be decrypted: {error}"
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn read_dashboard_config(path: &Path) -> Option<DashboardCredentials> {
     let content = std::fs::read_to_string(path).ok()?;
     let config: DashboardConfig = serde_json::from_str(&content).ok()?;
     let workspace_id = config.workspace_id.trim().to_string();
-    let auth_cookie = config.auth_cookie.trim().to_string();
-    if !valid_workspace_id(&workspace_id) || !valid_cookie(&auth_cookie) {
+    if !valid_workspace_id(&workspace_id) {
         return None;
     }
+
+    let encrypted = config
+        .auth_cookie_encrypted
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let auth_cookie = if let Some(encoded) = encrypted {
+        match decrypt_auth_cookie(encoded) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                diagnose::log(format!(
+                    "OpenCode encrypted auth cookie in {} could not be decrypted: {error}",
+                    path.display()
+                ));
+                return None;
+            }
+        }
+    } else {
+        let cookie = config.auth_cookie?.trim().to_string();
+        if !valid_cookie(&cookie) {
+            return None;
+        }
+        cookie
+    };
+
     Some(DashboardCredentials {
         workspace_id,
         auth_cookie,
         source: path.display().to_string(),
     })
+}
+
+/// Protect an OpenCode dashboard cookie with Windows DPAPI (CurrentUser scope)
+/// and encode it as standard base64 for storage in `authCookieEncrypted`.
+#[allow(dead_code)]
+pub(crate) fn encrypt_auth_cookie(cookie: &str) -> Result<String, String> {
+    let trimmed = cookie.trim();
+    if !valid_cookie(trimmed) {
+        return Err("Invalid OpenCode auth cookie".to_string());
+    }
+    let protected = dpapi_protect(trimmed.as_bytes())?;
+    Ok(base64_encode(&protected))
+}
+
+/// Decode and DPAPI-unprotect an `authCookieEncrypted` value.
+pub(crate) fn decrypt_auth_cookie(encoded: &str) -> Result<String, String> {
+    let blob = base64_decode(encoded.trim())?;
+    let mut plaintext = dpapi_unprotect(&blob)?;
+    let result = String::from_utf8(plaintext.clone())
+        .map_err(|_| "Decrypted OpenCode auth cookie is not valid UTF-8".to_string())
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if valid_cookie(&trimmed) {
+                Ok(trimmed)
+            } else {
+                Err("Decrypted OpenCode auth cookie is invalid".to_string())
+            }
+        });
+    plaintext.zeroize();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// DPAPI protection (CurrentUser scope, UI forbidden) — mirrors manager::backup.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[repr(C)]
+struct CryptBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
+}
+
+#[cfg(windows)]
+#[link(name = "crypt32")]
+extern "system" {
+    fn CryptProtectData(
+        data_in: *const CryptBlob,
+        data_descr: *const u16,
+        optional_entropy: *const CryptBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt_struct: *mut std::ffi::c_void,
+        flags: u32,
+        data_out: *mut CryptBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        data_in: *const CryptBlob,
+        data_descr: *mut *mut u16,
+        optional_entropy: *const CryptBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt_struct: *mut std::ffi::c_void,
+        flags: u32,
+        data_out: *mut CryptBlob,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(windows)]
+const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+#[cfg(windows)]
+fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let input = CryptBlob {
+        cb_data: u32::try_from(plaintext.len())
+            .map_err(|_| "OpenCode cookie too large for DPAPI".to_string())?,
+        pb_data: plaintext.as_ptr() as *mut u8,
+    };
+    let mut output = CryptBlob {
+        cb_data: 0,
+        pb_data: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 || output.pb_data.is_null() {
+        return Err("Unable to protect OpenCode cookie with DPAPI".to_string());
+    }
+    Ok(unsafe {
+        let protected =
+            std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        LocalFree(output.pb_data as *mut std::ffi::c_void);
+        protected
+    })
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
+    let input = CryptBlob {
+        cb_data: u32::try_from(blob.len())
+            .map_err(|_| "OpenCode cookie blob too large for DPAPI".to_string())?,
+        pb_data: blob.as_ptr() as *mut u8,
+    };
+    let mut output = CryptBlob {
+        cb_data: 0,
+        pb_data: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 || output.pb_data.is_null() {
+        return Err("Unable to unprotect OpenCode cookie with DPAPI".to_string());
+    }
+    Ok(unsafe {
+        let plaintext =
+            std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        LocalFree(output.pb_data as *mut std::ffi::c_void);
+        plaintext
+    })
+}
+
+#[cfg(not(windows))]
+fn dpapi_protect(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Encrypted OpenCode cookies require Windows DPAPI".to_string())
+}
+
+#[cfg(not(windows))]
+fn dpapi_unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Encrypted OpenCode cookies require Windows DPAPI".to_string())
 }
 
 fn fetch_dashboard_usage(credentials: &DashboardCredentials) -> Result<DashboardUsage, PollError> {
@@ -677,5 +885,104 @@ mod tests {
         assert!(!valid_workspace_id("../other"));
         assert!(valid_cookie("auth=abc; theme=dark"));
         assert!(!valid_cookie("auth=abc\r\nX-Test: injected"));
+    }
+
+    #[test]
+    fn dpapi_cookie_roundtrip_and_tamper_rejection() {
+        let original = "__Host-console_session=SessionToken123==; __stripe_mid=StripeVal";
+        let encrypted = encrypt_auth_cookie(original).expect("DPAPI encrypt should succeed");
+        assert_ne!(encrypted, original);
+        assert!(!encrypted.contains("SessionToken123"));
+
+        let decrypted = decrypt_auth_cookie(&encrypted).expect("DPAPI decrypt should succeed");
+        assert_eq!(decrypted, original);
+
+        // Tampering with the base64 ciphertext must fail verification/decryption.
+        let mut raw_blob = base64_decode(&encrypted).unwrap();
+        raw_blob[0] ^= 0xff;
+        let tampered = base64_encode(&raw_blob);
+        assert!(decrypt_auth_cookie(&tampered).is_err());
+
+        // Header-injection cookies must be rejected before encryption.
+        assert!(encrypt_auth_cookie("auth=abc\r\nX-Evil: 1").is_err());
+    }
+
+    #[test]
+    fn config_file_supports_encrypted_and_legacy_plaintext_cookies() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // 1. DPAPI-encrypted config.
+        let encrypted_cookie = encrypt_auth_cookie("__Host-console_session=dpapi_tok").unwrap();
+        let enc_path = temp.path().join("encrypted.json");
+        std::fs::write(
+            &enc_path,
+            serde_json::json!({
+                "workspaceId": "wrk_encrypted",
+                "authCookieEncrypted": encrypted_cookie,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let creds = read_dashboard_config(&enc_path).unwrap();
+        assert_eq!(creds.workspace_id, "wrk_encrypted");
+        assert_eq!(creds.auth_cookie, "__Host-console_session=dpapi_tok");
+
+        // 2. Legacy plaintext config remains fully supported.
+        let legacy_path = temp.path().join("legacy.json");
+        std::fs::write(
+            &legacy_path,
+            r#"{"workspaceId":"wrk_legacy","authCookie":"legacy_secret_cookie"}"#,
+        )
+        .unwrap();
+        let legacy_creds = read_dashboard_config(&legacy_path).unwrap();
+        assert_eq!(legacy_creds.workspace_id, "wrk_legacy");
+        assert_eq!(legacy_creds.auth_cookie, "legacy_secret_cookie");
+
+        // 3. Corrupted encrypted cookie returns None rather than panicking.
+        let bad_path = temp.path().join("corrupt.json");
+        std::fs::write(
+            &bad_path,
+            r#"{"workspaceId":"wrk_bad","authCookieEncrypted":"not_valid_base64!!!"}"#,
+        )
+        .unwrap();
+        assert!(read_dashboard_config(&bad_path).is_none());
+
+        // 4. Encrypted cookie takes precedence over plaintext when both exist.
+        let both_path = temp.path().join("both.json");
+        let newer_enc = encrypt_auth_cookie("__Host-console_session=preferred_dpapi").unwrap();
+        std::fs::write(
+            &both_path,
+            serde_json::json!({
+                "workspaceId": "wrk_both",
+                "authCookie": "old_plaintext",
+                "authCookieEncrypted": newer_enc,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let both_creds = read_dashboard_config(&both_path).unwrap();
+        assert_eq!(
+            both_creds.auth_cookie,
+            "__Host-console_session=preferred_dpapi"
+        );
+    }
+
+    #[test]
+    fn env_credentials_preserve_plaintext_and_support_encrypted() {
+        let plain = read_env_credentials(
+            Some("wrk_env".into()),
+            Some("plain_env_cookie".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain.workspace_id, "wrk_env");
+        assert_eq!(plain.auth_cookie, "plain_env_cookie");
+        assert_eq!(plain.source, "environment");
+
+        let enc_val = encrypt_auth_cookie("dpapi_env_cookie").unwrap();
+        let enc = read_env_credentials(Some("wrk_env".into()), None, Some(enc_val)).unwrap();
+        assert_eq!(enc.workspace_id, "wrk_env");
+        assert_eq!(enc.auth_cookie, "dpapi_env_cookie");
+        assert_eq!(enc.source, "environment (encrypted)");
     }
 }

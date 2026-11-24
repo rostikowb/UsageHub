@@ -109,10 +109,27 @@ pub(super) fn send_owner_message(owner: isize, message: u32) -> Result<(), Strin
     }
 }
 
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub(super) fn redacted_log_for_export(content: &str) -> String {
+    crate::diagnose::redact(content)
+}
+
 impl StudioApp {
     pub(super) fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
         let language = self.language();
         let mut recording = crate::diagnose::is_enabled();
+        let log_status = crate::diagnose::log_status();
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(16, 8))
             .show(ui, |ui| {
@@ -144,6 +161,28 @@ impl StudioApp {
                     if let Some(error) = &self.diagnostics.recording_error {
                         ui.colored_label(egui::Color32::from_rgb(255, 190, 178), error);
                     }
+                    setting_separator(ui);
+                    ui.add_space(6.0);
+                    let rotation_info = match log_status.prev_bytes {
+                        Some(prev) => language
+                            .text("Rotation: {current} / {max} (previous log: {prev})")
+                            .replace("{current}", &format_byte_size(log_status.current_bytes))
+                            .replace("{max}", &format_byte_size(log_status.max_bytes))
+                            .replace("{prev}", &format_byte_size(prev)),
+                        None => language
+                            .text("Rotation: {current} / {max}")
+                            .replace("{current}", &format_byte_size(log_status.current_bytes))
+                            .replace("{max}", &format_byte_size(log_status.max_bytes)),
+                    };
+                    ui.label(egui::RichText::new(rotation_info).size(13.0).color(muted()));
+                    ui.label(
+                        egui::RichText::new(language.text(
+                            "Automatic redaction masks tokens, cookies, emails, and user profile paths.",
+                        ))
+                        .size(13.0)
+                        .color(muted()),
+                    );
+                    ui.add_space(4.0);
                 });
                 ui.add_space(18.0);
                 settings_group(ui, |ui| {
@@ -181,6 +220,16 @@ impl StudioApp {
                             .clicked()
                         {
                             ui.ctx().copy_text(self.diagnostics.content.clone());
+                        }
+                        if ui
+                            .add(lucide_labeled_button(
+                                LucideIcon::ShieldCheck,
+                                language.text("Copy redacted log"),
+                            ))
+                            .clicked()
+                        {
+                            ui.ctx()
+                                .copy_text(redacted_log_for_export(&self.diagnostics.content));
                         }
                     });
                     ui.add_space(8.0);
@@ -269,5 +318,20 @@ mod tests {
             .unwrap_err()
             .contains("not connected"));
         assert!(send_owner_message(-1, WM_APP_REFRESH_NOW).is_err());
+    }
+
+    #[test]
+    fn redacted_export_masks_secrets_and_formats_rotation_sizes() {
+        let raw = "[123] Authorization: Bearer tok_secret\n[124] Cookie: __Host-console_session=sess123\n[125] user@example.com C:\\Users\\alice\\AppData\\log.txt";
+        let exported = redacted_log_for_export(raw);
+        assert!(!exported.contains("tok_secret"));
+        assert!(!exported.contains("sess123"));
+        assert!(!exported.contains("user@example.com"));
+        assert!(!exported.contains("alice"));
+        assert!(exported.contains("[REDACTED]"));
+
+        assert_eq!(format_byte_size(512), "512 B");
+        assert_eq!(format_byte_size(2048), "2.0 KiB");
+        assert_eq!(format_byte_size(5 * 1024 * 1024), "5.0 MiB");
     }
 }
