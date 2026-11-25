@@ -1,5 +1,6 @@
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::diagnose;
 use crate::models::{AppUsageData, UsageData, UsageSection};
@@ -142,7 +143,7 @@ pub fn poll(
     } else {
         poll_concurrently_with_progress(
             enabled_providers,
-            |provider| retry_after::with_manual_refresh(force, || poll_provider(provider)),
+            |provider| retry_after::with_manual_refresh(force, || poll_provider_tracked(provider)),
             on_progress,
         )
     }
@@ -328,6 +329,499 @@ mod retry_after;
 mod windows_credentials;
 
 pub use retry_after::retry_delay_ms;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialSourceState {
+    Detected,
+    Expired,
+    Missing,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialSourceStatus {
+    pub state: CredentialSourceState,
+    /// Non-secret human-readable source description (never tokens, emails, or raw paths).
+    pub source_label: &'static str,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderTelemetry {
+    pub last_poll_at: Option<SystemTime>,
+    pub latency_ms: Option<u64>,
+    pub last_http_status: Option<u16>,
+    pub last_error: Option<PollError>,
+    pub retry_after_remaining: Option<Duration>,
+    pub credential_status: Option<CredentialSourceStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TelemetryKey {
+    pub provider: ProviderId,
+    pub account_id: Option<String>,
+}
+
+impl TelemetryKey {
+    pub fn new(provider: ProviderId, account_id: Option<&str>) -> Self {
+        Self {
+            provider,
+            account_id: account_id.filter(|id| !id.is_empty()).map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct TelemetryStore {
+    entries: Mutex<HashMap<TelemetryKey, ProviderTelemetry>>,
+}
+
+impl TelemetryStore {
+    pub fn record_poll(
+        &self,
+        provider: ProviderId,
+        account_id: Option<&str>,
+        finished_at: SystemTime,
+        elapsed: Duration,
+        http_status: Option<u16>,
+        error: Option<PollError>,
+        credential_status: Option<CredentialSourceStatus>,
+    ) {
+        let key = TelemetryKey::new(provider, account_id);
+        let effective_status = http_status.or_else(|| match error {
+            Some(PollError::HttpStatus(code)) => Some(code),
+            _ => None,
+        });
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries.entry(key).or_default();
+        entry.last_poll_at = Some(finished_at);
+        entry.latency_ms = Some(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        if effective_status.is_some() || error.is_none() {
+            entry.last_http_status = effective_status;
+        }
+        entry.last_error = error;
+        if let Some(status) = credential_status {
+            entry.credential_status = Some(status);
+        }
+    }
+
+    pub fn set_credential_status(
+        &self,
+        provider: ProviderId,
+        account_id: Option<&str>,
+        status: CredentialSourceStatus,
+    ) {
+        let key = TelemetryKey::new(provider, account_id);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.entry(key).or_default().credential_status = Some(status);
+    }
+
+    pub fn get(&self, provider: ProviderId, account_id: Option<&str>) -> ProviderTelemetry {
+        let key = TelemetryKey::new(provider, account_id);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+pub(super) fn shared_telemetry() -> &'static TelemetryStore {
+    static STORE: OnceLock<TelemetryStore> = OnceLock::new();
+    STORE.get_or_init(TelemetryStore::default)
+}
+
+pub fn provider_telemetry(provider: ProviderId, account_id: Option<&str>) -> ProviderTelemetry {
+    let mut telemetry = shared_telemetry().get(provider, account_id);
+    telemetry.retry_after_remaining = retry_after::cooldown_remaining(provider, account_id);
+    telemetry
+}
+
+pub fn refresh_credential_statuses(settings: &crate::accounts::AccountSettings) {
+    for provider in ProviderId::ALL {
+        let status = detect_provider_credential_status(provider);
+        shared_telemetry().set_credential_status(provider, None, status);
+        if let Some(accounts) = settings.get(provider) {
+            for profile in &accounts.profiles {
+                let account_status = detect_account_credential_status(provider, profile);
+                shared_telemetry().set_credential_status(
+                    provider,
+                    Some(&profile.id),
+                    account_status,
+                );
+            }
+        }
+    }
+}
+
+pub fn test_provider_connection(provider: ProviderId) -> Result<UsageData, PollError> {
+    let credential_status = detect_provider_credential_status(provider);
+    shared_telemetry().set_credential_status(provider, None, credential_status);
+    retry_after::with_manual_refresh(true, || poll_provider_tracked(provider))
+}
+
+pub fn test_account_connection(
+    provider: ProviderId,
+    profile: &crate::accounts::AccountProfile,
+) -> Result<UsageData, PollError> {
+    let credential_status = detect_account_credential_status(provider, profile);
+    shared_telemetry().set_credential_status(provider, Some(&profile.id), credential_status);
+    accounts::poll_single_account(provider, profile, true)
+}
+
+fn poll_provider_tracked(provider: ProviderId) -> Result<UsageData, PollError> {
+    let started = Instant::now();
+    let (result, http_status) =
+        retry_after::with_poll_scope(provider, None, || poll_provider(provider));
+    let finished_at = SystemTime::now();
+    let credential_status = Some(detect_provider_credential_status_fast(provider));
+    shared_telemetry().record_poll(
+        provider,
+        None,
+        finished_at,
+        started.elapsed(),
+        http_status,
+        result.as_ref().err().copied(),
+        credential_status,
+    );
+    result
+}
+
+pub fn detect_provider_credential_status(provider: ProviderId) -> CredentialSourceStatus {
+    detect_provider_credential_status_inner(provider, true)
+}
+
+fn detect_provider_credential_status_fast(provider: ProviderId) -> CredentialSourceStatus {
+    detect_provider_credential_status_inner(provider, false)
+}
+
+fn detect_provider_credential_status_inner(
+    provider: ProviderId,
+    allow_wsl: bool,
+) -> CredentialSourceStatus {
+    match provider {
+        ProviderId::Claude => detect_claude_default_credential_status(allow_wsl),
+        ProviderId::Codex => match codex::codex_auth_path() {
+            Some(path) => {
+                let label = if std::env::var_os("CODEX_HOME").is_some_and(|v| !v.is_empty()) {
+                    "Environment variable"
+                } else {
+                    "Credentials file"
+                };
+                inspect_codex_auth_file(&path, label)
+            }
+            None => CredentialSourceStatus {
+                state: CredentialSourceState::Missing,
+                source_label: "Not found",
+            },
+        },
+        ProviderId::Antigravity => {
+            if antigravity::antigravity_credential_watch_signature().contains("|present|") {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: "Windows Credential Manager",
+                }
+            } else {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Missing,
+                    source_label: "Not found",
+                }
+            }
+        }
+        ProviderId::OpenCode => {
+            let snapshot = opencode::credential_watch_snapshot(false);
+            let first = snapshot.first().map(String::as_str).unwrap_or("");
+            if first.starts_with("dashboard|present|") {
+                let head = first.split(";;").next().unwrap_or("");
+                let label = if head.ends_with("|environment") {
+                    "Environment variable"
+                } else {
+                    "Config file"
+                };
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: label,
+                }
+            } else {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Missing,
+                    source_label: "Not found",
+                }
+            }
+        }
+        ProviderId::Cursor => {
+            let snapshot = cursor::credential_watch_snapshot(false);
+            if snapshot
+                .first()
+                .is_some_and(|entry| entry.starts_with("environment|present|"))
+            {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: "Environment variable",
+                }
+            } else if snapshot
+                .get(1)
+                .is_some_and(|entry| entry.contains("|present|"))
+            {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: "Local database",
+                }
+            } else {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Missing,
+                    source_label: "Not found",
+                }
+            }
+        }
+        ProviderId::Grok => {
+            let snapshot = grok::credential_watch_snapshot(false);
+            if snapshot
+                .first()
+                .is_some_and(|entry| entry.contains("|present|"))
+            {
+                let label = if std::env::var_os("GROK_HOME").is_some_and(|v| !v.is_empty()) {
+                    "Environment variable"
+                } else {
+                    "Credentials file"
+                };
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: label,
+                }
+            } else {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Missing,
+                    source_label: "Not found",
+                }
+            }
+        }
+        ProviderId::Copilot => {
+            let snapshot = copilot::credential_watch_snapshot(false);
+            if snapshot
+                .iter()
+                .take(3)
+                .any(|entry| entry.contains("|present|"))
+            {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: "Environment variable",
+                }
+            } else if snapshot.len() > 3 {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Detected,
+                    source_label: "Windows Credential Manager",
+                }
+            } else {
+                CredentialSourceStatus {
+                    state: CredentialSourceState::Missing,
+                    source_label: "Not found",
+                }
+            }
+        }
+    }
+}
+
+pub fn detect_account_credential_status(
+    provider: ProviderId,
+    profile: &crate::accounts::AccountProfile,
+) -> CredentialSourceStatus {
+    match provider {
+        ProviderId::Claude => {
+            if !profile.desktop_dir.trim().is_empty() {
+                return match profile.desktop_dir_resolved() {
+                    Err(_) => CredentialSourceStatus {
+                        state: CredentialSourceState::Invalid,
+                        source_label: "Invalid path",
+                    },
+                    Ok(None) => CredentialSourceStatus {
+                        state: CredentialSourceState::Missing,
+                        source_label: "Not found",
+                    },
+                    Ok(Some(dir)) => match claude_desktop::read_token_for_dir(&dir) {
+                        Some(token) if is_unix_ms_expired(token.expires_at) => {
+                            CredentialSourceStatus {
+                                state: CredentialSourceState::Expired,
+                                source_label: "Desktop directory",
+                            }
+                        }
+                        Some(_) => CredentialSourceStatus {
+                            state: CredentialSourceState::Detected,
+                            source_label: "Desktop directory",
+                        },
+                        None => CredentialSourceStatus {
+                            state: CredentialSourceState::Missing,
+                            source_label: "Not found",
+                        },
+                    },
+                };
+            }
+            match profile.credential_path(ProviderId::Claude) {
+                Err(_) => CredentialSourceStatus {
+                    state: CredentialSourceState::Invalid,
+                    source_label: "Invalid path",
+                },
+                Ok(None) => detect_provider_credential_status(ProviderId::Claude),
+                Ok(Some(path)) => {
+                    let file_status = inspect_claude_credential_file(&path);
+                    if file_status.state != CredentialSourceState::Missing {
+                        return file_status;
+                    }
+                    for target in &profile.credential_targets {
+                        if let Some(secret) = windows_credentials::read_generic(target) {
+                            if let Some(state) = inspect_claude_json_state(&secret) {
+                                return CredentialSourceStatus {
+                                    state,
+                                    source_label: "Windows Credential Manager",
+                                };
+                            }
+                        }
+                    }
+                    CredentialSourceStatus {
+                        state: CredentialSourceState::Missing,
+                        source_label: "Not found",
+                    }
+                }
+            }
+        }
+        ProviderId::Codex => match profile.credential_path(ProviderId::Codex) {
+            Err(_) => CredentialSourceStatus {
+                state: CredentialSourceState::Invalid,
+                source_label: "Invalid path",
+            },
+            Ok(None) => detect_provider_credential_status(ProviderId::Codex),
+            Ok(Some(path)) => inspect_codex_auth_file(&path, "Credentials file"),
+        },
+        _ => detect_provider_credential_status(provider),
+    }
+}
+
+fn detect_claude_default_credential_status(allow_wsl: bool) -> CredentialSourceStatus {
+    let explicit_env = std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty());
+    let file_path = if explicit_env {
+        crate::accounts::environment_directory(ProviderId::Claude)
+            .map(|dir| dir.join(".credentials.json"))
+    } else {
+        crate::known_folders::home_dir().map(|home| home.join(".claude").join(".credentials.json"))
+    };
+    if let Some(path) = file_path {
+        let status = inspect_claude_credential_file(&path);
+        if status.state != CredentialSourceState::Missing {
+            return CredentialSourceStatus {
+                state: status.state,
+                source_label: if explicit_env {
+                    "Environment variable"
+                } else {
+                    "Credentials file"
+                },
+            };
+        }
+    }
+    if !explicit_env {
+        for path in claude_desktop::config_paths() {
+            if let Some(token) = claude_desktop::read_token(&path) {
+                return CredentialSourceStatus {
+                    state: if is_unix_ms_expired(token.expires_at) {
+                        CredentialSourceState::Expired
+                    } else {
+                        CredentialSourceState::Detected
+                    },
+                    source_label: "Desktop directory",
+                };
+            }
+        }
+        if allow_wsl
+            && claude::credential_watch_snapshot(false)
+                .iter()
+                .any(|entry| entry.starts_with("wsl:") && entry.contains("|present|"))
+        {
+            return CredentialSourceStatus {
+                state: CredentialSourceState::Detected,
+                source_label: "WSL credentials",
+            };
+        }
+    }
+    CredentialSourceStatus {
+        state: CredentialSourceState::Missing,
+        source_label: "Not found",
+    }
+}
+
+fn inspect_claude_credential_file(path: &std::path::Path) -> CredentialSourceStatus {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return CredentialSourceStatus {
+            state: CredentialSourceState::Missing,
+            source_label: "Not found",
+        };
+    };
+    match inspect_claude_json_state(&content) {
+        Some(state) => CredentialSourceStatus {
+            state,
+            source_label: "Credentials file",
+        },
+        None => CredentialSourceStatus {
+            state: CredentialSourceState::Missing,
+            source_label: "Not found",
+        },
+    }
+}
+
+fn inspect_claude_json_state(content: &str) -> Option<CredentialSourceState> {
+    let json: serde_json::Value = serde_json::from_str(content).ok()?;
+    let oauth = json.get("claudeAiOauth")?;
+    let token = oauth
+        .get("accessToken")?
+        .as_str()
+        .filter(|token| !token.trim().is_empty())?;
+    let _ = token;
+    let expires_at = oauth.get("expiresAt").and_then(|value| value.as_i64());
+    Some(if is_unix_ms_expired(expires_at) {
+        CredentialSourceState::Expired
+    } else {
+        CredentialSourceState::Detected
+    })
+}
+
+fn inspect_codex_auth_file(path: &std::path::Path, label: &'static str) -> CredentialSourceStatus {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return CredentialSourceStatus {
+            state: CredentialSourceState::Missing,
+            source_label: "Not found",
+        };
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return CredentialSourceStatus {
+            state: CredentialSourceState::Invalid,
+            source_label: label,
+        };
+    };
+    let has_token = json
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|token| !token.trim().is_empty());
+    if has_token {
+        CredentialSourceStatus {
+            state: CredentialSourceState::Detected,
+            source_label: label,
+        }
+    } else {
+        CredentialSourceStatus {
+            state: CredentialSourceState::Missing,
+            source_label: "Not found",
+        }
+    }
+}
+
+fn is_unix_ms_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|expires_at| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        now >= expires_at
+    })
+}
 
 struct ProviderPoller {
     id: ProviderId,

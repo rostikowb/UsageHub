@@ -143,6 +143,9 @@ unsafe fn dispatch_to_surface(msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESU
         .as_ref()
         .map(|state| state.hwnd.to_hwnd())
         .unwrap_or_default();
+    if surface.is_invalid() || !IsWindow(Some(surface)).as_bool() {
+        return LRESULT(0);
+    }
     wnd_proc(surface, msg, wparam, lparam)
 }
 

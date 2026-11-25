@@ -351,6 +351,41 @@ pub fn rendered_label(
     crate::theme_engine::format_template(translated, context)
 }
 
+pub fn update_action_label(
+    language: crate::localization::LanguageId,
+    available_version: Option<&str>,
+    checking: bool,
+    applying: bool,
+) -> String {
+    let strings = language.strings();
+    if applying {
+        return strings.applying_update.to_string();
+    }
+    if checking {
+        return strings.checking_for_updates.to_string();
+    }
+    if let Some(version) = available_version {
+        let clean = version.trim().trim_start_matches('v');
+        if !clean.is_empty() {
+            return format!("{} v{clean}", strings.update_to);
+        }
+    }
+    language.text("Check for updates").to_string()
+}
+
+pub fn update_banner_label(
+    language: crate::localization::LanguageId,
+    available_version: &str,
+) -> String {
+    let strings = language.strings();
+    let clean = available_version.trim().trim_start_matches('v');
+    if clean.is_empty() {
+        strings.update_available.to_string()
+    } else {
+        format!("{}: v{clean}", strings.update_available)
+    }
+}
+
 pub fn classic_context_menu() -> ContextMenuDocument {
     use ContextMenuAction as Action;
     use ContextMenuProvider as Provider;
@@ -938,5 +973,34 @@ mod tests {
             item.render = Expression(render.into());
             assert_eq!(item.should_render(&context), visible);
         }
+    }
+
+    #[test]
+    fn update_labels_reflect_status_and_normalize_version_prefix() {
+        let lang = crate::localization::LanguageId::English;
+        assert_eq!(
+            update_action_label(lang, None, false, false),
+            "Check for updates"
+        );
+        assert_eq!(
+            update_action_label(lang, None, true, false),
+            "Checking for Updates..."
+        );
+        assert_eq!(
+            update_action_label(lang, None, false, true),
+            "Applying update..."
+        );
+        assert_eq!(
+            update_action_label(lang, Some("2.24.0"), false, false),
+            "Update to v2.24.0"
+        );
+        assert_eq!(
+            update_action_label(lang, Some("v2.24.0"), false, false),
+            "Update to v2.24.0"
+        );
+        assert_eq!(
+            update_banner_label(lang, "2.24.0"),
+            "Update available: v2.24.0"
+        );
     }
 }

@@ -9,6 +9,210 @@ fn clock_refresh_delay(interval: Duration) -> Duration {
     Duration::from_millis((interval_ms - elapsed_ms % interval_ms) as u64)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    stamp: Option<(Option<SystemTime>, u64)>,
+}
+
+fn read_file_stamp(path: &Path) -> FileStamp {
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.modified().ok(), metadata.len()));
+    FileStamp {
+        path: path.to_path_buf(),
+        stamp,
+    }
+}
+
+fn file_stamp_changed(path: &Path, is_usage_cache: bool) -> bool {
+    thread_local! {
+        static SETTINGS_STAMP: std::cell::RefCell<Option<FileStamp>> = const { std::cell::RefCell::new(None) };
+        static USAGE_CACHE_STAMP: std::cell::RefCell<Option<FileStamp>> = const { std::cell::RefCell::new(None) };
+    }
+    let current = read_file_stamp(path);
+    let slot = if is_usage_cache {
+        &USAGE_CACHE_STAMP
+    } else {
+        &SETTINGS_STAMP
+    };
+    slot.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.as_ref() == Some(&current) {
+            false
+        } else {
+            *guard = Some(current);
+            true
+        }
+    })
+}
+
+fn paint_equal(a: &Paint, b: &Paint) -> bool {
+    a.color == b.color && a.opacity == b.opacity
+}
+
+fn stroke_equal(a: &theme_engine::Stroke, b: &theme_engine::Stroke) -> bool {
+    paint_equal(&a.color, &b.color) && a.width == b.width
+}
+
+fn layer_background_equal(a: &LayerBackground, b: &LayerBackground) -> bool {
+    match (a, b) {
+        (LayerBackground::None, LayerBackground::None) => true,
+        (LayerBackground::Colour { colour: a }, LayerBackground::Colour { colour: b }) => {
+            paint_equal(a, b)
+        }
+        (
+            LayerBackground::Gradient {
+                start: a_start,
+                end: a_end,
+                angle: a_angle,
+            },
+            LayerBackground::Gradient {
+                start: b_start,
+                end: b_end,
+                angle: b_angle,
+            },
+        ) => paint_equal(a_start, b_start) && paint_equal(a_end, b_end) && a_angle == b_angle,
+        (
+            LayerBackground::Image {
+                path: a_path,
+                fit: a_fit,
+            },
+            LayerBackground::Image {
+                path: b_path,
+                fit: b_fit,
+            },
+        ) => a_path == b_path && a_fit == b_fit,
+        _ => false,
+    }
+}
+
+fn placement_persisted_equal(a: &Placement, b: &Placement) -> bool {
+    a.reference == b.reference
+        && a.nest == b.nest
+        && a.horizontal == b.horizontal
+        && a.vertical == b.vertical
+        && a.surface_horizontal == b.surface_horizontal
+        && a.surface_vertical == b.surface_vertical
+        && a.offset_x == b.offset_x
+        && a.offset_x_expression == b.offset_x_expression
+        && a.offset_y == b.offset_y
+        && a.offset_y_expression == b.offset_y_expression
+}
+
+fn scene_content_equal(a: &SceneContent, b: &SceneContent) -> bool {
+    match (a, b) {
+        (SceneContent::None, SceneContent::None) => true,
+        (
+            SceneContent::Text {
+                template: a_template,
+                font_family: a_font_family,
+                font_size: a_font_size,
+                weight: a_weight,
+                rendering: a_rendering,
+                contrast: a_contrast,
+                align: a_align,
+                color: a_color,
+            },
+            SceneContent::Text {
+                template: b_template,
+                font_family: b_font_family,
+                font_size: b_font_size,
+                weight: b_weight,
+                rendering: b_rendering,
+                contrast: b_contrast,
+                align: b_align,
+                color: b_color,
+            },
+        ) => {
+            a_template == b_template
+                && a_font_family == b_font_family
+                && a_font_size == b_font_size
+                && a_weight == b_weight
+                && a_rendering == b_rendering
+                && a_contrast == b_contrast
+                && a_align == b_align
+                && paint_equal(a_color, b_color)
+        }
+        (
+            SceneContent::Progress {
+                value: a_value,
+                direction: a_direction,
+                fill: a_fill,
+                track: a_track,
+                corner_radius: a_corner_radius,
+                segments: a_segments,
+                segments_expression: a_segments_expression,
+                segment_gap: a_segment_gap,
+            },
+            SceneContent::Progress {
+                value: b_value,
+                direction: b_direction,
+                fill: b_fill,
+                track: b_track,
+                corner_radius: b_corner_radius,
+                segments: b_segments,
+                segments_expression: b_segments_expression,
+                segment_gap: b_segment_gap,
+            },
+        ) => {
+            a_value == b_value
+                && a_direction == b_direction
+                && paint_equal(a_fill, b_fill)
+                && paint_equal(a_track, b_track)
+                && a_corner_radius == b_corner_radius
+                && a_segments == b_segments
+                && a_segments_expression == b_segments_expression
+                && a_segment_gap == b_segment_gap
+        }
+        _ => false,
+    }
+}
+
+fn scene_object_equal(a: &SceneObject, b: &SceneObject) -> bool {
+    a.id == b.id
+        && a.name == b.name
+        && a.render == b.render
+        && a.visibility == b.visibility
+        && a.parent == b.parent
+        && placement_persisted_equal(&a.placement, &b.placement)
+        && a.anchor == b.anchor
+        && a.x == b.x
+        && a.y == b.y
+        && a.width == b.width
+        && a.height == b.height
+        && a.rotation == b.rotation
+        && layer_background_equal(&a.background, &b.background)
+        && match (&a.border, &b.border) {
+            (Some(a_border), Some(b_border)) => stroke_equal(a_border, b_border),
+            (None, None) => true,
+            _ => false,
+        }
+        && a.mouse_events == b.mouse_events
+        && a.tooltip == b.tooltip
+        && a.corner_radius == b.corner_radius
+        && a.layout == b.layout
+        && a.align == b.align
+        && a.gap == b.gap
+        && scene_content_equal(&a.content, &b.content)
+        && a.children.len() == b.children.len()
+        && a.children
+            .iter()
+            .zip(&b.children)
+            .all(|(child_a, child_b)| scene_object_equal(child_a, child_b))
+}
+
+fn theme_documents_equal(a: &ThemeDocument, b: &ThemeDocument) -> bool {
+    a.schema_version == b.schema_version
+        && a.id == b.id
+        && a.name == b.name
+        && a.surfaces.len() == b.surfaces.len()
+        && a.surfaces
+            .iter()
+            .zip(&b.surfaces)
+            .all(|(surface_a, surface_b)| scene_object_equal(surface_a, surface_b))
+}
+
 impl StudioApp {
     pub(super) fn language(&self) -> LanguageId {
         localization::resolve_language(
@@ -434,9 +638,7 @@ impl StudioApp {
             return;
         }
         self.theme.prepare_runtime();
-        if serde_json::to_string(&self.theme).ok()
-            != serde_json::to_string(&self.history_snapshot).ok()
-        {
+        if !theme_documents_equal(&self.theme, &self.history_snapshot) {
             self.undo_stack.push(self.history_snapshot.clone());
             if self.undo_stack.len() > 100 {
                 self.undo_stack.remove(0);
@@ -838,11 +1040,16 @@ impl StudioApp {
             self.owner = owner;
         }
         self.update_status = crate::dashboard::read_update_status(self.owner);
-        let persisted = app_settings::load_settings();
-        self.sync_poll_interval(persisted.poll_interval_ms);
-        self.sync_taskbar_lock(persisted.lock_taskbar);
-        let usage_changed =
-            app_settings::load_usage_cache().is_some_and(|cache| self.update_usage_cache(cache));
+        if file_stamp_changed(&app_settings::settings_path(), false) {
+            let persisted = app_settings::load_settings();
+            self.sync_poll_interval(persisted.poll_interval_ms);
+            self.sync_taskbar_lock(persisted.lock_taskbar);
+        }
+        let usage_changed = if file_stamp_changed(&app_settings::usage_cache_path(), true) {
+            app_settings::load_usage_cache().is_some_and(|cache| self.update_usage_cache(cache))
+        } else {
+            false
+        };
         let countdown_due = self
             .next_preview_countdown_refresh
             .is_some_and(|deadline| now >= deadline);

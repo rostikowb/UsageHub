@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -94,9 +95,16 @@ pub(super) fn poll_account(path: &Path) -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage_at(&creds.access_token, creds.account_id.as_deref(), Some(path)) {
-        Ok(data) => Ok(data),
-        Err(PollError::AuthRequired) => {
+    poll_codex_with_refresh(
+        creds,
+        |credentials| {
+            fetch_codex_usage_at(
+                &credentials.access_token,
+                credentials.account_id.as_deref(),
+                Some(path),
+            )
+        },
+        || {
             if path.file_name().is_some_and(|name| name == "auth.json") {
                 if imported_from_omp(path) {
                     // omp owns the rotating refresh token; refreshing here
@@ -104,20 +112,52 @@ pub(super) fn poll_account(path: &Path) -> Result<UsageData, PollError> {
                     diagnose::log(
                         "Codex sign-in imported from omp expired; re-import instead of refreshing",
                     );
-                    return Err(PollError::TokenExpired);
+                    return None;
                 }
                 if let Some(directory) = path.parent() {
                     cli_refresh_codex_token(directory);
                 }
             }
-            let refreshed = read_codex_credentials_at(path).ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage_at(
-                &refreshed.access_token,
-                refreshed.account_id.as_deref(),
-                Some(path),
-            )
+            read_codex_credentials_at(path)
+        },
+    )
+}
+
+fn poll_codex_with_refresh(
+    creds: CodexTokenData,
+    mut fetch: impl FnMut(&CodexTokenData) -> Result<UsageData, PollError>,
+    mut refresh: impl FnMut() -> Option<CodexTokenData>,
+) -> Result<UsageData, PollError> {
+    match fetch(&creds) {
+        Ok(data) => Ok(data),
+        Err(PollError::AuthRequired) => {
+            let refreshed = refresh().ok_or(PollError::TokenExpired)?;
+            if refreshed.access_token == creds.access_token {
+                diagnose::log("Codex token refresh did not update access_token; skipping retry");
+                return Err(PollError::TokenExpired);
+            }
+            fetch(&refreshed)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn map_codex_http_error(error: ureq::Error) -> PollError {
+    match error {
+        ureq::Error::StatusCode(code) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Codex usage endpoint returned auth error status {code}; refresh required"
+            ));
+            PollError::AuthRequired
+        }
+        ureq::Error::StatusCode(code) => {
+            diagnose::log(format!("Codex usage endpoint returned HTTP status {code}"));
+            PollError::HttpStatus(code)
+        }
+        error => {
+            diagnose::log_error("Codex usage endpoint request failed", error);
+            PollError::RequestFailed
+        }
     }
 }
 
@@ -139,16 +179,7 @@ fn fetch_codex_usage_at(
 
     let mut resp = match request.call().and_then(super::check_http_status) {
         Ok(resp) => resp,
-        Err(ureq::Error::StatusCode(code)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Codex usage endpoint returned auth error status {code}; refresh required"
-            ));
-            return Err(PollError::AuthRequired);
-        }
-        Err(error) => {
-            diagnose::log_error("Codex usage endpoint request failed", error);
-            return Err(PollError::RequestFailed);
-        }
+        Err(error) => return Err(map_codex_http_error(error)),
     };
 
     let response: CodexUsageResponse = match resp.body_mut().read_json() {
@@ -415,7 +446,7 @@ fn cli_refresh_codex_token(directory: &Path) {
     let args: &[&str] = &["exec", "."];
     let mut command = if is_cmd {
         let mut command = Command::new("cmd.exe");
-        command.arg("/c").arg(&codex_path).args(args);
+        command.args(["/d", "/c"]).arg(&codex_path).args(args);
         command
     } else if is_ps1 {
         let mut command = Command::new("powershell.exe");
@@ -445,7 +476,41 @@ fn cli_refresh_codex_token(directory: &Path) {
     }
 }
 
+struct CachedCodexPath {
+    path: String,
+    found: bool,
+    checked_at: Instant,
+}
+
 fn resolve_windows_codex_path() -> String {
+    const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+    static CACHE: OnceLock<Mutex<Option<CachedCodexPath>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = guard.as_ref() {
+            if entry.found {
+                let path = Path::new(&entry.path);
+                if !path.is_absolute() || path.exists() {
+                    return entry.path.clone();
+                }
+            } else if entry.checked_at.elapsed() < NEGATIVE_CACHE_TTL {
+                return entry.path.clone();
+            }
+        }
+    }
+
+    let (resolved, found) = resolve_windows_codex_path_uncached();
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    *guard = Some(CachedCodexPath {
+        path: resolved.clone(),
+        found,
+        checked_at: Instant::now(),
+    });
+    resolved
+}
+
+fn resolve_windows_codex_path_uncached() -> (String, bool) {
     // Bounded discovery: 2s and 8MiB per probe, eight probes at most, so the
     // whole scan stays within ~16s even when every probe hangs.
     const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -461,7 +526,7 @@ fn resolve_windows_codex_path() -> String {
         )
         .is_ok()
         {
-            return name.to_string();
+            return (name.to_string(), true);
         }
     }
 
@@ -482,12 +547,12 @@ fn resolve_windows_codex_path() -> String {
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
                 {
-                    return path.to_string();
+                    return (path.to_string(), true);
                 }
             }
         }
     }
-    "codex.cmd".to_string()
+    ("codex.cmd".to_string(), false)
 }
 
 #[cfg(test)]
@@ -888,5 +953,68 @@ mod tests {
             assert_eq!(data.weekly_label.as_deref(), Some("30d"));
             assert_eq!(data.monthly.as_ref(), Some(&data.weekly));
         }
+    }
+
+    #[test]
+    fn codex_http_error_preserves_non_auth_status_codes() {
+        assert_eq!(
+            map_codex_http_error(ureq::Error::StatusCode(401)),
+            PollError::AuthRequired
+        );
+        assert_eq!(
+            map_codex_http_error(ureq::Error::StatusCode(403)),
+            PollError::AuthRequired
+        );
+        for code in [429, 500, 503] {
+            let mapped = map_codex_http_error(ureq::Error::StatusCode(code));
+            assert_eq!(mapped, PollError::HttpStatus(code));
+            assert!(mapped.is_transient());
+        }
+        assert_eq!(
+            map_codex_http_error(ureq::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::TimedOut
+            ))),
+            PollError::RequestFailed
+        );
+    }
+
+    #[test]
+    fn codex_refresh_skips_re_poll_when_access_token_is_unchanged() {
+        let initial = CodexTokenData {
+            access_token: "same-token".into(),
+            account_id: Some("acct".into()),
+        };
+        let mut fetches = 0usize;
+        let unchanged = poll_codex_with_refresh(
+            initial.clone(),
+            |_| {
+                fetches += 1;
+                Err(PollError::AuthRequired)
+            },
+            || Some(initial.clone()),
+        );
+        assert_eq!(unchanged, Err(PollError::TokenExpired));
+        assert_eq!(fetches, 1);
+
+        let mut fetches = 0usize;
+        let updated = poll_codex_with_refresh(
+            initial,
+            |creds| {
+                fetches += 1;
+                if creds.access_token == "new-token" {
+                    Ok(UsageData::default())
+                } else {
+                    Err(PollError::AuthRequired)
+                }
+            },
+            || {
+                Some(CodexTokenData {
+                    access_token: "new-token".into(),
+                    account_id: Some("acct".into()),
+                })
+            },
+        );
+        assert!(updated.is_ok());
+        assert_eq!(fetches, 2);
     }
 }

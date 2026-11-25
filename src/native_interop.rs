@@ -455,8 +455,10 @@ pub fn find_desktop_host() -> Option<DesktopHost> {
         if let Some((parent_value, insert_after_value)) = cached {
             let parent = HWND(parent_value as *mut _);
             let insert_after = HWND(insert_after_value as *mut _);
-            let sibling_is_valid =
-                insert_after == HWND_BOTTOM || IsWindow(Some(insert_after)).as_bool();
+            let sibling_is_valid = insert_after == HWND_BOTTOM
+                || insert_after == HWND_TOP
+                || (IsWindow(Some(insert_after)).as_bool()
+                    && GetParent(insert_after) == Ok(parent));
             if IsWindow(Some(parent)).as_bool()
                 && IsWindowVisible(parent).as_bool()
                 && sibling_is_valid

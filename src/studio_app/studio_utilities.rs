@@ -42,18 +42,61 @@ pub(super) fn blank_theme(name: &str) -> ThemeDocument {
     theme
 }
 
+fn resolve_dialog_owner(owner: isize) -> HWND {
+    use windows::core::BOOL;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
+
+    let current_pid = std::process::id();
+    let candidate = HWND(owner as *mut _);
+    if !candidate.is_invalid() && unsafe { IsWindow(Some(candidate)).as_bool() } {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(candidate, Some(&mut pid));
+        }
+        if pid == current_pid {
+            return candidate;
+        }
+    }
+    let active = unsafe { GetActiveWindow() };
+    if !active.is_invalid() && unsafe { IsWindow(Some(active)).as_bool() } {
+        return active;
+    }
+    let mut found = HWND::default();
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        if IsWindowVisible(hwnd).as_bool() {
+            let slot = &mut *(lparam.0 as *mut HWND);
+            *slot = hwnd;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let _ = EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(enum_proc),
+            LPARAM(&mut found as *mut _ as isize),
+        );
+    }
+    found
+}
+
 pub(super) fn choose_file(owner: isize, title: &str, filter: &str) -> Option<PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::OFN_NOCHANGEDIR;
     let mut file = [0u16; 32768];
     let filter: Vec<u16> = filter.encode_utf16().collect();
     let title: Vec<u16> = format!("{title}\0").encode_utf16().collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: HWND(owner as *mut _),
+        hwndOwner: resolve_dialog_owner(owner),
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
         lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
@@ -74,6 +117,7 @@ pub(super) fn choose_save_file(
     default_name: &str,
     default_extension: &str,
 ) -> Option<PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::OFN_NOCHANGEDIR;
     let mut file = [0u16; 32768];
     let default_name: Vec<u16> = default_name.encode_utf16().collect();
     let copy_len = default_name.len().min(file.len().saturating_sub(1));
@@ -83,14 +127,14 @@ pub(super) fn choose_save_file(
     let default_extension: Vec<u16> = format!("{default_extension}\0").encode_utf16().collect();
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: HWND(owner as *mut _),
+        hwndOwner: resolve_dialog_owner(owner),
         lpstrFilter: PCWSTR(filter.as_ptr()),
         nFilterIndex: 1,
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
         lpstrTitle: PCWSTR(title.as_ptr()),
         lpstrDefExt: PCWSTR(default_extension.as_ptr()),
-        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     if unsafe { GetSaveFileNameW(&mut dialog) }.as_bool() {

@@ -133,8 +133,11 @@ pub fn present(hwnd: HWND, rendered: &RenderedTheme) -> Result<(), String> {
                     .map_err(|error| format!("DirectComposition setup failed: {error}"))?;
             entry.insert(presenter);
         }
-        unsafe { presenters[&key].present(rendered) }
-            .map_err(|error| format!("DirectComposition present failed: {error}"))
+        if let Err(error) = unsafe { presenters[&key].present(rendered) } {
+            presenters.remove(&key);
+            return Err(format!("DirectComposition present failed: {error}"));
+        }
+        Ok(())
     })
 }
 

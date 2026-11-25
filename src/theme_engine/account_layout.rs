@@ -237,12 +237,7 @@ pub fn layout_accounts(cards: &[AccountCard], max_width: f64) -> AccountLayout {
     let mut chosen = None;
     for candidate in (1..=ACCOUNT_SEGMENTS_MAX).rev() {
         if cards_width(target, candidate, ACCOUNT_CARD_VALUE_WIDTH) <= budget {
-            chosen = Some((
-                candidate,
-                ACCOUNT_CARD_VALUE_WIDTH,
-                12.0,
-                false,
-            ));
+            chosen = Some((candidate, ACCOUNT_CARD_VALUE_WIDTH, 12.0, false));
             break;
         }
     }
@@ -940,11 +935,11 @@ fn expand_builtin_theme(theme: &ThemeDocument, layout: &AccountLayout) -> ThemeD
                 .children
                 .iter()
                 .enumerate()
-                .filter(|(_, child)| {
-                    child.parent.as_deref() == Some(row_id.as_str())
-                        && provider_group_key(child).is_some()
+                .filter_map(|(index, child)| {
+                    (child.parent.as_deref() == Some(row_id.as_str()))
+                        .then(|| provider_group_key(child).map(|key| (index, key.to_string())))
+                        .flatten()
                 })
-                .map(|(index, child)| (index, provider_group_key(child).unwrap().to_string()))
                 .collect();
             let mut additions: Vec<SceneObject> = Vec::new();
             let mut width_terms: Vec<String> = Vec::new();
@@ -1242,24 +1237,25 @@ mod tests {
     use crate::accounts::{AccountProfile, AccountSettings, ProviderAccounts};
 
     fn pinned_settings(ids: &[&str]) -> AccountSettings {
-        let mut settings = AccountSettings::default();
-        settings.claude = ProviderAccounts {
-            profiles: ids
-                .iter()
-                .enumerate()
-                .map(|(index, id)| AccountProfile {
-                    id: id.to_string(),
-                    name: format!("Account {}", index + 1),
-                    enabled: true,
-                    pinned: true,
-                    sort_order: index as i32,
-                    ..Default::default()
-                })
-                .collect(),
-            selected: ids.first().map(|id| id.to_string()).unwrap_or_default(),
-            used_ids: ids.iter().map(|id| id.to_string()).collect(),
-        };
-        settings
+        AccountSettings {
+            claude: ProviderAccounts {
+                profiles: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| AccountProfile {
+                        id: id.to_string(),
+                        name: format!("Account {}", index + 1),
+                        enabled: true,
+                        pinned: true,
+                        sort_order: index as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+                selected: ids.first().map(|id| id.to_string()).unwrap_or_default(),
+                used_ids: ids.iter().map(|id| id.to_string()).collect(),
+            },
+            ..Default::default()
+        }
     }
 
     fn builtin_like_theme() -> ThemeDocument {
@@ -1527,10 +1523,7 @@ mod tests {
         assert_eq!(value.width.0, "62");
 
         let seven = layout_accounts(
-            &visible_account_cards(
-                &pinned_settings(&["a", "b", "c", "d", "e", "f", "g"]),
-                None,
-            ),
+            &visible_account_cards(&pinned_settings(&["a", "b", "c", "d", "e", "f", "g"]), None),
             560.0,
         );
         assert_eq!(seven.segments, 2);

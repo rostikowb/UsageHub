@@ -400,4 +400,300 @@ mod tests {
                 .all(|(_, value)| !value.trim().is_empty()));
         }
     }
+
+    #[test]
+    fn every_source_text_key_is_catalogued_and_translated_in_ukrainian() {
+        const UK_IDENTICAL_ALLOWLIST: &[&str] = &[
+            "Antigravity",
+            "Claude Code",
+            "Codex",
+            "Copilot",
+            "Cursor",
+            "Grok",
+            "OpenCode",
+            "URL",
+            "X",
+            "Y",
+        ];
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_files(&src_dir, &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "No Rust source files found under src/");
+
+        let mut source_keys = std::collections::BTreeSet::new();
+        for file in &files {
+            let content = std::fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("Failed to read {}: {error}", file.display()));
+            let is_loc_mod = file.ends_with("mod.rs")
+                && file
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == "localization");
+            for key in extract_text_literal_keys(&content) {
+                if is_loc_mod && key == "A future specialist label" {
+                    continue;
+                }
+                source_keys.insert(key);
+            }
+        }
+        assert!(!source_keys.is_empty(), "No .text(\"...\") keys discovered");
+
+        let english_translations = LanguageId::English.locale().translations;
+        let uk_translations = LanguageId::from_code("uk")
+            .expect("uk locale must exist")
+            .locale()
+            .translations;
+
+        for key in &source_keys {
+            assert!(
+                english_translations
+                    .binary_search_by(|(entry, _)| (*entry).cmp(key.as_str()))
+                    .is_ok(),
+                "Key {key:?} used in src/ is missing from en.toml and locale catalogues"
+            );
+            let uk_idx = uk_translations
+                .binary_search_by(|(entry, _)| (*entry).cmp(key.as_str()))
+                .unwrap_or_else(|_| {
+                    panic!("Key {key:?} used in src/ is missing from uk.toml");
+                });
+            let uk_value = uk_translations[uk_idx].1;
+            if !UK_IDENTICAL_ALLOWLIST.contains(&key.as_str()) {
+                assert_ne!(
+                    uk_value,
+                    key.as_str(),
+                    "Key {key:?} used in src/ is missing a Ukrainian translation in uk.toml"
+                );
+            }
+        }
+
+        for &(key, value) in uk_translations {
+            if !UK_IDENTICAL_ALLOWLIST.contains(&key) {
+                assert_ne!(
+                    value, key,
+                    "uk.toml entry {key:?} still uses the untranslated English key"
+                );
+            }
+        }
+    }
+
+    fn collect_rust_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("Failed to read {}: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("Failed to read dir entry").path();
+            if path.is_dir() {
+                collect_rust_files(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ScanToken {
+        Ident(String),
+        Str(String),
+        Punct(char),
+        Other,
+    }
+
+    fn extract_text_literal_keys(source: &str) -> Vec<String> {
+        let tokens = tokenize_rust_source(source);
+        let mut keys = Vec::new();
+        for idx in 0..tokens.len().saturating_sub(4) {
+            if tokens[idx] == ScanToken::Punct('.')
+                && matches!(&tokens[idx + 1], ScanToken::Ident(name) if name == "text")
+                && tokens[idx + 2] == ScanToken::Punct('(')
+            {
+                if let ScanToken::Str(value) = &tokens[idx + 3] {
+                    let mut next = idx + 4;
+                    if tokens.get(next) == Some(&ScanToken::Punct(',')) {
+                        next += 1;
+                    }
+                    if tokens.get(next) == Some(&ScanToken::Punct(')')) {
+                        keys.push(value.clone());
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    fn tokenize_rust_source(source: &str) -> Vec<ScanToken> {
+        let bytes = source.as_bytes();
+        let mut tokens = Vec::new();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if byte.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                i += 2;
+                let mut depth = 1usize;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if byte == b'"' {
+                let (parsed, next_i) = parse_regular_string(source, i + 1);
+                tokens.push(ScanToken::Str(parsed));
+                i = next_i;
+                continue;
+            }
+            if byte == b'r' {
+                if let Some((parsed, next_i)) = try_parse_raw_string(source, i) {
+                    tokens.push(ScanToken::Str(parsed));
+                    i = next_i;
+                    continue;
+                }
+            }
+            if byte == b'\'' {
+                i = skip_char_or_lifetime(source, i);
+                tokens.push(ScanToken::Other);
+                continue;
+            }
+            if byte.is_ascii_alphabetic() || byte == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                tokens.push(ScanToken::Ident(source[start..i].to_string()));
+                continue;
+            }
+            if matches!(byte, b'.' | b'(' | b')' | b',') {
+                tokens.push(ScanToken::Punct(byte as char));
+            } else {
+                tokens.push(ScanToken::Other);
+            }
+            i += 1;
+        }
+
+        tokens
+    }
+
+    fn parse_regular_string(source: &str, mut i: usize) -> (String, usize) {
+        let mut out = String::new();
+        while i < source.len() {
+            let rest = &source[i..];
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            i += ch.len_utf8();
+            if ch == '"' {
+                return (out, i);
+            }
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            let Some(esc) = source[i..].chars().next() else {
+                break;
+            };
+            i += esc.len_utf8();
+            match esc {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                '\'' => out.push('\''),
+                '0' => out.push('\0'),
+                '\r' => {
+                    if source[i..].starts_with('\n') {
+                        i += 1;
+                    }
+                    while i < source.len() && matches!(source.as_bytes()[i], b' ' | b'\t') {
+                        i += 1;
+                    }
+                }
+                '\n' => {
+                    while i < source.len() && matches!(source.as_bytes()[i], b' ' | b'\t') {
+                        i += 1;
+                    }
+                }
+                'x' if i + 2 <= source.len() => {
+                    if let Ok(val) = u8::from_str_radix(&source[i..i + 2], 16) {
+                        out.push(val as char);
+                        i += 2;
+                    }
+                }
+                'u' if source[i..].starts_with('{') => {
+                    if let Some(close) = source[i + 1..].find('}') {
+                        let hex = &source[i + 1..i + 1 + close];
+                        if let Some(decoded) =
+                            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                        {
+                            out.push(decoded);
+                        }
+                        i += 1 + close + 1;
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        (out, i)
+    }
+
+    fn try_parse_raw_string(source: &str, start: usize) -> Option<(String, usize)> {
+        let bytes = source.as_bytes();
+        let mut j = start + 1;
+        let mut hashes = 0usize;
+        while j < bytes.len() && bytes[j] == b'#' {
+            hashes += 1;
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'"' {
+            return None;
+        }
+        let content_start = j + 1;
+        let end_delim = format!("\"{}", "#".repeat(hashes));
+        let end_rel = source[content_start..].find(&end_delim)?;
+        let content = source[content_start..content_start + end_rel].to_string();
+        Some((content, content_start + end_rel + end_delim.len()))
+    }
+
+    fn skip_char_or_lifetime(source: &str, start: usize) -> usize {
+        let bytes = source.as_bytes();
+        let mut i = start + 1;
+        if i >= bytes.len() {
+            return i;
+        }
+        if bytes[i] == b'\\' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            return (i + 1).min(bytes.len());
+        }
+        if let Some(ch) = source[i..].chars().next() {
+            let after_ch = i + ch.len_utf8();
+            if after_ch < bytes.len() && bytes[after_ch] == b'\'' {
+                return after_ch + 1;
+            }
+        }
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        i
+    }
 }

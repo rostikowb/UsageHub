@@ -279,10 +279,7 @@ mod tests {
                     evaluate(&format!("{base}.remaining"), &context).unwrap(),
                     100.0
                 );
-                assert_eq!(
-                    evaluate(&format!("{base}.display"), &context).unwrap(),
-                    0.0
-                );
+                assert_eq!(evaluate(&format!("{base}.display"), &context).unwrap(), 0.0);
                 assert_eq!(
                     evaluate(&format!("{base}.reset.unix"), &context).unwrap(),
                     0.0

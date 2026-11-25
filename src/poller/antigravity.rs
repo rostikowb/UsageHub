@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
@@ -142,7 +143,14 @@ where
     }
 }
 
+struct CachedOauthClients {
+    modified: Option<SystemTime>,
+    len: u64,
+    clients: Vec<(String, String)>,
+}
+
 fn installed_oauth_clients() -> Vec<(String, String)> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedOauthClients>>> = OnceLock::new();
     let mut paths = Vec::new();
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let local = PathBuf::from(local);
@@ -154,9 +162,48 @@ fn installed_oauth_clients() -> Vec<(String, String)> {
             PathBuf::from(program_files).join("Antigravity/resources/bin/language_server.exe"),
         );
     }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    installed_oauth_clients_from_paths(&paths, cache)
+}
+
+fn installed_oauth_clients_from_paths(
+    paths: &[PathBuf],
+    cache: &Mutex<HashMap<PathBuf, CachedOauthClients>>,
+) -> Vec<(String, String)> {
     for path in paths {
+        let Ok(metadata) = fs::metadata(path) else {
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(path);
+            continue;
+        };
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if let Some(cached) = cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(path)
+            .filter(|entry| entry.modified == modified && entry.len == len)
+        {
+            if !cached.clients.is_empty() {
+                return cached.clients.clone();
+            }
+            continue;
+        }
         if let Ok(bytes) = fs::read(path) {
             let clients = oauth_clients_from_binary(&bytes);
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    path.clone(),
+                    CachedOauthClients {
+                        modified,
+                        len,
+                        clients: clients.clone(),
+                    },
+                );
             if !clients.is_empty() {
                 return clients;
             }
@@ -421,6 +468,27 @@ pub(super) fn best_gemini_model_quota(models: &AntigravityModelsResponse) -> Opt
     }))
 }
 
+fn map_antigravity_http_error(endpoint: &str, error: ureq::Error) -> PollError {
+    match error {
+        ureq::Error::StatusCode(code) if code == 401 || code == 403 => {
+            diagnose::log(format!(
+                "Antigravity {endpoint} returned auth error status {code}"
+            ));
+            PollError::AuthRequired
+        }
+        ureq::Error::StatusCode(code) => {
+            diagnose::log(format!(
+                "Antigravity {endpoint} returned HTTP status {code}"
+            ));
+            PollError::HttpStatus(code)
+        }
+        error => {
+            diagnose::log_error(&format!("Antigravity {endpoint} request failed"), error);
+            PollError::RequestFailed
+        }
+    }
+}
+
 pub(super) fn fetch_antigravity_project(
     base_url: &str,
     token: &str,
@@ -441,16 +509,7 @@ pub(super) fn fetch_antigravity_project(
         .and_then(super::check_http_status)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::StatusCode(code)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity loadCodeAssist returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
-        Err(error) => {
-            diagnose::log_error("Antigravity loadCodeAssist request failed", error);
-            return Err(PollError::RequestFailed);
-        }
+        Err(error) => return Err(map_antigravity_http_error("loadCodeAssist", error)),
     };
 
     let response: AntigravityLoadResponse = match resp.body_mut().read_json() {
@@ -484,15 +543,8 @@ pub(super) fn fetch_antigravity_models_response(
         .and_then(super::check_http_status)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::StatusCode(code)) if code == 401 || code == 403 => {
-            diagnose::log(format!(
-                "Antigravity fetchAvailableModels returned auth error status {code}"
-            ));
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
-            diagnose::log_error("Antigravity fetchAvailableModels request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(map_antigravity_http_error("fetchAvailableModels", error));
         }
     };
 
@@ -545,12 +597,11 @@ pub(super) fn fetch_antigravity_quota_summary(
         .and_then(super::check_http_status)
     {
         Ok(resp) => resp,
-        Err(ureq::Error::StatusCode(code)) if code == 401 || code == 403 => {
-            return Err(PollError::AuthRequired);
-        }
         Err(error) => {
-            diagnose::log_error("Antigravity retrieveUserQuotaSummary request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(map_antigravity_http_error(
+                "retrieveUserQuotaSummary",
+                error,
+            ));
         }
     };
 
@@ -1012,5 +1063,59 @@ mod auth_tests {
         assert!(old.token.refresh_token.is_none());
         let current: AntigravityAuthFile = serde_json::from_str(r#"{"token":{"access_token":"old","refresh_token":"refresh","expiry":"2026-01-01T00:00:00Z"}}"#).unwrap();
         assert_eq!(current.token.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[test]
+    fn antigravity_http_error_preserves_non_auth_status_codes() {
+        assert_eq!(
+            map_antigravity_http_error("loadCodeAssist", ureq::Error::StatusCode(401)),
+            PollError::AuthRequired
+        );
+        assert_eq!(
+            map_antigravity_http_error("fetchAvailableModels", ureq::Error::StatusCode(403)),
+            PollError::AuthRequired
+        );
+        for code in [429, 500, 503] {
+            let mapped = map_antigravity_http_error(
+                "retrieveUserQuotaSummary",
+                ureq::Error::StatusCode(code),
+            );
+            assert_eq!(mapped, PollError::HttpStatus(code));
+            assert!(mapped.is_transient());
+        }
+        assert_eq!(
+            map_antigravity_http_error(
+                "loadCodeAssist",
+                ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            ),
+            PollError::RequestFailed
+        );
+    }
+
+    #[test]
+    fn oauth_clients_cache_reuses_unchanged_binary_and_refreshes_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agy.exe");
+        let mut first =
+            b"123456789012-hash_12345678901234567890.apps.googleusercontent.com".to_vec();
+        first.extend_from_slice(b"GOCSPX-");
+        first.resize(first.len() + 28, b'1');
+        std::fs::write(&exe, &first).unwrap();
+
+        let cache = Mutex::new(HashMap::new());
+        let paths = vec![exe.clone()];
+        let extracted = installed_oauth_clients_from_paths(&paths, &cache);
+        assert_eq!(extracted.len(), 1);
+        assert!(cache.lock().unwrap().contains_key(&exe));
+
+        // Overwrite with different length so cache invalidates cleanly.
+        let mut second =
+            b"999999999999-hash_99999999999999999999.apps.googleusercontent.com".to_vec();
+        second.extend_from_slice(b"GOCSPX-");
+        second.resize(second.len() + 29, b'2');
+        std::fs::write(&exe, &second).unwrap();
+        let refreshed = installed_oauth_clients_from_paths(&paths, &cache);
+        assert_eq!(refreshed.len(), 1);
+        assert_ne!(refreshed[0].0, extracted[0].0);
     }
 }

@@ -203,6 +203,19 @@ pub(super) fn find_context_menu_item_path(
     visit(items, id, &[])
 }
 
+fn adjust_context_menu_path_after_removal(source: &[usize], target: &[usize]) -> Vec<usize> {
+    let mut adjusted = target.to_vec();
+    if let Some(depth) = source.len().checked_sub(1) {
+        if adjusted.len() > depth
+            && adjusted[..depth] == source[..depth]
+            && adjusted[depth] > source[depth]
+        {
+            adjusted[depth] -= 1;
+        }
+    }
+    adjusted
+}
+
 pub(super) fn move_context_menu_item_to(
     items: &mut Vec<ContextMenuItem>,
     source: &[usize],
@@ -214,19 +227,36 @@ pub(super) fn move_context_menu_item_to(
         | ContextMenuDropTarget::After(path)
         | ContextMenuDropTarget::Into(path) => path,
     };
-    if source == target_path || target_path.starts_with(source) {
+    if source.is_empty()
+        || target_path.is_empty()
+        || source == target_path
+        || target_path.starts_with(source)
+    {
         return false;
     }
-    let Some(target_id) = context_menu_item(items, target_path).map(|item| item.id.clone()) else {
+    if context_menu_item(items, source).is_none() {
+        return false;
+    }
+    let Some(target_item) = context_menu_item(items, target_path) else {
         return false;
     };
+    if matches!(target, ContextMenuDropTarget::Into(_))
+        && !matches!(target_item.kind, ContextMenuItemKind::Submenu { .. })
+    {
+        return false;
+    }
+    let adjusted_target = adjust_context_menu_path_after_removal(source, target_path);
+    if matches!(
+        target,
+        ContextMenuDropTarget::Before(_) | ContextMenuDropTarget::After(_)
+    ) && adjusted_target.is_empty()
+    {
+        return false;
+    }
     let Some(moving) = remove_context_menu_item(items, source) else {
         return false;
     };
     let moving_id = moving.id.clone();
-    let Some(adjusted_target) = find_context_menu_item_path(items, &target_id) else {
-        return false;
-    };
     let new_path = match target {
         ContextMenuDropTarget::Into(_) => {
             let Some(ContextMenuItemKind::Submenu { items: children }) =
@@ -240,7 +270,9 @@ pub(super) fn move_context_menu_item_to(
             path
         }
         ContextMenuDropTarget::Before(_) | ContextMenuDropTarget::After(_) => {
-            let (&target_index, parent_path) = adjusted_target.split_last().unwrap();
+            let Some((&target_index, parent_path)) = adjusted_target.split_last() else {
+                return false;
+            };
             let Some(siblings) = context_menu_items_mut(items, parent_path) else {
                 return false;
             };
@@ -623,4 +655,92 @@ pub(super) fn context_menu_action_editor(
         _ => {}
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action_item(id: &str, label: &str) -> ContextMenuItem {
+        ContextMenuItem {
+            id: id.into(),
+            label: label.into(),
+            render: crate::theme_engine::default_render(),
+            kind: ContextMenuItemKind::Action {
+                action: ContextMenuAction::Refresh,
+            },
+        }
+    }
+
+    fn submenu_item(id: &str, label: &str, children: Vec<ContextMenuItem>) -> ContextMenuItem {
+        ContextMenuItem {
+            id: id.into(),
+            label: label.into(),
+            render: crate::theme_engine::default_render(),
+            kind: ContextMenuItemKind::Submenu { items: children },
+        }
+    }
+
+    #[test]
+    fn move_context_menu_item_to_preserves_items_when_target_is_invalid() {
+        let initial = vec![
+            action_item("first", "First"),
+            action_item("second", "Second"),
+            submenu_item("folder", "Folder", vec![action_item("nested", "Nested")]),
+        ];
+
+        // Into a non-submenu target must fail without removing the source item.
+        let mut items = initial.clone();
+        let mut selection = Some(vec![0]);
+        assert!(!move_context_menu_item_to(
+            &mut items,
+            &[0],
+            &ContextMenuDropTarget::Into(vec![1]),
+            &mut selection,
+        ));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "first");
+        assert_eq!(items[1].id, "second");
+        assert_eq!(selection, Some(vec![0]));
+
+        // Out-of-bounds or empty target path must fail without removing the source item.
+        assert!(!move_context_menu_item_to(
+            &mut items,
+            &[0],
+            &ContextMenuDropTarget::Before(vec![99]),
+            &mut selection,
+        ));
+        assert!(!move_context_menu_item_to(
+            &mut items,
+            &[0],
+            &ContextMenuDropTarget::After(vec![]),
+            &mut selection,
+        ));
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "first");
+        assert_eq!(selection, Some(vec![0]));
+    }
+
+    #[test]
+    fn move_context_menu_item_to_updates_order_and_selection_on_valid_moves() {
+        let mut items = vec![
+            action_item("first", "First"),
+            action_item("second", "Second"),
+            submenu_item("folder", "Folder", vec![action_item("nested", "Nested")]),
+        ];
+        let mut selection = None;
+        assert!(move_context_menu_item_to(
+            &mut items,
+            &[0],
+            &ContextMenuDropTarget::Into(vec![2]),
+            &mut selection,
+        ));
+        assert_eq!(items.len(), 2);
+        assert_eq!(selection, Some(vec![1, 1]));
+        let ContextMenuItemKind::Submenu { items: children } = &items[1].kind else {
+            panic!("expected submenu");
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[1].id, "first");
+    }
 }

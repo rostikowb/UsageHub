@@ -1580,6 +1580,8 @@ mod tests {
         // replace fails. The guard below restores writability on any exit.
         struct WritableOnDrop(std::path::PathBuf);
         impl Drop for WritableOnDrop {
+            // Windows uses the read-only file attribute rather than Unix mode bits.
+            #[allow(clippy::permissions_set_readonly_false)]
             fn drop(&mut self) {
                 if let Ok(metadata) = std::fs::metadata(&self.0) {
                     let mut permissions = metadata.permissions();
