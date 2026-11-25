@@ -47,7 +47,7 @@ use crate::theme_engine::{
     ReferenceRegion, SurfaceNest, ThemeDocument, ThemeRuntime, VerticalAnchor,
 };
 use crate::tray_icon;
-use crate::updater::{self, AvailableUpdate, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+use crate::updater::{self, AvailableUpdate, ReleaseDescriptor, UpdateCheckResult};
 
 fn account_bar_budget(state: &AppState) -> f64 {
     host_geometry::account_bar_budget(state.taskbar_index)

@@ -1,4 +1,5 @@
 use super::*;
+use crate::updater::InstallChannel;
 
 pub(super) fn state_for(theme: ThemeDocument, placement: PlacementOverride) -> AppState {
     AppState {

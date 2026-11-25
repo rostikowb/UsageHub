@@ -114,11 +114,7 @@ impl AccountOperationGuard {
         let namespace = format!("Local\\UsageHubTest{}_Account", std::process::id());
         #[cfg(not(test))]
         let namespace = "Local\\UsageHubAccount";
-        let name = format!(
-            "{namespace}_{}_{}",
-            provider.descriptor().key,
-            safe
-        );
+        let name = format!("{namespace}_{}_{}", provider.descriptor().key, safe);
         let wide = wide_str(&name);
         let handle = unsafe { CreateMutexW(None, false, PCWSTR::from_raw(wide.as_ptr())) }
             .map_err(|error| format!("Unable to create the account guard: {error}"))?;

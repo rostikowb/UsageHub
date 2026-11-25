@@ -819,7 +819,7 @@ fn try_redact_email(input: &str, i: usize) -> Option<(usize, String)> {
     pos += 1;
 
     let mut label_count = 0usize;
-    let mut last_label: Option<(usize, usize)> = None;
+    let mut last_label;
     loop {
         let label_start = pos;
         while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-') {
