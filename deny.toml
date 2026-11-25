@@ -20,6 +20,7 @@ ignore = [
 confidence-threshold = 0.93
 allow = [
     "Apache-2.0",
+    "BSD-3-Clause",
     "BSL-1.0",
     "ISC",
     "MIT",

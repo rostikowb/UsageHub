@@ -2385,7 +2385,9 @@ fn recognized_legacy_backup_dir(path: &Path) -> Result<(), String> {
     if let Some(library) = super::skills::shared_skills_dir() {
         protected.push(Some(library));
     }
-    protected.push(Some(PathBuf::from("C:\\")));
+    if same_home(Path::new("C:\\"), path) {
+        return Err("Refusing legacy-backup overlapping protected root 'C:\\'".into());
+    }
     for root in protected.into_iter().flatten() {
         if same_home(&root, path) || paths::is_within(&root, path) || paths::is_within(path, &root)
         {

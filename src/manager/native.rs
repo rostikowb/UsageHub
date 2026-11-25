@@ -725,7 +725,8 @@ fn live_process_snapshot_inner() -> Snapshot {
 /// Win32/NT prefixes stripped. Shared by attribution, overlap checks, and
 /// the lifecycle slice (which reuses this instead of a third copy).
 pub fn canonical_spelling(path: &Path) -> String {
-    let mut spelling = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let expanded = super::paths::expand_short_path(path);
+    let mut spelling = expanded.to_string_lossy().replace('/', "\\").to_lowercase();
     for prefix in ["\\\\?\\unc\\", "\\??\\unc\\", "\\\\?\\", "\\??\\"] {
         if let Some(rest) = spelling.strip_prefix(prefix) {
             spelling = if prefix.ends_with("unc\\") {

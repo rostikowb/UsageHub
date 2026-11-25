@@ -216,15 +216,61 @@ fn without_nt_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// Expand Windows 8.3 short path components (for example `RUNNER~1`) to
+/// their long names without traversing junctions/reparse points. Non-existent
+/// paths fall back to the longest existing ancestor and re-append the suffix.
+#[cfg(windows)]
+pub(crate) fn expand_short_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+
+    let raw = path.as_os_str().to_string_lossy();
+    if !raw.contains('~') {
+        return path.to_path_buf();
+    }
+    let clean = without_nt_prefix(path);
+    let mut existing = clean.as_path();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return path.to_path_buf();
+        };
+        let Some(parent) = existing.parent() else {
+            return path.to_path_buf();
+        };
+        tail.push(name.to_os_string());
+        existing = parent;
+    }
+    let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+    let needed = unsafe { GetLongPathNameW(PCWSTR::from_raw(wide.as_ptr()), None) };
+    if needed == 0 {
+        return path.to_path_buf();
+    }
+    let mut buf = vec![0u16; needed as usize + 1];
+    let len = unsafe { GetLongPathNameW(PCWSTR::from_raw(wide.as_ptr()), Some(&mut buf)) };
+    if len == 0 || len as usize >= buf.len() {
+        return path.to_path_buf();
+    }
+    let mut out = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
+    for part in tail.into_iter().rev() {
+        out.push(part);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub(crate) fn expand_short_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn lowered(path: &Path) -> String {
     // Normalize both slash styles (imported `C:/` paths) and extended-length
     // plus NT-object-manager prefixes (`\\?\C:\x`, `\\?\UNC\server\share`,
     // `\??\C:\x`, `\??\UNC\server\share` as returned by `read_link` for
     // junctions) before comparing, so all spellings of one path compare equal.
-    let mut text = normalize_lexical(path)
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_lowercase();
+    let expanded = expand_short_path(&normalize_lexical(path));
+    let mut text = expanded.to_string_lossy().replace('/', "\\").to_lowercase();
     if let Some(rest) = text
         .strip_prefix("\\\\?\\unc\\")
         .or_else(|| text.strip_prefix("\\??\\unc\\"))
