@@ -896,7 +896,7 @@ pub fn import_omp_sign_in(
     }
     // No refresh token is copied on purpose: rotating it would invalidate the
     // same sign-in inside omp.
-    let document = serde_json::json!({
+    let mut document = serde_json::json!({
         "auth_mode": "chatgpt",
         "OPENAI_API_KEY": serde_json::Value::Null,
         "tokens": {
@@ -905,10 +905,28 @@ pub fn import_omp_sign_in(
         },
         "usagehub_omp_email": credential.email,
     });
+    if let Some(expires_sec) = credential.expires_unix_secs() {
+        if let Some(obj) = document.as_object_mut() {
+            obj.insert(
+                "usagehub_omp_expires_unix".to_string(),
+                serde_json::json!(expires_sec),
+            );
+        }
+    }
     let bytes = serde_json::to_vec_pretty(&document)
         .map_err(|error| format!("Unable to encode the imported sign-in: {error}"))?;
     std::fs::write(&auth_path, bytes)
         .map_err(|error| format!("Unable to write {}: {error}", auth_path.display()))?;
+    if !credential.email.trim().is_empty() {
+        let discovery_key = crate::manager::omp_auth::discovery_key(&credential.email);
+        let _ = state::mutate_settings(|settings| {
+            let accounts = provider_accounts_mut(settings, provider)?;
+            if let Some(profile) = accounts.profiles.iter_mut().find(|p| p.id == id) {
+                profile.discovery_key = discovery_key.clone();
+            }
+            Ok::<_, String>(())
+        });
+    }
     Ok((credential.email.clone(), auth_path))
 }
 
