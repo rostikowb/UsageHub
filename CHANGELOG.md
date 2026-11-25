@@ -6,6 +6,28 @@ changes grouped into Added, Changed, Fixed, and Removed where applicable.
 
 ## [Unreleased]
 
+## [2.24.0] - 2026-11-25
+
+### Added
+
+- **Provider health & connection testing**: Added an in-memory `TelemetryStore` tracking per-provider/account last poll timestamp, latency, HTTP status / error, active `Retry-After` cooldown, and non-secret credential source detection, surfaced in **Settings → Providers** with a **Test connection** action.
+- **Tray & context-menu update visibility**: When background update checks detect a newer release, the tray tooltip and native context menus surface the available version directly.
+- **Log rotation & automatic redaction**: Capped `%TEMP%\usagehub.log` at 5 MiB with `.prev` rotation across normal, recovery, and panic writes; automatically masks Bearer tokens, session cookies, auth headers, emails, and user profile paths, and adds a **Copy redacted log** action in **Diagnostics**.
+- **DPAPI-protected OpenCode cookie**: Added `authCookieEncrypted` (`config.json`) and `OPENCODE_GO_AUTH_COOKIE_ENCRYPTED` support using Windows DPAPI with `Zeroizing` memory handling while keeping plaintext `authCookie` backwards compatibility.
+- **Proactive `omp` token expiry UX**: Codex managed cards now load `omp` metadata asynchronously and show token expiration status with a one-click **Re-import from omp** prompt.
+- **CI & localization coverage**: Added `.github/workflows/ci.yml` (`cargo fmt --check`, `cargo clippy`, `cargo test` on `windows-latest`) and an automated `localization` audit test covering all UI keys across 15 locales (694 keys, completing `uk.toml` translations).
+
+### Changed
+
+- **Modularization & in-process reads**: Split `src/window.rs` into focused `src/window/{app_state,polling,surfaces,tray,update_flow,watchdog}.rs` submodules and `src/studio_app/studio_manage.rs` into `src/studio_app/manage/{worker,cards,cleanup_ui,backups_ui,skills_ui,migration_ui}.rs`, routing read-only manager queries in-process instead of spawning child `--manage` processes.
+- **Performance & test isolation**: Added bounded LRU caches for decoded and rescaled theme images (`MAX_DECODED_IMAGES`, `MAX_RESCALED_IMAGES`), recursion depth limits (`MAX_EXPRESSION_DEPTH = 128`) in the theme expression parser, coalesced poll-progress cache writes, mtime-gated Studio reloads, and per-test isolation so `poller` tests run reliably in parallel.
+
+### Fixed
+
+- Fixed `OpenProcess` `HANDLE` leaks in `process_created_unix`, `CloseHandle` cleanup in `stop_account_force`, and inherited pipe deadlocks in `open_codex_sign_in`.
+- Fixed data loss in `move_context_menu_item_to` when moving to an invalid target, `DesktopPresenter` recovery after `DXGI_ERROR_DEVICE_REMOVED`, `DestroyMenu` leaks and owner HWND handling in `window_context_menu.rs`, and cross-thread `STATE` lock holding in `watchdog.rs`.
+- Fixed SQLite `-wal`/`-shm` sidecar copying for Cursor, `PollError::HttpStatus` preservation across Codex/Cursor/Antigravity, `SettingsOperationGuard` account merging on save, and `omp_auth` exact `--email` matching.
+
 ## [2.23.4] - 2026-11-13
 
 ### Added
