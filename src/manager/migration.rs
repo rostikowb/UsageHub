@@ -2374,11 +2374,16 @@ fn recognized_legacy_backup_dir(path: &Path) -> Result<(), String> {
         paths::profiles_root(),
     ]);
     protected.extend([
-        crate::known_folders::home_dir(),
         crate::accounts::environment_directory(ProviderId::Claude),
         crate::accounts::environment_directory(ProviderId::Codex),
     ]);
     if let Some(home) = crate::known_folders::home_dir() {
+        if same_home(&home, path) {
+            return Err(format!(
+                "Refusing legacy-backup overlapping protected root '{}'",
+                home.display()
+            ));
+        }
         protected.push(Some(home.join(".claude")));
         protected.push(Some(home.join(".codex")));
     }
