@@ -378,9 +378,11 @@ fn claimable_codex_profile(settings: &crate::app_settings::SettingsFile) -> Opti
                 && profile.discovery_key.is_empty()
                 && {
                     let root = if !profile.config_dir.trim().is_empty() {
-                        Path::new(&profile.config_dir)
+                        Path::new(profile.config_dir.trim())
+                    } else if !profile.desktop_dir.trim().is_empty() {
+                        Path::new(profile.desktop_dir.trim())
                     } else {
-                        Path::new(&profile.desktop_dir)
+                        return false;
                     };
                     let auth = root.join("auth.json");
                     let Ok(content) = std::fs::read_to_string(auth) else {
@@ -676,6 +678,27 @@ mod tests {
     #[test]
     fn only_an_unsigned_managed_codex_profile_can_be_claimed() {
         let mut settings = crate::app_settings::SettingsFile::default();
+        assert_eq!(claimable_codex_profile(&settings), None);
+        // A managed profile with empty config_dir and desktop_dir must not fall back to CWD "auth.json".
+        settings.accounts.codex.profiles.push(AccountProfile {
+            id: "empty_dirs".into(),
+            ownership: AccountOwnership::Managed,
+            ..Default::default()
+        });
+        assert_eq!(claimable_codex_profile(&settings), None);
+        // A signed-in managed profile cannot be claimed.
+        let signed_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            signed_dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"tok"}}"#,
+        )
+        .unwrap();
+        settings.accounts.codex.profiles.push(AccountProfile {
+            id: "signed_in".into(),
+            ownership: AccountOwnership::Managed,
+            config_dir: signed_dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        });
         assert_eq!(claimable_codex_profile(&settings), None);
         settings.accounts.codex.profiles.push(AccountProfile {
             id: "account_9".into(),

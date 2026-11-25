@@ -231,19 +231,31 @@ impl Reader {
             }
             let mut found_control = false;
             for index in 0..count {
-                let element = elements.GetElement(index)?;
-                if element.CachedProcessId()? == std::process::id() as i32
-                    || !occupies_space(element.CachedControlType()?)
-                {
+                let Ok(element) = elements.GetElement(index) else {
+                    continue;
+                };
+                let Ok(pid) = element.CachedProcessId() else {
+                    continue;
+                };
+                let Ok(control_type) = element.CachedControlType() else {
+                    continue;
+                };
+                if pid == std::process::id() as i32 || !occupies_space(control_type) {
                     continue;
                 }
                 found_control = true;
-                if !element.CachedIsOffscreen()?.as_bool() {
-                    if let Some(rect) = intersection(element.CachedBoundingRectangle()?, bounds) {
+                let Ok(offscreen) = element.CachedIsOffscreen() else {
+                    continue;
+                };
+                if !offscreen.as_bool() {
+                    let Ok(element_rect) = element.CachedBoundingRectangle() else {
+                        continue;
+                    };
+                    if let Some(rect) = intersection(element_rect, bounds) {
                         let is_tray = element
-                            .CachedClassName()?
-                            .to_string()
-                            .starts_with("SystemTray.")
+                            .CachedClassName()
+                            .ok()
+                            .is_some_and(|name| name.to_string().starts_with("SystemTray."))
                             || tray_rect.is_some_and(|tray| intersection(rect, tray) == Some(rect));
                         if is_tray {
                             reserved.push(rect);

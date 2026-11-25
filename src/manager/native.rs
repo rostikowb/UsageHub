@@ -31,7 +31,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use windows::core::{Interface as _, BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, PROPERTYKEY, RECT, WPARAM,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, HWND, LPARAM, PROPERTYKEY, RECT,
+    WPARAM,
 };
 use windows::Win32::Storage::EnhancedStorage::{
     PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand,
@@ -1100,14 +1101,27 @@ fn snapshot_processes(image_names: &[&str]) -> (Vec<LiveProcess>, bool) {
     (out, complete)
 }
 
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 fn process_created_unix(pid: u32) -> Option<u64> {
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let handle = OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?);
         let mut created: windows::Win32::Foundation::FILETIME = std::mem::zeroed();
         let mut exited: windows::Win32::Foundation::FILETIME = std::mem::zeroed();
         let mut kernel: windows::Win32::Foundation::FILETIME = std::mem::zeroed();
         let mut user: windows::Win32::Foundation::FILETIME = std::mem::zeroed();
-        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
+        let ok =
+            GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
         if !ok {
             return None;
         }
@@ -1120,10 +1134,9 @@ fn process_created_unix(pid: u32) -> Option<u64> {
 
 fn process_image_path(pid: u32) -> Option<PathBuf> {
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let handle = OwnedHandle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?);
         let mut buf = vec![0u16; 1024];
-        let len = GetModuleFileNameExW(Some(handle), None, &mut buf);
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        let len = GetModuleFileNameExW(Some(handle.0), None, &mut buf);
         if len == 0 {
             return None;
         }
@@ -1466,9 +1479,16 @@ pub fn open_codex_sign_in(ctx: &AccountContext) -> ManagerResult<()> {
         // CREATE_NEW_CONSOLE: the login prompts need a real console.
         command.creation_flags(0x0000_0010);
     }
-    command
+    // Clear inheritable flags on any inherited STD pipes (such as `--manage`
+    // response pipes under `run_bounded`) before spawning the interactive
+    // `CREATE_NEW_CONSOLE` shell so the console child never holds the caller's
+    // stdout/stderr pipes open past manager exit, while still receiving its own
+    // console input/output rather than `NUL`.
+    crate::manager::process::clear_inherited_standard_handles();
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to open the Codex sign-in console: {error}"))?;
+    let _ = child.try_wait();
     Ok(())
 }
 
@@ -1628,7 +1648,7 @@ pub fn stop_account_force(ctx: &AccountContext) -> ManagerResult<StopReport> {
                 .map(|p| p.parent_pid)
                 .unwrap_or(0);
         }
-        std::cmp::Reverse(depth);
+        std::cmp::Reverse(depth)
     });
     let mut stopped = Vec::new();
     unsafe {
@@ -3155,5 +3175,13 @@ mod tests {
         // surviving registry entry.
         let ext = managed_ctx("default", crate::accounts::AccountOwnership::External);
         assert!(owned_account_artifact_paths(&ext).expect("list").is_empty());
+    }
+
+    #[test]
+    fn process_created_unix_reads_current_process_and_closes_handle() {
+        let created = process_created_unix(std::process::id());
+        assert!(created.is_some());
+        assert_eq!(process_created_unix(0), None);
+        assert_eq!(process_created_unix(u32::MAX), None);
     }
 }

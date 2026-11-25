@@ -203,6 +203,35 @@ fn read_cursor_access_token_from_state_db() -> Option<String> {
     }
 }
 
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn copy_db_with_sidecars(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::copy(src, dst)?;
+    for suffix in ["-wal", "-shm"] {
+        let src_sidecar = sqlite_sidecar_path(src, suffix);
+        if src_sidecar.is_file() {
+            let dst_sidecar = sqlite_sidecar_path(dst, suffix);
+            if let Err(error) = std::fs::copy(&src_sidecar, &dst_sidecar) {
+                diagnose::log(format!(
+                    "Cursor state DB sidecar {suffix} copy failed: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_db_and_sidecars(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
+    }
+}
+
 fn query_cursor_access_token_from_copy(path: &Path) -> Option<String> {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -212,12 +241,13 @@ fn query_cursor_access_token_from_copy(path: &Path) -> Option<String> {
         "claude-monitor-cursor-state-{}-{unique}.vscdb",
         std::process::id()
     ));
-    if let Err(error) = std::fs::copy(path, &temporary) {
+    if let Err(error) = copy_db_with_sidecars(path, &temporary) {
         diagnose::log(format!("Cursor state DB temp copy failed: {error}"));
+        remove_db_and_sidecars(&temporary);
         return None;
     }
     let result = query_cursor_access_token(&temporary);
-    let _ = std::fs::remove_file(&temporary);
+    remove_db_and_sidecars(&temporary);
     match result {
         Ok(token) => token,
         Err(error) => {
@@ -264,6 +294,20 @@ fn fetch_cursor_usage_with(
     }
 }
 
+fn map_cursor_http_error(endpoint: &str, error: ureq::Error) -> PollError {
+    match error {
+        ureq::Error::StatusCode(401 | 403) => PollError::AuthRequired,
+        ureq::Error::StatusCode(code) => {
+            diagnose::log(format!("Cursor {endpoint} returned HTTP status {code}"));
+            PollError::HttpStatus(code)
+        }
+        error => {
+            diagnose::log_error(&format!("Cursor {endpoint} request failed"), error);
+            PollError::RequestFailed
+        }
+    }
+}
+
 fn fetch_cursor_usage_current_period(auth: &CursorAuth) -> Result<UsageData, PollError> {
     let body = serde_json::json!({});
     let mut response = match build_agent()?
@@ -275,12 +319,7 @@ fn fetch_cursor_usage_current_period(auth: &CursorAuth) -> Result<UsageData, Pol
         .and_then(super::check_http_status)
     {
         Ok(response) => response,
-        Err(ureq::Error::StatusCode(401 | 403)) => return Err(PollError::AuthRequired),
-        Err(ureq::Error::StatusCode(code)) => return Err(PollError::HttpStatus(code)),
-        Err(error) => {
-            diagnose::log_error("Cursor GetCurrentPeriodUsage request failed", error);
-            return Err(PollError::RequestFailed);
-        }
+        Err(error) => return Err(map_cursor_http_error("GetCurrentPeriodUsage", error)),
     };
 
     // The endpoint is undocumented and has drifted before, so parse loosely
@@ -313,11 +352,7 @@ fn fetch_cursor_usage_summary(cookie: &str) -> Result<UsageData, PollError> {
         .and_then(super::check_http_status)
     {
         Ok(response) => response,
-        Err(ureq::Error::StatusCode(401 | 403)) => return Err(PollError::AuthRequired),
-        Err(error) => {
-            diagnose::log_error("Cursor usage-summary request failed", error);
-            return Err(PollError::RequestFailed);
-        }
+        Err(error) => return Err(map_cursor_http_error("usage-summary", error)),
     };
 
     let response: CursorUsageSummaryResponse =
@@ -701,5 +736,55 @@ mod tests {
         let auth =
             cursor_auth_from_environment(&format!("WorkosCursorSessionToken={cookie}")).unwrap();
         assert_eq!(auth.access_token, jwt);
+    }
+
+    #[test]
+    fn cursor_http_error_preserves_non_auth_status_codes() {
+        assert_eq!(
+            map_cursor_http_error("usage-summary", ureq::Error::StatusCode(401)),
+            PollError::AuthRequired
+        );
+        assert_eq!(
+            map_cursor_http_error("usage-summary", ureq::Error::StatusCode(403)),
+            PollError::AuthRequired
+        );
+        for code in [429, 500, 503] {
+            let mapped = map_cursor_http_error("usage-summary", ureq::Error::StatusCode(code));
+            assert_eq!(mapped, PollError::HttpStatus(code));
+            assert!(mapped.is_transient());
+        }
+        assert_eq!(
+            map_cursor_http_error(
+                "usage-summary",
+                ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            ),
+            PollError::RequestFailed
+        );
+    }
+
+    #[test]
+    fn cursor_db_temp_copy_preserves_and_cleans_sqlite_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("state.vscdb");
+        let dst = dir.path().join("copy.vscdb");
+        std::fs::write(&src, b"main-db").unwrap();
+        std::fs::write(sqlite_sidecar_path(&src, "-wal"), b"wal-frames").unwrap();
+        std::fs::write(sqlite_sidecar_path(&src, "-shm"), b"shm-index").unwrap();
+
+        copy_db_with_sidecars(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"main-db");
+        assert_eq!(
+            std::fs::read(sqlite_sidecar_path(&dst, "-wal")).unwrap(),
+            b"wal-frames"
+        );
+        assert_eq!(
+            std::fs::read(sqlite_sidecar_path(&dst, "-shm")).unwrap(),
+            b"shm-index"
+        );
+
+        remove_db_and_sidecars(&dst);
+        assert!(!dst.exists());
+        assert!(!sqlite_sidecar_path(&dst, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&dst, "-shm").exists());
     }
 }
