@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
+
+jobs:
+  check:
+    name: Format, Clippy, and Tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Override the local gnullvm host and target with the hosted MSVC toolchain.
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
+
+      - name: Run tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc

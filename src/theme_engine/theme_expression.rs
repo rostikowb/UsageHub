@@ -19,6 +19,8 @@ pub fn evaluate(source: &str, context: &DataContext) -> Result<f64, String> {
     evaluate_value(source, context)?.number()
 }
 
+const MAX_EXPRESSION_DEPTH: usize = 128;
+
 pub(super) fn evaluate_value(
     source: &str,
     context: &DataContext,
@@ -26,6 +28,7 @@ pub(super) fn evaluate_value(
     let mut parser = Parser {
         source: source.as_bytes(),
         index: 0,
+        depth: 0,
         context,
     };
     let value = parser.parse_expression()?;
@@ -67,12 +70,25 @@ pub(super) fn split_template_token(token: &str) -> (&str, &str) {
 pub(super) struct Parser<'a> {
     source: &'a [u8],
     index: usize,
+    depth: usize,
     context: &'a DataContext,
 }
 
 impl Parser<'_> {
+    fn with_depth<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.depth >= MAX_EXPRESSION_DEPTH {
+            return Err("Expression nesting is too deep".into());
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
+    }
     fn parse_expression(&mut self) -> Result<ExpressionValue, String> {
-        self.parse_or()
+        self.with_depth(Self::parse_or)
     }
     fn parse_or(&mut self) -> Result<ExpressionValue, String> {
         let mut value = self.parse_and()?;
@@ -185,24 +201,26 @@ impl Parser<'_> {
         }
     }
     fn parse_unary(&mut self) -> Result<ExpressionValue, String> {
-        self.skip_space();
-        match self.peek() {
-            Some(b'+') => {
-                self.index += 1;
-                self.parse_unary()
+        self.with_depth(|parser| {
+            parser.skip_space();
+            match parser.peek() {
+                Some(b'+') => {
+                    parser.index += 1;
+                    parser.parse_unary()
+                }
+                Some(b'-') => {
+                    parser.index += 1;
+                    Ok(ExpressionValue::Number(-parser.parse_unary()?.number()?))
+                }
+                Some(b'!') => {
+                    parser.index += 1;
+                    Ok(ExpressionValue::Number(
+                        (parser.parse_unary()?.number()? == 0.0) as u8 as f64,
+                    ))
+                }
+                _ => parser.parse_primary(),
             }
-            Some(b'-') => {
-                self.index += 1;
-                Ok(ExpressionValue::Number(-self.parse_unary()?.number()?))
-            }
-            Some(b'!') => {
-                self.index += 1;
-                Ok(ExpressionValue::Number(
-                    (self.parse_unary()?.number()? == 0.0) as u8 as f64,
-                ))
-            }
-            _ => self.parse_primary(),
-        }
+        })
     }
     fn parse_primary(&mut self) -> Result<ExpressionValue, String> {
         self.skip_space();
@@ -321,7 +339,9 @@ impl Parser<'_> {
             .ok_or_else(|| "Invalid number".to_string())
     }
     fn parse_string(&mut self) -> Result<String, String> {
-        let quote = self.peek().expect("parse_string requires a quote");
+        let Some(quote) = self.peek() else {
+            return Err("Expected opening quote in text".into());
+        };
         self.index += 1;
         let mut result = Vec::new();
         while let Some(character) = self.peek() {

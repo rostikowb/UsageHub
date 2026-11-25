@@ -3706,3 +3706,48 @@ fn missing_antigravity_external_pool_draws_an_empty_gauge() {
     assert_eq!(value("antigravity.gemini.weekly.display"), 0.0);
     assert_eq!(value("antigravity.external.session.display"), 0.0);
 }
+
+#[test]
+fn deeply_nested_expressions_return_error_instead_of_overflowing() {
+    let context = DataContext::from_usage(None, &Canvas::default());
+    let depth = 500;
+    let nested_parens = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+    let error = evaluate(&nested_parens, &context).unwrap_err();
+    assert!(error.contains("deep"), "unexpected error: {error}");
+
+    let nested_unary = format!("{}1", "-".repeat(depth));
+    let unary_error = evaluate(&nested_unary, &context).unwrap_err();
+    assert!(
+        unary_error.contains("deep"),
+        "unexpected error: {unary_error}"
+    );
+
+    // Reasonable nesting still succeeds.
+    let valid = format!("{}42{}", "(".repeat(16), ")".repeat(16));
+    assert_eq!(evaluate(&valid, &context).unwrap(), 42.0);
+}
+
+#[test]
+fn rescaled_image_cache_reuses_and_bounds_entries() {
+    use super::theme_rendering::{load_image_entry, render_image_cached};
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("sample.png");
+    let img = image::RgbaImage::from_pixel(16, 16, image::Rgba([20, 120, 220, 255]));
+    img.save(&img_path).unwrap();
+
+    let (modified, decoded_a) = load_image_entry(&img_path).unwrap();
+    let (_, decoded_b) = load_image_entry(&img_path).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&decoded_a, &decoded_b));
+
+    let mut target = vec![0u32; 8 * 8];
+    render_image_cached(
+        &mut target,
+        8,
+        8,
+        &img_path,
+        modified,
+        &decoded_a,
+        ImageFit::Stretch,
+    );
+    assert!(target.iter().all(|pixel| *pixel != 0));
+}

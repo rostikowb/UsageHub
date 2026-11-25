@@ -481,6 +481,9 @@ pub fn resolve_object_bounds_with_runtime(
         geometry.height,
     ))
 }
+/// Logical preview size paired with per-child bounding rectangles `(x, y, width, height)`.
+pub type ScenePreviewBounds = ((u32, u32), Vec<Option<(f64, f64, f64, f64)>>);
+
 /// Resolve a surface's editor thumbnail bounds together, sharing the same
 /// data context and parent geometry for all rows in this frame.
 pub fn resolve_scene_preview_bounds(
@@ -488,7 +491,7 @@ pub fn resolve_scene_preview_bounds(
     surface_index: usize,
     data: Option<&AppUsageData>,
     runtime: ThemeRuntime,
-) -> ((u32, u32), Vec<Option<(f64, f64, f64, f64)>>) {
+) -> ScenePreviewBounds {
     let Some(surface) = theme.surfaces.get(surface_index) else {
         return (
             resolve_surface_size(theme, surface_index, data, runtime),
@@ -988,9 +991,9 @@ pub(super) fn render_object_background(
         }
         LayerBackground::Image { path, fit } => {
             let path = resolve_asset_path(path);
-            match load_image_cached(&path) {
-                Ok(image) => {
-                    render_image(pixels, width, height, &image, *fit);
+            match load_image_entry(&path) {
+                Ok((modified, image)) => {
+                    render_image_cached(pixels, width, height, &path, modified, &image, *fit);
                     clip_to_rounded_rectangle(pixels, width, height, radius);
                 }
                 Err(error) => warnings.push(format!(
@@ -1140,36 +1143,195 @@ pub(super) fn resolve_asset_path(path: &str) -> PathBuf {
     }
 }
 
-pub(super) fn load_image_cached(
+const MAX_DECODED_IMAGES: usize = 64;
+const MAX_RESCALED_IMAGES: usize = 128;
+const MAX_RESCALED_BYTES: usize = 64 * 1024 * 1024;
+
+type ImageTimestamp = Option<std::time::SystemTime>;
+
+struct CachedDecodedImage {
+    modified: ImageTimestamp,
+    last_used: u64,
+    image: Arc<image::DynamicImage>,
+}
+
+#[derive(Default)]
+struct DecodedImageCache {
+    next_tick: u64,
+    entries: HashMap<PathBuf, CachedDecodedImage>,
+}
+
+impl DecodedImageCache {
+    fn get(&mut self, path: &Path, modified: ImageTimestamp) -> Option<Arc<image::DynamicImage>> {
+        let entry = self.entries.get_mut(path)?;
+        if entry.modified != modified {
+            return None;
+        }
+        self.next_tick += 1;
+        entry.last_used = self.next_tick;
+        Some(entry.image.clone())
+    }
+
+    fn insert(&mut self, path: PathBuf, modified: ImageTimestamp, image: Arc<image::DynamicImage>) {
+        if !self.entries.contains_key(&path) && self.entries.len() >= MAX_DECODED_IMAGES {
+            if let Some(evict_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&evict_key);
+            }
+        }
+        self.next_tick += 1;
+        self.entries.insert(
+            path,
+            CachedDecodedImage {
+                modified,
+                last_used: self.next_tick,
+                image,
+            },
+        );
+    }
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct RescaledKey {
+    path: PathBuf,
+    modified: ImageTimestamp,
+    width: u32,
+    height: u32,
+}
+
+struct CachedRescaledImage {
+    last_used: u64,
+    byte_len: usize,
+    rgba: Arc<image::RgbaImage>,
+}
+
+#[derive(Default)]
+struct RescaledImageCache {
+    next_tick: u64,
+    total_bytes: usize,
+    entries: HashMap<RescaledKey, CachedRescaledImage>,
+}
+
+impl RescaledImageCache {
+    fn get(&mut self, key: &RescaledKey) -> Option<Arc<image::RgbaImage>> {
+        let entry = self.entries.get_mut(key)?;
+        self.next_tick += 1;
+        entry.last_used = self.next_tick;
+        Some(entry.rgba.clone())
+    }
+
+    fn insert(&mut self, key: RescaledKey, rgba: Arc<image::RgbaImage>) {
+        let byte_len = rgba.as_raw().len();
+        if byte_len > MAX_RESCALED_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.byte_len);
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= MAX_RESCALED_IMAGES
+                || self.total_bytes + byte_len > MAX_RESCALED_BYTES)
+        {
+            let Some(evict_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(entry_key, _)| entry_key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&evict_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.byte_len);
+            }
+        }
+        self.next_tick += 1;
+        self.total_bytes += byte_len;
+        self.entries.insert(
+            key,
+            CachedRescaledImage {
+                last_used: self.next_tick,
+                byte_len,
+                rgba,
+            },
+        );
+    }
+}
+
+pub(super) fn load_image_entry(
     path: &Path,
-) -> Result<Arc<image::DynamicImage>, image::ImageError> {
-    type ImageCache = HashMap<PathBuf, (Option<std::time::SystemTime>, Arc<image::DynamicImage>)>;
-    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
+) -> Result<(ImageTimestamp, Arc<image::DynamicImage>), image::ImageError> {
+    static CACHE: OnceLock<Mutex<DecodedImageCache>> = OnceLock::new();
     let modified = std::fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some((cached_modified, image)) = cache
+    let cache = CACHE.get_or_init(|| Mutex::new(DecodedImageCache::default()));
+    if let Some(image) = cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(path)
+        .get(path, modified)
     {
-        if *cached_modified == modified {
-            return Ok(image.clone());
-        }
+        return Ok((modified, image));
     }
     let image = Arc::new(image::open(path)?);
     cache
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(path.to_path_buf(), (modified, image.clone()));
-    Ok(image)
+        .insert(path.to_path_buf(), modified, image.clone());
+    Ok((modified, image))
 }
 
-pub(super) fn render_image(
+fn rescaled_image_cached(
+    path: &Path,
+    modified: ImageTimestamp,
+    source: &image::DynamicImage,
+    draw_width: u32,
+    draw_height: u32,
+) -> Arc<image::RgbaImage> {
+    static CACHE: OnceLock<Mutex<RescaledImageCache>> = OnceLock::new();
+    let key = RescaledKey {
+        path: path.to_path_buf(),
+        modified,
+        width: draw_width,
+        height: draw_height,
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(RescaledImageCache::default()));
+    if let Some(rgba) = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+    {
+        return rgba;
+    }
+    let rgba = if source.width() == draw_width && source.height() == draw_height {
+        Arc::new(source.to_rgba8())
+    } else {
+        Arc::new(
+            source
+                .resize_exact(
+                    draw_width,
+                    draw_height,
+                    image::imageops::FilterType::Lanczos3,
+                )
+                .to_rgba8(),
+        )
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, rgba.clone());
+    rgba
+}
+
+pub(super) fn render_image_cached(
     target: &mut [u32],
     width: u32,
     height: u32,
+    path: &Path,
+    modified: ImageTimestamp,
     source: &image::DynamicImage,
     fit: ImageFit,
 ) {
@@ -1195,13 +1357,7 @@ pub(super) fn render_image(
             )
         }
     };
-    let resized = source
-        .resize_exact(
-            draw_width,
-            draw_height,
-            image::imageops::FilterType::Lanczos3,
-        )
-        .to_rgba8();
+    let resized = rescaled_image_cached(path, modified, source, draw_width, draw_height);
     let offset_x = (width as i64 - draw_width as i64) / 2;
     let offset_y = (height as i64 - draw_height as i64) / 2;
     for y in 0..height {
